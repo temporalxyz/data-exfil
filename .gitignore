@@ -1,0 +1,11 @@
+.DS_Store
+
+/target/
+**/*.rs.bk
+
+# never commit salvage working state or salvaged data
+/work/
+*.tsv
+*.tsv.gz
+*.tar
+*.tar.gz

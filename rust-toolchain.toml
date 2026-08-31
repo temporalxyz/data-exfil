@@ -1,0 +1,6 @@
+# Source plan section 3: pin a known-good toolchain, reviewed, independently built.
+# Bump deliberately, never by drift.
+[toolchain]
+channel    = "1.90.0"
+components = ["rustfmt", "clippy"]
+targets    = ["x86_64-unknown-linux-gnu"]

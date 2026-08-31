@@ -1,0 +1,58 @@
+[package]
+name        = "salvage"
+version     = "0.1.0"
+edition      = "2024"
+rust-version = "1.90"
+description = "Fail-closed ClickHouse data salvage from a compromised cluster"
+publish     = false
+
+[dependencies]
+clap                  = { version = "4", features = ["derive"] }
+clap-verbosity-flag   = "3"
+serde                 = { version = "1", features = ["derive"] }
+serde_json            = "1"
+toml                  = "0.8"
+thiserror             = "2"
+tracing               = "0.1"
+tracing-subscriber    = { version = "0.3", features = ["env-filter"] }
+regex                 = "1"
+num-bigint            = "0.4"
+num-traits            = "0.2"
+time                  = { version = "0.3", features = ["macros", "parsing", "formatting"] }
+uuid                  = "1"
+sha2                  = "0.10"
+crc32c                = "0.6"
+flate2                = "1"
+tar                   = "0.4"
+base64                = "0.22"
+percent-encoding      = "2"
+unicode-normalization = "0.1"
+# Automatic decompression is deliberately NOT enabled: the raw bytes are what we hash, and the
+# "exactly one gzip member, no trailing bytes" check is impossible if the transport already
+# decompressed. rustls rather than native-tls so there is no OpenSSL coupling on either host.
+reqwest               = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile   = "3"
+
+[profile.release]
+overflow-checks = true      # wrapping arithmetic in a bounds validator is a silent wrong answer
+panic           = "unwind"  # explicit: Drop must run so no partial output survives a panic
+debug           = 1         # symbols for a one-shot operation we cannot re-run
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Fail-closed discipline: no reachable panic on the parse path, no silent truncation.
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+indexing_slicing = "deny"
+# Denied per-module in the parsing and bounds code, where a wrap or a lossy cast is a wrong answer
+# rather than a style question. Crate-wide would drown the I/O and CLI code in noise.
+arithmetic_side_effects = "allow"
+as_conversions          = "allow"
+integer_division        = "allow"

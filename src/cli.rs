@@ -184,6 +184,22 @@ pub struct Common {
     #[arg(long, global = true, default_value = "salvage_ro")]
     pub clickhouse_user: String,
 
+    /// Disposable ClickHouse for the pre-flight insert test, **pinned by digest**.
+    ///
+    /// Section 3 wants independently built and verified images; a tag is mutable, so a tag is not
+    /// a pin. Choose from section 3's supported list -- 26.7, 26.6, 26.5, 26.3 or 25.8 -- and never
+    /// 25.3, which is the compromised cluster's own end-of-support build.
+    #[arg(
+        long,
+        global = true,
+        default_value = "clickhouse/clickhouse-server:26.7"
+    )]
+    pub clickhouse_image: String,
+
+    /// Host the disposable ClickHouse answers on.
+    #[arg(long, global = true, default_value = "127.0.0.1")]
+    pub insert_host: String,
+
     /// Bucket this invocation reads from or writes to.
     ///
     /// Required by `export` and `audit`; `plan`, `secrets` and `teardown` touch no bucket, so it

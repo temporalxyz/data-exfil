@@ -295,6 +295,24 @@ pub enum ClickHouseType {
 }
 
 impl ClickHouseType {
+    /// How deeply this type nests, counting the outermost level as 1.
+    ///
+    /// Section 8.4 caps nesting depth "during parsing". The cap belongs on the **declared type**
+    /// rather than on each value: a value deeper than its own type already fails that type's
+    /// validator, so bounding the type bounds every value it can hold, once, at plan time instead
+    /// of per row.
+    #[must_use]
+    pub fn depth(&self) -> u32 {
+        let inner = match self {
+            Self::Nullable(t) | Self::LowCardinality(t) | Self::Array(t) => t.depth(),
+            Self::Map(k, v) => k.depth().max(v.depth()),
+            Self::Tuple(parts) => parts.iter().map(Self::depth).max().unwrap_or(0),
+            Self::Nested(fields) => fields.iter().map(|(_, t)| t.depth()).max().unwrap_or(0),
+            _ => 0,
+        };
+        inner.saturating_add(1)
+    }
+
     /// The canonical spelling, which must round-trip through [`parse_type`].
     #[must_use]
     pub fn canonical(&self) -> String {

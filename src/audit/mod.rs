@@ -24,6 +24,7 @@ use crate::abort::{Result, SalvageError, StagingDir, abort};
 use crate::archive::{ArchiveMember, write_targz};
 use crate::audit::bounds::{ColumnContract, check_row, contracts};
 use crate::audit::frame::frame;
+use crate::audit::insert::{InsertPlan, InsertTester};
 use crate::audit::profile::{profile, render_markdown};
 use crate::clickhouse::ddl::PinnedDdl;
 use crate::clickhouse::quarantine::{output_columns, quarantine_ddl, staging_table_name};
@@ -180,6 +181,7 @@ pub fn run_audit(
     ddl: &PinnedDdl,
     overrides: &Overrides,
     store: &dyn ObjectStore,
+    inserter: &dyn InsertTester,
     ledger: &PagesJson,
     opts: &AuditOptions,
 ) -> Result<Report> {
@@ -310,6 +312,24 @@ pub fn run_audit(
             reason: format!("could not read the regenerated archive: {e}"),
             context: Vec::new(),
         })?;
+        // Section 7's pre-flight, per file. It runs on the **regenerated** bytes -- the ones that
+        // will actually ship -- and before anything is pushed, because its whole purpose is to
+        // catch on our side of the boundary what only appears when a real parser meets the data.
+        //
+        // Per-file staging, never a shared table (section 9): one failure drops one table whole,
+        // so there is no partial state to reason about and no retry landing on a half-load.
+        //
+        // Survey writes nothing forward, so it does not run this; enforce always does.
+        if opts.mode == Mode::Enforce {
+            let staging_table = staging_table_name(ddl.table.as_str(), &opts.batch, entry.index)?;
+            inserter.test(&InsertPlan {
+                staging_table: staging_table.clone(),
+                quarantine_ddl: quarantine_ddl(ddl, overrides, &staging_table)?,
+                columns: header.clone(),
+                tsv: tsv_path.clone(),
+            })?;
+        }
+
         regenerated.push((
             stem,
             archive,
@@ -322,6 +342,13 @@ pub fn run_audit(
     }
 
     report.phase("frame", true, format!("{} pages", ledger.pages.len()))?;
+    if opts.mode == Mode::Enforce {
+        report.phase(
+            "insert",
+            true,
+            format!("{} pages loaded", ledger.pages.len()),
+        )?;
+    }
     report.phase(
         "bounds",
         report.findings().is_empty(),
@@ -532,7 +559,7 @@ mod tests {
     use super::*;
     use crate::clickhouse::ddl::parse_create_table;
     use crate::export::{ExportOptions, run_export};
-    use crate::testkit::{FakeRunner, LocalStore};
+    use crate::testkit::{FakeRunner, LocalStore, RecordingInsertTester};
 
     const OVERRIDES: &str = include_str!("../../overrides/typematrix.typematrix.toml");
 
@@ -629,6 +656,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
         )
@@ -651,6 +679,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
         )
@@ -687,6 +716,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Survey, true),
         )
@@ -720,6 +750,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, false),
         )
@@ -739,6 +770,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
         )
@@ -758,6 +790,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
         )
@@ -775,6 +808,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
         )
@@ -821,6 +855,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
         )
@@ -848,5 +883,91 @@ mod tests {
             "\"consumer_must_revalidate\": false",
         );
         assert!(serde_json::from_str::<ManifestEnvelope>(&flipped).is_err());
+    }
+
+    #[test]
+    fn every_page_is_insert_tested_before_anything_is_pushed() {
+        // With no Q3 in this topology (deviation D2), this is the only point where a real
+        // ClickHouse parser meets the data before the consumer's does. A pipeline that forgot the
+        // phase would otherwise pass every other test in this file.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, ledger) = exported(dir.path(), &["ordinary", "also ordinary"]);
+        let inserter = RecordingInsertTester::new();
+        run_audit(
+            &ddl(),
+            &overrides(),
+            &store,
+            &inserter,
+            &ledger,
+            &opts(dir.path(), Mode::Enforce, true),
+        )
+        .unwrap();
+
+        let attempted = inserter.attempted();
+        assert_eq!(
+            attempted.len(),
+            ledger.pages.len(),
+            "every page, not just the first"
+        );
+
+        let plan = &attempted[0];
+        // Per-file staging, never shared: one failure drops one table whole.
+        assert!(
+            plan.staging_table.contains("__b1__0"),
+            "{}",
+            plan.staging_table
+        );
+        // All text, so coercion is structurally impossible at the import boundary.
+        assert!(plan.quarantine_ddl.contains("String"));
+        assert!(!plan.quarantine_ddl.contains("UInt64"));
+        // The regenerated file, not the pulled one.
+        assert!(
+            plan.tsv
+                .starts_with(dir.path().join("audit").join(".b1-clean.staging"))
+        );
+        assert_eq!(plan.columns, vec!["ts", "id", "body"]);
+    }
+
+    #[test]
+    fn a_real_parser_rejecting_the_data_kills_the_batch() {
+        // Section 7's whole purpose: values that satisfy a regex but that ClickHouse unescapes
+        // differently, fields under the length cap but over a block limit. Static validation
+        // passed; the insert did not.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, ledger) = exported(dir.path(), &["ordinary"]);
+        let err = run_audit(
+            &ddl(),
+            &overrides(),
+            &store,
+            &RecordingInsertTester::new().failing_on(1),
+            &ledger,
+            &opts(dir.path(), Mode::Enforce, true),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.exit_code(), crate::abort::ExitCode::Abort);
+        assert!(
+            !dir.path().join("audit").join("b1-clean").exists(),
+            "nothing may be promoted"
+        );
+    }
+
+    #[test]
+    fn survey_does_not_insert_test_because_it_writes_nothing_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, ledger) = exported(dir.path(), &["<script>x</script>"]);
+        let inserter = RecordingInsertTester::new();
+        let _ = run_audit(
+            &ddl(),
+            &overrides(),
+            &store,
+            &inserter,
+            &ledger,
+            &opts(dir.path(), Mode::Survey, true),
+        );
+        assert!(
+            inserter.attempted().is_empty(),
+            "the survey enumerates; it does not load"
+        );
     }
 }

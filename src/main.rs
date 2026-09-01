@@ -89,7 +89,8 @@ fn cmd_teardown(cli: &Cli, args: &salvage::cli::TeardownArgs) -> Result<()> {
 
     let table = args.table.table.qualified();
     let batch = args.batch.batch.as_str().to_owned();
-    let store = object_store(cli)?;
+    // Teardown touches no table data, so it has no per-table limits to derive a budget from.
+    let store = object_store(cli, None)?;
 
     std::fs::create_dir_all(&cli.common.work).map_err(|e| SalvageError::Infra {
         reason: format!("could not create the work dir: {e}"),
@@ -122,7 +123,7 @@ fn cmd_audit(cli: &Cli, args: &salvage::cli::AuditArgs) -> Result<()> {
     let table = args.table.table.qualified();
     let batch = args.batch.batch.as_str().to_owned();
     let (ddl, overrides) = ddl::load_one(&cli.common.ddl_dir, &cli.common.overrides_dir, &table)?;
-    let store = object_store(cli)?;
+    let store = object_store(cli, Some(&overrides.limits))?;
 
     // `PAGES.json` is the completion sentinel. Its absence means the export never finished, and a
     // prefix without it is an incomplete run a consumer must treat as absent.
@@ -176,7 +177,24 @@ fn cmd_audit(cli: &Cli, args: &salvage::cli::AuditArgs) -> Result<()> {
         rotation_signoff: args.rotation_signoff,
     };
 
-    let report = audit::run_audit(&ddl, &overrides, &store, &ledger, &opts)?;
+    // Section 7's pre-flight. The image is pinned by digest, never by tag: section 3 wants
+    // independently verified images, and a tag is mutable so a tag is not a pin.
+    let inserter = salvage::audit::insert::SubprocessTester {
+        target: salvage::audit::insert::InsertTarget {
+            runner: match args.runner {
+                salvage::cli::Runner::Docker => "docker".to_owned(),
+                salvage::cli::Runner::Podman => "podman".to_owned(),
+                salvage::cli::Runner::Local => "clickhouse-client".to_owned(),
+            },
+            image: cli.common.clickhouse_image.clone(),
+            host: cli.common.insert_host.clone(),
+            max_memory_usage: overrides.limits.max_uncompressed_bytes,
+            max_insert_block_size: overrides.limits.max_rows_per_page.min(65_536),
+        },
+        dry_run: cli.common.dry_run,
+    };
+
+    let report = audit::run_audit(&ddl, &overrides, &store, &inserter, &ledger, &opts)?;
     if cli.common.json {
         let rendered = serde_json::to_string_pretty(&report).map_err(|e| SalvageError::Infra {
             reason: format!("could not render the report: {e}"),
@@ -205,8 +223,8 @@ fn cmd_export(cli: &Cli, args: &salvage::cli::ExportArgs) -> Result<()> {
             reason: "--clickhouse-url is required to export".to_owned(),
             context: Vec::new(),
         })?;
-    let store = object_store(cli)?;
-    let runner = query_runner(cli, url, ddl.database.as_str())?;
+    let store = object_store(cli, Some(&overrides.limits))?;
+    let runner = query_runner(cli, url, ddl.database.as_str(), &overrides.limits)?;
 
     std::fs::create_dir_all(&cli.common.work).map_err(|e| SalvageError::Infra {
         reason: format!("could not create the work dir: {e}"),
@@ -277,7 +295,7 @@ fn cmd_plan(cli: &Cli, args: &salvage::cli::PlanArgs) -> Result<()> {
     let cutoff = salvage::pages::cutoff_predicate(&ddl, &overrides)?;
     let facts = match &cli.common.clickhouse_url {
         Some(url) => {
-            let runner = query_runner(cli, url, ddl.database.as_str())?;
+            let runner = query_runner(cli, url, ddl.database.as_str(), &overrides.limits)?;
             // Addition A1's first caller: a pinned setting the server does not recognise is a
             // setting we silently failed to pin, so it is checked before anything else is asked.
             plan::assert_settings_known(&runner)?;
@@ -326,11 +344,13 @@ fn cmd_plan(cli: &Cli, args: &salvage::cli::PlanArgs) -> Result<()> {
 }
 
 /// Build the query runner. Constructed once, and only for the subcommands that talk to the source.
-fn query_runner(cli: &Cli, url: &str, database: &str) -> Result<HttpRunner> {
-    let budget = TransferBudget {
-        wall_clock: std::time::Duration::from_secs(3600),
-        max_bytes: 256 * 1024 * 1024,
-    };
+fn query_runner(
+    cli: &Cli,
+    url: &str,
+    database: &str,
+    limits: &salvage::limits::Limits,
+) -> Result<HttpRunner> {
+    let budget = TransferBudget::from_limits(limits);
     // Read, never written: `std::env::set_var` is unsafe in edition 2024 and this crate forbids
     // unsafe, so no test can set one either.
     let password = std::env::var("SALVAGE_CH_PASSWORD")
@@ -400,7 +420,7 @@ fn cmd_secrets(cli: &Cli) -> Result<()> {
 ///
 /// `--bucket` is a usage error when missing rather than a default, because there is no safe
 /// default destination for data pulled off a compromised cluster.
-fn object_store(cli: &Cli) -> Result<HttpStore> {
+fn object_store(cli: &Cli, limits: Option<&salvage::limits::Limits>) -> Result<HttpStore> {
     let bucket = cli
         .common
         .bucket
@@ -431,13 +451,18 @@ fn object_store(cli: &Cli) -> Result<HttpStore> {
         },
     };
 
-    // Until the pinned overrides are loaded (step 6), the transfer budget is the conservative
-    // default rather than the per-table one. It is a real cap either way: nothing in the HTTP
-    // stack provides a total budget.
-    let budget = TransferBudget {
-        wall_clock: std::time::Duration::from_secs(3600),
-        max_bytes: 256 * 1024 * 1024,
-    };
+    // From the pinned per-table limits when we have them. `teardown` has no table overrides, so it
+    // falls back to a conservative default -- but every path that moves data uses the pinned
+    // values, or `wall_clock_secs` and `max_compressed_bytes` would be correctly-spelled keys that
+    // are silently never read, which is the exact failure `deny_unknown_fields` exists to prevent
+    // everywhere else in this crate.
+    let budget = limits.map_or(
+        TransferBudget {
+            wall_clock: std::time::Duration::from_secs(3600),
+            max_bytes: 256 * 1024 * 1024,
+        },
+        TransferBudget::from_limits,
+    );
 
     HttpStore::new(bucket.as_str(), tokens, budget, session_dir)
 }

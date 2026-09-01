@@ -101,6 +101,17 @@ pub fn frame_tsv(
     }
 
     let width = expected.len();
+    // The exact-width check below is stricter, but the pinned cap is an independent upper guard:
+    // if the expectation itself were ever built wrong, this is what stops a 10,000-column row
+    // being parsed at all.
+    if u64::try_from(width).unwrap_or(u64::MAX) > u64::from(limits.max_fields_per_row) {
+        return abort("the expected column count exceeds the pinned field cap").map_err(
+            |e: SalvageError| {
+                e.with("columns", width)
+                    .with("cap", limits.max_fields_per_row)
+            },
+        );
+    }
     let mut rows = Vec::new();
     for (i, line) in lines.enumerate() {
         if line.is_empty() {

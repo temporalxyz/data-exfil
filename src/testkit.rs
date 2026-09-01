@@ -1036,3 +1036,57 @@ pub fn gzip_with_trailing(bytes: &[u8], trailing: &[u8]) -> Vec<u8> {
 pub fn gzip_bomb(uncompressed_bytes: usize) -> Vec<u8> {
     gzip(&vec![0u8; uncompressed_bytes])
 }
+
+// -- the insert-test double ----------------------------------------------------------------------
+
+use crate::audit::insert::{InsertPlan, InsertTester};
+
+/// Records every insert test the pipeline attempts, and succeeds.
+///
+/// Deliberately a *recorder* rather than a skip: the audit tests assert that the insert test was
+/// **attempted**, with the right staging table and the right column list, on every page. A double
+/// that merely returned `Ok` would let a pipeline that forgot the phase entirely pass its tests --
+/// which, with no Q3 in this topology, is the last real-parser check going missing unnoticed.
+#[derive(Debug, Default)]
+pub struct RecordingInsertTester {
+    plans: Mutex<Vec<InsertPlan>>,
+    /// When set, the nth call fails, standing in for a real parser rejecting the data.
+    fail_on_call: Option<usize>,
+}
+
+impl RecordingInsertTester {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fail the `n`th call (1-based), as a real ClickHouse would on a value that satisfied every
+    /// regex and still could not be parsed.
+    #[must_use]
+    pub fn failing_on(mut self, n: usize) -> Self {
+        self.fail_on_call = Some(n);
+        self
+    }
+
+    pub fn attempted(&self) -> Vec<InsertPlan> {
+        self.plans.lock().map(|p| p.clone()).unwrap_or_default()
+    }
+}
+
+impl InsertTester for RecordingInsertTester {
+    fn test(&self, plan: &InsertPlan) -> Result<()> {
+        let n = {
+            let Ok(mut plans) = self.plans.lock() else {
+                return infra("RecordingInsertTester mutex poisoned");
+            };
+            plans.push(plan.clone());
+            plans.len()
+        };
+        if self.fail_on_call == Some(n) {
+            return crate::abort::abort("the insert test rejected the data").map_err(
+                |e: crate::abort::SalvageError| e.with("staging_table", plan.staging_table.clone()),
+            );
+        }
+        Ok(())
+    }
+}

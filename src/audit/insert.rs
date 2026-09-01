@@ -92,6 +92,47 @@ pub fn drop_argv(target: &InsertTarget, staging_table: &str) -> Vec<String> {
     ]
 }
 
+/// Everything one insert test needs.
+#[derive(Debug, Clone)]
+pub struct InsertPlan {
+    pub staging_table: String,
+    pub quarantine_ddl: String,
+    pub columns: Vec<String>,
+    pub tsv: std::path::PathBuf,
+}
+
+/// The seam, so the audit pipeline can be exercised without a container runtime.
+///
+/// There is deliberately **no "skip" implementation**. A missing runtime is `Infra` -- exit 3, "we
+/// never got to look" -- and not a phase that quietly passes. Section 7 puts this test *before*
+/// anything reaches the clean bucket, and with no Q3 in this topology (deviation D2) it is the only
+/// point where a real ClickHouse parser meets the data before the consumer's does. A tool that
+/// shrugged and promoted anyway would have removed the last real-parser check in the chain and
+/// still reported success.
+pub trait InsertTester {
+    fn test(&self, plan: &InsertPlan) -> Result<()>;
+}
+
+/// The real one: subprocess `clickhouse-client` against a disposable instance.
+#[derive(Debug, Clone)]
+pub struct SubprocessTester {
+    pub target: InsertTarget,
+    pub dry_run: bool,
+}
+
+impl InsertTester for SubprocessTester {
+    fn test(&self, plan: &InsertPlan) -> Result<()> {
+        run_insert_test(
+            &self.target,
+            &plan.staging_table,
+            &plan.quarantine_ddl,
+            &plan.columns,
+            &plan.tsv,
+            self.dry_run,
+        )
+    }
+}
+
 /// Run the insert test.
 ///
 /// The only phase permitted to return `Infra` for "no container runtime": on a laptop there is no
@@ -183,4 +224,143 @@ fn check(output: &std::process::Output, what: &str) -> Result<()> {
             .with("status", output.status.code().unwrap_or(-1))
             .with("stderr", stderr.chars().take(400).collect::<String>())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target() -> InsertTarget {
+        InsertTarget {
+            runner: "local".to_owned(),
+            image: "clickhouse/clickhouse-server@sha256:deadbeef".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            max_memory_usage: 1_073_741_824,
+            max_insert_block_size: 65_536,
+        }
+    }
+
+    #[test]
+    fn the_argv_carries_section_9s_flag_set_verbatim() {
+        let argv = insert_argv(
+            &target(),
+            "staging.`t__b1__0`",
+            &["a".to_owned(), "b".to_owned()],
+        );
+        let joined = argv.join(" ");
+
+        // Every flag, in the source's own spelling. The set is passed to the binary that documents
+        // it rather than translated into HTTP settings, because a mistranslation here silently
+        // re-enables the coercion the quarantine design exists to prevent.
+        for flag in [
+            "--input_format_with_names_use_header=1",
+            "--input_format_skip_unknown_fields=0",
+            "--input_format_null_as_default=0",
+            "--input_format_tsv_empty_as_default=0",
+            "--input_format_defaults_for_omitted_fields=0",
+            "--input_format_allow_errors_num=0",
+            "--input_format_allow_errors_ratio=0",
+            "--input_format_parallel_parsing=0",
+            "--async_insert=0",
+        ] {
+            assert!(joined.contains(flag), "missing {flag} in:\n{joined}");
+        }
+        assert!(joined.contains("--max_memory_usage=1073741824"), "{joined}");
+        assert!(joined.contains("--max_insert_block_size=65536"), "{joined}");
+    }
+
+    #[test]
+    fn skip_unknown_fields_is_explicitly_zero_because_its_default_is_one() {
+        // Left alone it defaults to 1: extra columns are silently discarded and schema drift
+        // passes undetected. The explicit =0 is what enforces "zero skipped".
+        let argv = insert_argv(&target(), "staging.`t__b1__0`", &["a".to_owned()]);
+        assert!(
+            argv.iter()
+                .any(|a| a == "--input_format_skip_unknown_fields=0")
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a == "--input_format_skip_unknown_fields=1")
+        );
+    }
+
+    #[test]
+    fn the_format_and_the_header_flag_agree() {
+        // Importing a headered file as plain TabSeparated consumes the header as data. The format
+        // and the flag have to be chosen together or the first row is silently lost.
+        let argv = insert_argv(&target(), "staging.`t__b1__0`", &["a".to_owned()]);
+        let query = argv.iter().find(|a| a.starts_with("--query=")).unwrap();
+        assert!(query.contains("FORMAT TabSeparatedWithNames"), "{query}");
+        assert!(
+            argv.iter()
+                .any(|a| a == "--input_format_with_names_use_header=1")
+        );
+    }
+
+    #[test]
+    fn the_column_list_is_explicit_and_quoted() {
+        let argv = insert_argv(
+            &target(),
+            "staging.`t__b1__0`",
+            &["ts".to_owned(), "events.kind".to_owned()],
+        );
+        let query = argv.iter().find(|a| a.starts_with("--query=")).unwrap();
+        // Never `INSERT INTO t VALUES` positionally: the header check is only meaningful against a
+        // named list, and flattened names carry a dot that must be quoted.
+        assert!(query.contains("(`ts`, `events.kind`)"), "{query}");
+    }
+
+    #[test]
+    fn the_drop_is_synchronous_so_a_retry_cannot_land_on_a_half_dropped_table() {
+        let argv = drop_argv(&target(), "staging.`t__b1__0`");
+        assert!(argv.iter().any(|a| a.contains("DROP TABLE IF EXISTS")));
+        assert!(argv.iter().any(|a| a.contains("SYNC")), "{argv:?}");
+    }
+
+    #[test]
+    fn a_dry_run_builds_every_command_and_executes_none() {
+        // A dry run that skipped the code path would prove nothing, and this is the single most
+        // review-worthy command in the tool.
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("page.tsv");
+        std::fs::write(&tsv, b"a\n1\n").unwrap();
+        let tester = SubprocessTester {
+            target: target(),
+            dry_run: true,
+        };
+        tester
+            .test(&InsertPlan {
+                staging_table: "staging.`t__b1__0`".to_owned(),
+                quarantine_ddl: "CREATE TABLE staging.`t__b1__0` (`a` String) ENGINE = MergeTree ORDER BY tuple()".to_owned(),
+                columns: vec!["a".to_owned()],
+                tsv,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_missing_runtime_is_infrastructure_and_never_a_quiet_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("page.tsv");
+        std::fs::write(&tsv, b"a\n1\n").unwrap();
+        let mut t = target();
+        t.runner = "definitely-not-a-real-binary-9f3a".to_owned();
+        let err = SubprocessTester {
+            target: t,
+            dry_run: false,
+        }
+        .test(&InsertPlan {
+            staging_table: "staging.`t__b1__0`".to_owned(),
+            quarantine_ddl: "CREATE TABLE x (a String) ENGINE = MergeTree ORDER BY tuple()"
+                .to_owned(),
+            columns: vec!["a".to_owned()],
+            tsv,
+        })
+        .unwrap_err();
+
+        // Exit 3, not exit 0. With no Q3 in this topology, skipping this test would remove the
+        // last point at which a real parser sees the data.
+        assert_eq!(err.exit_code(), crate::abort::ExitCode::Infra);
+    }
 }

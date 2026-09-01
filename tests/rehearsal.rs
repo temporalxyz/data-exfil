@@ -27,7 +27,9 @@ use salvage::export::plan::ClusterFacts;
 use salvage::export::{ExportOptions, run_export};
 use salvage::models::{Overrides, PagesJson, PayloadInventory};
 use salvage::teardown::{Disposition, TeardownPlan, run_teardown};
-use salvage::testkit::{FakeRunner, LocalStore, TarForge, gzip_concatenated, gzip_with_trailing};
+use salvage::testkit::{
+    FakeRunner, LocalStore, RecordingInsertTester, TarForge, gzip_concatenated, gzip_with_trailing,
+};
 
 const OVERRIDES: &str = include_str!("../overrides/typematrix.typematrix.toml");
 
@@ -237,6 +239,7 @@ fn items_8_and_10_a_single_rejected_row_aborts_and_delivers_no_subset() {
         &ddl(),
         &overrides(),
         &s,
+        &RecordingInsertTester::new(),
         &ledger,
         &audit_opts(dir.path(), Mode::Enforce),
     )
@@ -281,6 +284,7 @@ fn item_9_one_value_per_catalogue_class_halts_the_run() {
                 &ddl(),
                 &overrides(),
                 &s,
+                &RecordingInsertTester::new(),
                 &ledger,
                 &audit_opts(dir.path(), Mode::Enforce)
             )
@@ -304,6 +308,7 @@ fn item_9_one_value_per_catalogue_class_halts_the_run() {
                 &ddl(),
                 &overrides(),
                 &s,
+                &RecordingInsertTester::new(),
                 &ledger,
                 &audit_opts(dir.path(), Mode::Enforce)
             )
@@ -336,6 +341,7 @@ fn item_12_the_survey_enumerates_every_finding_and_writes_nothing_forward() {
             &ddl(),
             &overrides(),
             &s,
+            &RecordingInsertTester::new(),
             &ledger,
             &audit_opts(dir.path(), Mode::Survey)
         )
@@ -480,6 +486,7 @@ fn a7h_promotion_is_all_or_nothing_across_the_table_s_pages() {
             &ddl(),
             &overrides(),
             &s,
+            &RecordingInsertTester::new(),
             &ledger,
             &audit_opts(dir.path(), Mode::Enforce)
         )
@@ -501,6 +508,7 @@ fn item_6_a_pinned_generation_that_does_not_exist_is_refused() {
             &ddl(),
             &overrides(),
             &s,
+            &RecordingInsertTester::new(),
             &ledger,
             &audit_opts(dir.path(), Mode::Enforce)
         )
@@ -522,6 +530,7 @@ fn the_clean_path_runs_end_to_end_with_no_network_and_no_clickhouse() {
         &ddl(),
         &overrides(),
         &s,
+        &RecordingInsertTester::new(),
         &ledger,
         &audit_opts(dir.path(), Mode::Enforce),
     )

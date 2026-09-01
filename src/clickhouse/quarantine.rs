@@ -118,6 +118,17 @@ pub fn output_columns(ddl: &PinnedDdl, overrides: &Overrides) -> Result<Vec<Outp
             continue;
         }
 
+        // Section 8.4's nesting cap, applied to the declared type. Bounding the type bounds every
+        // value it can hold, so this is checked once here rather than per row.
+        let depth = column.ty.depth();
+        if depth > overrides.limits.max_nesting_depth {
+            return Err(usage::<()>("column type nests deeper than the pinned cap")
+                .unwrap_err()
+                .with("column", column.name.as_str())
+                .with("depth", depth)
+                .with("cap", overrides.limits.max_nesting_depth));
+        }
+
         let rules = rules_for(&column.ty, overrides.limits.max_array_elements)
             .map_err(|e| e.with("column", column.name.as_str()))?;
 
@@ -452,5 +463,50 @@ mod tests {
             },
         );
         assert!(output_columns(&ddl, &over).is_err());
+    }
+
+    #[test]
+    fn a_type_nesting_deeper_than_the_pinned_cap_is_refused() {
+        // Section 8.4's nesting cap, which was declared and never read until now. Enforced on the
+        // declared type: bounding the type bounds every value it can hold, once, rather than per
+        // row.
+        let deep = parse_create_table(
+            "CREATE TABLE db.t (`a` UInt8, `nest` Array(Array(Array(Array(String))))) \
+             ENGINE = MergeTree ORDER BY (`a`)",
+        )
+        .unwrap();
+        let mut over = toml::from_str::<Overrides>(MATRIX_OVERRIDES).unwrap();
+        over.limits.max_nesting_depth = 3;
+        let err = output_columns(&deep, &over).unwrap_err();
+        assert!(err.to_string().contains("nests deeper"), "{err}");
+
+        // Raise the cap and the same type is fine, which is what makes it a pinned decision
+        // rather than a hard-coded one.
+        over.limits.max_nesting_depth = 8;
+        assert!(output_columns(&deep, &over).is_ok());
+    }
+
+    #[test]
+    fn depth_counts_the_outermost_level_and_takes_the_deepest_branch() {
+        use crate::clickhouse::types::parse_type;
+        assert_eq!(parse_type("String").unwrap().depth(), 1);
+        assert_eq!(parse_type("Nullable(String)").unwrap().depth(), 2);
+        assert_eq!(parse_type("Array(Nullable(String))").unwrap().depth(), 3);
+        // A composite is as deep as its deepest member, not the sum.
+        assert_eq!(
+            parse_type("Tuple(UInt8, Array(Array(String)))")
+                .unwrap()
+                .depth(),
+            4
+        );
+        assert_eq!(parse_type("Map(String, Array(UInt8))").unwrap().depth(), 3);
+    }
+
+    #[test]
+    fn the_pinned_matrix_fits_inside_its_own_pinned_depth_cap() {
+        // The fixture and the overrides that ship with it have to agree, or the worked example
+        // does not work.
+        let (ddl, over) = fixture();
+        assert!(output_columns(&ddl, &over).is_ok());
     }
 }

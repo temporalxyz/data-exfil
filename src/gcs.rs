@@ -41,7 +41,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::abort::{PartialOutput, Result, SalvageError, infra, usage};
-use crate::limits::{Limits, OrOverflow as _};
+use crate::limits::{OrOverflow as _, TransferBudget, copy_bounded};
 
 /// A GCS object generation. Named `Generation`, never `gen` -- `gen` is a reserved keyword in
 /// edition 2024.
@@ -272,30 +272,6 @@ pub const SCOPE_READ_ONLY: &str = "https://www.googleapis.com/auth/devstorage.re
 pub const SCOPE_WRITE_ONLY: &str = "https://www.googleapis.com/auth/devstorage.write_only";
 /// Read-write, needed only for holds and retention (`storage.objects.update`).
 pub const SCOPE_READ_WRITE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
-
-/// The wall-clock and byte budget for one transfer.
-///
-/// This exists because **nothing in the HTTP stack provides a total budget.** Verified against the
-/// vendored source: `reqwest::blocking::ClientBuilder` has no `read_timeout` at all, and the
-/// client-level `.timeout()` recomputes `Instant::now() + d` on every `read()`, so a server that
-/// drips one byte per second streams forever without ever tripping it. Section 8.4's wall-clock cap
-/// is therefore ours to enforce, in the copy loop, or it does not exist.
-#[derive(Debug, Clone, Copy)]
-pub struct TransferBudget {
-    pub wall_clock: Duration,
-    pub max_bytes: u64,
-}
-
-impl TransferBudget {
-    /// Derive from the pinned per-table limits.
-    #[must_use]
-    pub fn from_limits(limits: &Limits) -> Self {
-        Self {
-            wall_clock: Duration::from_secs(limits.wall_clock_secs),
-            max_bytes: limits.max_compressed_bytes,
-        }
-    }
-}
 
 /// 8 MiB. GCS requires every non-final resumable chunk to be a multiple of 256 KiB.
 const UPLOAD_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
@@ -551,11 +527,7 @@ impl ObjectStore for HttpStore {
             infra::<()>(format!("could not open download destination: {e}")).unwrap_err()
         })?;
 
-        let budget = TransferBudget {
-            wall_clock: self.budget.wall_clock,
-            max_bytes: self.budget.max_bytes,
-        };
-        copy_bounded(resp, &mut out, budget, self.deadline())?;
+        copy_bounded(resp, &mut out, self.budget, self.deadline())?;
         drop(out);
         guard.commit_as(dest)
     }
@@ -732,48 +704,6 @@ fn committed_from_range(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let raw = headers.get(reqwest::header::RANGE)?.to_str().ok()?;
     let end = raw.rsplit('-').next()?;
     end.parse::<u64>().ok().map(|n| n.saturating_add(1))
-}
-
-/// Copy a response body under both a byte cap and a wall-clock deadline.
-///
-/// Both checks are inside the loop, and that placement is the whole point: a cap checked after the
-/// copy has already consumed the disk, and a timeout that resets per read never fires against a
-/// slow drip. This is section 8.4's host-stage wall-clock limit, and nothing else in the process
-/// implements it.
-fn copy_bounded(
-    mut src: impl std::io::Read,
-    dest: &mut impl std::io::Write,
-    budget: TransferBudget,
-    deadline: Instant,
-) -> Result<u64> {
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        if Instant::now() > deadline {
-            return infra("transfer exceeded its wall-clock budget")
-                .map_err(|e: SalvageError| {
-                    e.with("bytes_so_far", total)
-                        .with("budget_secs", budget.wall_clock.as_secs())
-                })
-                .map(|()| 0);
-        }
-        let n = src
-            .read(&mut buf)
-            .map_err(|e| infra::<()>(format!("read failed mid-transfer: {e}")).unwrap_err())?;
-        if n == 0 {
-            return Ok(total);
-        }
-        total = total.checked_add(n as u64).or_overflow("transfer_bytes")?;
-        if total > budget.max_bytes {
-            return infra("transfer exceeded its byte cap")
-                .map_err(|e: SalvageError| {
-                    e.with("cap", budget.max_bytes).with("bytes_so_far", total)
-                })
-                .map(|()| 0);
-        }
-        dest.write_all(&buf[..n])
-            .map_err(|e| infra::<()>(format!("write failed mid-transfer: {e}")).unwrap_err())?;
-    }
 }
 
 /// Read a control-plane response body under a hard cap.
@@ -1046,61 +976,6 @@ mod tests {
     }
 
     #[test]
-    fn the_copy_loop_stops_at_the_byte_cap() {
-        let src = vec![0u8; 4096];
-        let mut out = Vec::new();
-        let budget = TransferBudget {
-            wall_clock: Duration::from_secs(60),
-            max_bytes: 1024,
-        };
-        let err = copy_bounded(
-            &src[..],
-            &mut out,
-            budget,
-            Instant::now() + Duration::from_secs(60),
-        )
-        .unwrap_err();
-        assert_eq!(err.exit_code(), crate::abort::ExitCode::Infra);
-        assert!(err.to_string().contains("byte cap"), "{err}");
-    }
-
-    #[test]
-    fn the_copy_loop_stops_at_the_deadline() {
-        // Section 8.4's wall-clock cap. Nothing in the HTTP stack provides a total budget: a
-        // per-read timeout resets on every read, so without this a slow drip streams forever.
-        let src = vec![0u8; 4096];
-        let mut out = Vec::new();
-        let budget = TransferBudget {
-            wall_clock: Duration::from_secs(1),
-            max_bytes: u64::MAX,
-        };
-        let already_past = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .expect("test clock");
-        let err = copy_bounded(&src[..], &mut out, budget, already_past).unwrap_err();
-        assert!(err.to_string().contains("wall-clock"), "{err}");
-    }
-
-    #[test]
-    fn a_transfer_inside_both_bounds_copies_exactly() {
-        let src = b"exactly these bytes".to_vec();
-        let mut out = Vec::new();
-        let budget = TransferBudget {
-            wall_clock: Duration::from_secs(60),
-            max_bytes: 1024,
-        };
-        let n = copy_bounded(
-            &src[..],
-            &mut out,
-            budget,
-            Instant::now() + Duration::from_secs(60),
-        )
-        .unwrap();
-        assert_eq!(n, src.len() as u64);
-        assert_eq!(out, src);
-    }
-
-    #[test]
     fn a_generation_larger_than_2_pow_53_survives_the_round_trip() {
         // Generations come back as JSON *strings* precisely because they exceed what a double can
         // hold. Parsing one as a number would silently round it, and a rounded generation pins the
@@ -1149,28 +1024,5 @@ mod tests {
             committed_from_range(&reqwest::header::HeaderMap::new()),
             None
         );
-    }
-
-    #[test]
-    fn the_transfer_budget_comes_from_the_pinned_limits() {
-        let limits = crate::limits::Limits {
-            max_compressed_bytes: 268_435_456,
-            max_uncompressed_bytes: 1_073_741_824,
-            max_expansion_ratio: 100,
-            max_rows_per_page: 5_000_000,
-            max_fields_per_row: 64,
-            max_field_bytes: 1_048_576,
-            max_array_elements: 4096,
-            max_nesting_depth: 8,
-            max_tar_members: 16,
-            max_tar_member_bytes: 1_073_741_824,
-            max_tar_name_bytes: 128,
-            max_decode_rounds: 1,
-            max_decode_expansion_ratio: 8,
-            wall_clock_secs: 3600,
-        };
-        let b = TransferBudget::from_limits(&limits);
-        assert_eq!(b.max_bytes, 268_435_456);
-        assert_eq!(b.wall_clock, Duration::from_secs(3600));
     }
 }

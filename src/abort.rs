@@ -186,6 +186,114 @@ impl Drop for PartialOutput {
     }
 }
 
+/// A directory of in-progress work that becomes visible in one atomic step, or not at all.
+///
+/// [`PartialOutput`] makes a single file all-or-nothing. This makes a whole batch all-or-nothing,
+/// which is what section 8.0 needs now that the batch is table-scoped: *"nothing partial is ever
+/// delivered, and no subset is assembled from a run that found something."* Individual pages are
+/// still `PartialOutput` files **inside** the staging directory, so a crash mid-page is clean at
+/// the file level; one `rename(2)` of the directory makes the batch visible at the batch level.
+/// Two-phase commit with the filesystem doing phase two.
+///
+/// # Why the staging directory is a sibling of the destination
+///
+/// [`StagingDir::inside`] derives the staging path from `dest` rather than using the system
+/// temporary directory, because `rename(2)` cannot cross a filesystem boundary. On macOS
+/// `std::env::temp_dir()` is on a different device from a repository checkout, so a design that
+/// staged in `/tmp` would fail with `EXDEV` only on some machines -- and pass every test written
+/// on the others.
+#[derive(Debug)]
+pub struct StagingDir {
+    staged: PathBuf,
+    dest: PathBuf,
+    committed: bool,
+}
+
+impl StagingDir {
+    /// Create a staging directory beside `dest`.
+    ///
+    /// Fails if `dest` already exists: that is `Usage`, not `Infra`, because `Infra` is the
+    /// resumable class and "this batch was already promoted" is not something a retry fixes.
+    pub fn inside(dest: PathBuf) -> Result<Self> {
+        if dest.exists() {
+            return Err(SalvageError::Usage {
+                reason: "batch is already promoted; pick a new --batch or run teardown".to_owned(),
+                context: vec![("path", dest.display().to_string())],
+            });
+        }
+        let parent = dest
+            .parent()
+            .ok_or_else(|| SalvageError::Usage {
+                reason: "destination has no parent directory".to_owned(),
+                context: vec![("path", dest.display().to_string())],
+            })?
+            .to_path_buf();
+        std::fs::create_dir_all(&parent).map_err(|e| SalvageError::Infra {
+            reason: format!("could not create the destination's parent: {e}"),
+            context: vec![("path", parent.display().to_string())],
+        })?;
+
+        let name =
+            dest.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| SalvageError::Usage {
+                    reason: "destination has no usable name".to_owned(),
+                    context: Vec::new(),
+                })?;
+        let staged = parent.join(format!(".{name}.staging"));
+        // A leftover from a previous crashed run. Removing it is safe precisely because it was
+        // never promoted -- nothing has ever read from a staging directory.
+        if staged.exists() {
+            let _ = std::fs::remove_dir_all(&staged);
+        }
+        std::fs::create_dir_all(&staged).map_err(|e| SalvageError::Infra {
+            reason: format!("could not create the staging directory: {e}"),
+            context: vec![("path", staged.display().to_string())],
+        })?;
+
+        Ok(Self {
+            staged,
+            dest,
+            committed: false,
+        })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.staged
+    }
+
+    #[must_use]
+    pub fn destination(&self) -> &Path {
+        &self.dest
+    }
+
+    /// Make the whole batch visible in one step.
+    pub fn promote(&mut self) -> Result<()> {
+        std::fs::rename(&self.staged, &self.dest).map_err(|e| {
+            SalvageError::Infra {
+                reason: format!("could not promote the staging directory: {e}"),
+                context: Vec::new(),
+            }
+            .with("from", self.staged.display())
+            .with("to", self.dest.display())
+        })?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Best effort, and never a panic inside Drop. An unpromoted staging directory is inert:
+        // nothing reads from one, and the caller's report records why the run died.
+        let _ = std::fs::remove_dir_all(&self.staged);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -266,5 +374,79 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("events.hits"), "{msg}");
         assert!(msg.contains("user_agent"), "{msg}");
+    }
+
+    #[test]
+    fn an_unpromoted_staging_dir_takes_its_contents_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("b1");
+        let staged_path;
+        {
+            let staging = StagingDir::inside(dest.clone()).unwrap();
+            staged_path = staging.path().to_path_buf();
+            std::fs::write(staging.path().join("page-0000.tar.gz"), b"half a batch").unwrap();
+            assert!(staged_path.exists());
+        }
+        assert!(
+            !staged_path.exists(),
+            "section 8.0: no subset survives a failed run"
+        );
+        assert!(!dest.exists(), "and nothing was promoted");
+    }
+
+    #[test]
+    fn promotion_makes_every_page_visible_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("b1");
+        let mut staging = StagingDir::inside(dest.clone()).unwrap();
+        for i in 0..3 {
+            std::fs::write(staging.path().join(format!("page-{i:04}.tar.gz")), b"x").unwrap();
+        }
+        assert!(!dest.exists(), "nothing is visible before promotion");
+        staging.promote().unwrap();
+        drop(staging);
+        assert!(dest.join("page-0000.tar.gz").exists());
+        assert!(dest.join("page-0002.tar.gz").exists());
+    }
+
+    #[test]
+    fn the_staging_dir_is_a_sibling_so_the_rename_cannot_cross_a_filesystem() {
+        // EXDEV: `rename(2)` cannot cross devices, and on macOS the system temp dir is on a
+        // different one from a checkout. Staging in /tmp would fail on some machines and pass
+        // every test written on the others. Promoting *into* a tempdir is the direction that
+        // actually exercises this.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("nested").join("b1");
+        let mut staging = StagingDir::inside(dest.clone()).unwrap();
+        assert_eq!(staging.path().parent(), dest.parent());
+        std::fs::write(staging.path().join("f"), b"x").unwrap();
+        staging.promote().unwrap();
+        assert!(dest.join("f").exists());
+    }
+
+    #[test]
+    fn promoting_over_an_existing_batch_is_a_usage_error_not_a_resumable_one() {
+        // Infra is the resumable class, and "this batch already exists" is not something a retry
+        // fixes -- it needs a new --batch or a teardown.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("b1");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err = StagingDir::inside(dest).unwrap_err();
+        assert_eq!(err.exit_code(), ExitCode::Usage);
+    }
+
+    #[test]
+    fn a_leftover_staging_dir_from_a_crashed_run_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("b1");
+        let orphan = dir.path().join(".b1.staging");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("stale"), b"from a crash").unwrap();
+
+        let staging = StagingDir::inside(dest).unwrap();
+        assert!(
+            !staging.path().join("stale").exists(),
+            "a stale page must not be carried forward"
+        );
     }
 }

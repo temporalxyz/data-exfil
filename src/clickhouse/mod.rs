@@ -16,6 +16,7 @@
 //! that the far side is hostile and nothing may parse its output before we have validated it --
 //! so the seam must not pre-parse, and no dependency may deserialize on our behalf.
 
+pub mod client;
 pub mod ddl;
 pub mod quarantine;
 pub mod settings;
@@ -31,7 +32,7 @@ use crate::clickhouse::settings::Settings;
 pub enum QueryKind {
     /// Cluster and settings cross-checks; reads no table data.
     Introspect,
-    /// The quiesce fingerprint: counts and part rows, before and after.
+    /// Row counts and part rows, for the reconciliation.
     Fingerprint,
     /// A page of table data.
     Page,
@@ -43,6 +44,9 @@ pub enum QueryKind {
 /// leaves without pinned SETTINGS" a property of the type instead of a review item.
 #[derive(Debug, Clone)]
 pub struct Query {
+    /// The statement **without** `SETTINGS` and **without** `FORMAT`. The client appends both and
+    /// refuses SQL that already carries either, which is what makes "no query leaves without the
+    /// pinned settings" a property of the type rather than a review item.
     pub sql: String,
     pub settings: &'static Settings,
     pub kind: QueryKind,

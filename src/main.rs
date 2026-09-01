@@ -24,8 +24,11 @@ use clap::Parser;
 use salvage::abort::{ExitCode, Result, SalvageError};
 use salvage::audit::secrets;
 use salvage::cli::{Cli, Command};
+use salvage::clickhouse::client::{Endpoint, HttpRunner};
 use salvage::clickhouse::ddl;
-use salvage::gcs::{self, HttpStore, TokenSource, TransferBudget};
+use salvage::export::plan;
+use salvage::gcs::{self, HttpStore, ObjectStore as _, TokenSource};
+use salvage::limits::TransferBudget;
 use salvage::{audit, export};
 
 fn main() -> ProcessExitCode {
@@ -72,19 +75,277 @@ fn main() -> ProcessExitCode {
 
 fn dispatch(cli: &Cli) -> Result<()> {
     match &cli.command {
-        Command::Plan(_) => Err(not_implemented("plan")),
-        Command::Export(args) => {
-            let store = object_store(cli)?;
-            let runner = no_runner()?;
-            export::run(args, runner.as_ref(), &store)
-        }
-        Command::Audit(args) => {
-            let store = object_store(cli)?;
-            audit::run(args, &store)
-        }
+        Command::Plan(args) => cmd_plan(cli, args),
+        Command::Export(args) => cmd_export(cli, args),
+        Command::Audit(args) => cmd_audit(cli, args),
         Command::Secrets => cmd_secrets(cli),
-        Command::Teardown(_) => Err(not_implemented("teardown")),
+        Command::Teardown(args) => cmd_teardown(cli, args),
     }
+}
+
+/// `salvage teardown` -- release holds, and force the source disposition to be recorded.
+fn cmd_teardown(cli: &Cli, args: &salvage::cli::TeardownArgs) -> Result<()> {
+    use salvage::teardown::{Disposition, TeardownPlan, run_teardown, write_report};
+
+    let table = args.table.table.qualified();
+    let batch = args.batch.batch.as_str().to_owned();
+    let store = object_store(cli)?;
+
+    std::fs::create_dir_all(&cli.common.work).map_err(|e| SalvageError::Infra {
+        reason: format!("could not create the work dir: {e}"),
+        context: Vec::new(),
+    })?;
+
+    let plan = TeardownPlan {
+        raw_prefix: format!("{table}/{batch}"),
+        table,
+        batch,
+        disposition: match args.disposition {
+            salvage::cli::Disposition::Wipe => Disposition::Wipe,
+            salvage::cli::Disposition::SnapshotThenWipe => Disposition::SnapshotThenWipe,
+            salvage::cli::Disposition::Retain => Disposition::Retain,
+        },
+        owner: args.owner.clone(),
+        accepted: args.accepted,
+        rotation_complete: args.rotation_complete,
+        dry_run: cli.common.dry_run,
+    };
+
+    let body = run_teardown(&plan, &store)?;
+    let path = write_report(&body, &cli.common.work)?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+/// `salvage audit` -- pull, frame, bound, profile, regenerate, promote.
+fn cmd_audit(cli: &Cli, args: &salvage::cli::AuditArgs) -> Result<()> {
+    let table = args.table.table.qualified();
+    let batch = args.batch.batch.as_str().to_owned();
+    let (ddl, overrides) = ddl::load_one(&cli.common.ddl_dir, &cli.common.overrides_dir, &table)?;
+    let store = object_store(cli)?;
+
+    // `PAGES.json` is the completion sentinel. Its absence means the export never finished, and a
+    // prefix without it is an incomplete run a consumer must treat as absent.
+    let raw_prefix = format!("{table}/{batch}");
+    let local_ledger = cli.common.work.join(&batch).join("PAGES.json");
+    let ledger_text = if local_ledger.exists() {
+        std::fs::read_to_string(&local_ledger).map_err(|e| SalvageError::Infra {
+            reason: format!("could not read the local ledger: {e}"),
+            context: vec![("path", local_ledger.display().to_string())],
+        })?
+    } else {
+        let name = salvage::gcs::ObjectName::new(format!("{raw_prefix}/PAGES.json"))?;
+        let stat = store.stat(&name)?.ok_or_else(|| SalvageError::Abort {
+            reason: "no PAGES.json: the export never finished".to_owned(),
+            context: vec![("prefix", raw_prefix.clone())],
+        })?;
+        // The Controller pins this generation out of band; reading the live one is a convenience
+        // for a single-operator run and is recorded as such.
+        tracing::warn!(
+            generation = %stat.generation,
+            "using the live PAGES.json generation; the Controller's pinned value is the control"
+        );
+        let dest = cli.common.work.join("PAGES.json");
+        std::fs::create_dir_all(&cli.common.work).ok();
+        store.get_pinned(&name, stat.generation, &dest)?;
+        std::fs::read_to_string(&dest).map_err(|e| SalvageError::Infra {
+            reason: format!("could not read the pulled ledger: {e}"),
+            context: Vec::new(),
+        })?
+    };
+
+    let ledger: salvage::models::PagesJson =
+        serde_json::from_str(&ledger_text).map_err(|e| SalvageError::Abort {
+            reason: format!("the ledger does not parse: {e}"),
+            context: Vec::new(),
+        })?;
+
+    let opts = audit::AuditOptions {
+        batch: batch.clone(),
+        work: cli.common.work.clone(),
+        raw_prefix,
+        clean_prefix: format!("{table}/{batch}"),
+        mode: match args.mode {
+            salvage::cli::Mode::Survey => audit::Mode::Survey,
+            salvage::cli::Mode::Enforce => audit::Mode::Enforce,
+        },
+        dry_run: cli.common.dry_run,
+        contract_version: plan::CONTRACT_VERSION.to_owned(),
+        git_commit: plan::GIT_COMMIT.to_owned(),
+        shape_review_signoff: args.shape_review_signoff,
+        rotation_signoff: args.rotation_signoff,
+    };
+
+    let report = audit::run_audit(&ddl, &overrides, &store, &ledger, &opts)?;
+    if cli.common.json {
+        let rendered = serde_json::to_string_pretty(&report).map_err(|e| SalvageError::Infra {
+            reason: format!("could not render the report: {e}"),
+            context: Vec::new(),
+        })?;
+        println!("{rendered}");
+    } else {
+        println!("{}", cli.common.work.join("report.json").display());
+    }
+    Ok(())
+}
+
+/// `salvage export` -- page, diff, pack, push.
+///
+/// Needs both a cluster and a bucket, and says which is missing rather than defaulting either.
+fn cmd_export(cli: &Cli, args: &salvage::cli::ExportArgs) -> Result<()> {
+    let table = args.table.table.qualified();
+    let batch = args.batch.batch.as_str().to_owned();
+    let (ddl, overrides) = ddl::load_one(&cli.common.ddl_dir, &cli.common.overrides_dir, &table)?;
+
+    let url = cli
+        .common
+        .clickhouse_url
+        .as_ref()
+        .ok_or_else(|| SalvageError::Usage {
+            reason: "--clickhouse-url is required to export".to_owned(),
+            context: Vec::new(),
+        })?;
+    let store = object_store(cli)?;
+    let runner = query_runner(cli, url, ddl.database.as_str())?;
+
+    std::fs::create_dir_all(&cli.common.work).map_err(|e| SalvageError::Infra {
+        reason: format!("could not create the work dir: {e}"),
+        context: vec![("path", cli.common.work.display().to_string())],
+    })?;
+
+    // The cross-check runs before a single row is read. Section 4: the server's answer is a
+    // cross-check, never the authority -- and a table that is not what source control says it is
+    // must not be exported at all.
+    plan::assert_settings_known(&runner)?;
+    let cutoff = salvage::pages::cutoff_predicate(&ddl, &overrides)?;
+    let facts = plan::introspect(&runner, &ddl, &cutoff)?;
+    plan::cross_check(&ddl, &facts)?;
+    let doc = plan::build(&ddl, &overrides, Some(&facts))?;
+
+    let opts = export::ExportOptions {
+        batch: batch.clone(),
+        work: cli.common.work.clone(),
+        bucket_prefix: format!("{table}/{batch}"),
+        dry_run: cli.common.dry_run,
+        resume: args.resume,
+        contract_version: plan::CONTRACT_VERSION.to_owned(),
+        git_commit: plan::GIT_COMMIT.to_owned(),
+    };
+
+    let pages = export::run_export(
+        &ddl,
+        &overrides,
+        &runner,
+        &store,
+        &facts,
+        doc.rows_per_page,
+        &opts,
+    )?;
+
+    if cli.common.json {
+        let rendered = serde_json::to_string_pretty(&pages).map_err(|e| SalvageError::Infra {
+            reason: format!("could not render the ledger: {e}"),
+            context: Vec::new(),
+        })?;
+        println!("{rendered}");
+    } else {
+        println!("{}", cli.common.work.join(&batch).display());
+    }
+    tracing::info!(
+        table = %pages.table,
+        pages = pages.pages.len(),
+        rows = pages.total_rows,
+        "export complete"
+    );
+    Ok(())
+}
+
+/// `salvage plan` -- derive the contract, then ask the cluster to agree.
+///
+/// Section 4: the allowlist comes from source control and the server's answer is a cross-check,
+/// never the authority. So the plan is built from `ddl/` and `overrides/` first, and the cluster is
+/// consulted second -- or not at all, which `plan.json` records rather than hides.
+fn cmd_plan(cli: &Cli, args: &salvage::cli::PlanArgs) -> Result<()> {
+    let table = args.table.table.qualified();
+    let (ddl, overrides) = ddl::load_one(&cli.common.ddl_dir, &cli.common.overrides_dir, &table)?;
+
+    std::fs::create_dir_all(&cli.common.work).map_err(|e| SalvageError::Infra {
+        reason: format!("could not create the work dir: {e}"),
+        context: vec![("path", cli.common.work.display().to_string())],
+    })?;
+
+    let cutoff = salvage::pages::cutoff_predicate(&ddl, &overrides)?;
+    let facts = match &cli.common.clickhouse_url {
+        Some(url) => {
+            let runner = query_runner(cli, url, ddl.database.as_str())?;
+            // Addition A1's first caller: a pinned setting the server does not recognise is a
+            // setting we silently failed to pin, so it is checked before anything else is asked.
+            plan::assert_settings_known(&runner)?;
+            let facts = plan::introspect(&runner, &ddl, &cutoff)?;
+            plan::cross_check(&ddl, &facts)?;
+            Some(facts)
+        }
+        None => {
+            tracing::warn!(
+                "no --clickhouse-url: deriving the contract from pinned source control only. \
+                 plan.json will record that the cluster was not cross-checked."
+            );
+            None
+        }
+    };
+
+    let doc = plan::build(&ddl, &overrides, facts.as_ref())?;
+    let path = cli.common.work.join("plan.json");
+    let rendered = serde_json::to_string_pretty(&doc).map_err(|e| SalvageError::Infra {
+        reason: format!("could not render plan.json: {e}"),
+        context: Vec::new(),
+    })?;
+    let mut guard = salvage::abort::PartialOutput::new(path.with_extension("json.partial"));
+    std::fs::write(guard.path(), &rendered).map_err(|e| SalvageError::Infra {
+        reason: format!("could not write plan.json: {e}"),
+        context: vec![("path", path.display().to_string())],
+    })?;
+    guard.commit_as(&path)?;
+
+    if cli.common.json {
+        println!("{rendered}");
+    } else {
+        println!("{}", path.display());
+    }
+    tracing::info!(
+        table = %doc.table,
+        columns = doc.columns.len(),
+        output_columns = doc.output_columns.len(),
+        dropped = doc.dropped_columns.len(),
+        cursor = ?doc.cursor_columns,
+        rows_per_page = doc.rows_per_page,
+        cross_checked = doc.cluster_cross_checked,
+        "plan written"
+    );
+    Ok(())
+}
+
+/// Build the query runner. Constructed once, and only for the subcommands that talk to the source.
+fn query_runner(cli: &Cli, url: &str, database: &str) -> Result<HttpRunner> {
+    let budget = TransferBudget {
+        wall_clock: std::time::Duration::from_secs(3600),
+        max_bytes: 256 * 1024 * 1024,
+    };
+    // Read, never written: `std::env::set_var` is unsafe in edition 2024 and this crate forbids
+    // unsafe, so no test can set one either.
+    let password = std::env::var("SALVAGE_CH_PASSWORD")
+        .ok()
+        .filter(|p| !p.is_empty());
+    HttpRunner::new(
+        Endpoint {
+            base_url: url.to_owned(),
+            database: database.to_owned(),
+            user: cli.common.clickhouse_user.clone(),
+            password,
+        },
+        budget,
+        cli.common.work.join("queries.log"),
+    )
 }
 
 /// `salvage secrets` -- the rotation inventory (addition A3).
@@ -179,20 +440,6 @@ fn object_store(cli: &Cli) -> Result<HttpStore> {
     };
 
     HttpStore::new(bucket.as_str(), tokens, budget, session_dir)
-}
-
-/// Every unbuilt phase fails closed. A stub that returned `Ok` would report success for work it
-/// did not do, which is the one failure mode this tool cannot tolerate.
-fn not_implemented(phase: &str) -> SalvageError {
-    SalvageError::Infra {
-        reason: format!("{phase}: not implemented"),
-        context: Vec::new(),
-    }
-}
-
-/// The ClickHouse client does not exist yet, so there is no runner to hand to `export`.
-fn no_runner() -> Result<Box<dyn salvage::clickhouse::QueryRunner>> {
-    Err(not_implemented("clickhouse client"))
 }
 
 fn init_logging(cli: &Cli) {

@@ -172,6 +172,18 @@ pub struct Common {
     #[arg(long, global = true, default_value = "./overrides")]
     pub overrides_dir: PathBuf,
 
+    /// ClickHouse HTTP endpoint of the compromised cluster, e.g. `http://10.0.0.5:8123`.
+    ///
+    /// Optional for `plan`: without it the contract is derived from pinned source control alone
+    /// and `plan.json` records that the cluster was not cross-checked.
+    #[arg(long, global = true)]
+    pub clickhouse_url: Option<String>,
+
+    /// Read-only user on the compromised cluster. Assumed compromised from creation; see
+    /// `SECRETS-ROTATION.md`.
+    #[arg(long, global = true, default_value = "salvage_ro")]
+    pub clickhouse_user: String,
+
     /// Bucket this invocation reads from or writes to.
     ///
     /// Required by `export` and `audit`; `plan`, `secrets` and `teardown` touch no bucket, so it
@@ -227,7 +239,10 @@ pub enum Command {
     /// ABORTS ON: no NOT NULL key prefix available, or a cursor that is not a key prefix.
     Plan(PlanArgs),
 
-    /// Freeze the source, pull each page twice, diff, tar, push to the raw bucket.
+    /// Pull each page twice, diff, tar, push to the raw bucket.
+    ///
+    /// Does not freeze the source: stopping legitimate writers is an operational step handled out
+    /// of band, never by logging in to the compromised host.
     ///
     /// PROVES: the export errored rather than truncating, and both passes of every page agree
     /// byte for byte.
@@ -287,6 +302,20 @@ pub struct ExportArgs {
 
 #[derive(Debug, Args)]
 pub struct AuditArgs {
+    /// Section 9's shape review has been done and signed off by a person.
+    ///
+    /// Never set by this tool. It is a smell test by someone who knows the data, recorded as a
+    /// reviewed artifact rather than a passed check.
+    #[arg(long)]
+    pub shape_review_signoff: bool,
+
+    /// Addition A3's rotation inventory has been worked through.
+    ///
+    /// Rotation proceeds regardless of whether the batch ships; promotion waits on it because a
+    /// live credential in salvaged data is a live credential in the consumer's systems.
+    #[arg(long)]
+    pub rotation_signoff: bool,
+
     #[command(flatten)]
     pub table: TableArg,
     #[command(flatten)]
@@ -312,6 +341,32 @@ pub struct TeardownArgs {
     pub table: TableArg,
     #[command(flatten)]
     pub batch: BatchArg,
+
+    /// What happens to the compromised source. There is no default: the source plan never says,
+    /// and with no evidence preserved every option is irreversible.
+    #[arg(long, value_enum)]
+    pub disposition: Disposition,
+
+    /// The named person who owns that decision. Not a team and not a rota.
+    #[arg(long)]
+    pub owner: String,
+
+    /// The consumer has accepted the batch. The source is kept until then precisely so there is a
+    /// second attempt if the chain fails.
+    #[arg(long)]
+    pub accepted: bool,
+
+    /// Every row of `SECRETS-ROTATION.md` is done.
+    #[arg(long)]
+    pub rotation_complete: bool,
+}
+
+/// The source disposition, per addition A6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Disposition {
+    Wipe,
+    SnapshotThenWipe,
+    Retain,
 }
 
 /// Survey means "collect every finding", never "tolerate them" -- a survey with findings still

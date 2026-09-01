@@ -20,6 +20,7 @@ pub mod gcs;
 pub mod limits;
 pub mod models;
 pub mod pages;
+pub mod teardown;
 
 /// Test doubles: fake and hostile query sources, a local object store, and a byte-level tar
 /// builder for archives that cannot be committed as fixtures (`.gitignore` excludes `*.tar`).

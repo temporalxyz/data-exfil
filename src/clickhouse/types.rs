@@ -150,6 +150,19 @@ use crate::limits::OrOverflow;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Ident(String);
 
+/// Deserialization goes through [`Ident::new`], never around it.
+///
+/// Hand-written rather than derived on purpose. A derived impl would set the private field
+/// directly and let a hand-edited `plan.json` put arbitrary text somewhere that is rendered into
+/// SQL -- which is the one thing this newtype exists to prevent. Routing through the constructor
+/// means the charset check holds on every path a value can arrive by.
+impl<'de> Deserialize<'de> for Ident {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Self::new(&raw).map_err(|e| serde::de::Error::custom(e.to_string()))
+    }
+}
+
 impl Ident {
     /// `^[A-Za-z0-9_]{1,64}$`. Deliberately narrower than ClickHouse permits: a backtick-quoted
     /// identifier can legally contain a backtick, and we would rather refuse an exotic column name
@@ -1051,6 +1064,16 @@ pub enum ExportExpr {
     MapValues(Box<ExportExpr>),
     /// `toJSONString(arrayMap(...))` -- a JSON array of the inner form.
     JsonArrayOf(Box<ExportExpr>),
+    /// One field of a `Nested` column.
+    ///
+    /// ClickHouse does not store a `Nested` as a single value: it stores one parallel array per
+    /// field, in its own column named `<parent>.<field>`. So the inner expression must render
+    /// against **that** column and not against the parent, which does not exist as a readable
+    /// column at all.
+    NestedField {
+        field: Ident,
+        inner: Box<ExportExpr>,
+    },
 }
 
 impl ExportExpr {
@@ -1091,6 +1114,13 @@ impl ExportExpr {
                 "toJSONString(arrayMap(x -> {}, {operand}))",
                 inner.render_on("x")
             ),
+            Self::NestedField { field, inner } => {
+                // `operand` is the backtick-quoted parent; the readable column is
+                // `parent.field`. Both halves are validated `Ident`s, so re-quoting the joined
+                // name needs no escaping -- the charset excluded everything that would.
+                let base = operand.trim_matches('`');
+                inner.render_on(&format!("`{base}.{}`", field.as_str()))
+            }
         }
     }
 }
@@ -1375,7 +1405,10 @@ fn expand(
                 for c in cols {
                     out.push(ExportColumn {
                         suffix: format!(".{}{}", name.as_str(), c.suffix),
-                        expr: c.expr,
+                        expr: ExportExpr::NestedField {
+                            field: name.clone(),
+                            inner: Box::new(c.expr),
+                        },
                         validator: c.validator,
                     });
                 }
@@ -2427,5 +2460,48 @@ mod tests {
             ),
             "{json}"
         );
+    }
+
+    #[test]
+    fn a_nested_field_projects_its_own_column_not_the_parent() {
+        // ClickHouse stores a Nested as one parallel array per field. Rendering all three against
+        // the parent produced two byte-identical expressions and read a column that is not
+        // readable -- caught by eye in plan.json, which is what that document is for.
+        let ty = parse_type("Nested(kind UInt8, at DateTime, note String)").unwrap();
+        let rules = rules_for(&ty, DEFAULT_MAX_ARRAY_ELEMENTS).unwrap();
+        let col = Ident::new("events").unwrap();
+        let sql: Vec<String> = rules.columns.iter().map(|c| c.expr.render(&col)).collect();
+
+        assert_eq!(sql.len(), 3);
+        assert!(sql[0].contains("`events.kind`"), "{}", sql[0]);
+        assert!(sql[1].contains("`events.at`"), "{}", sql[1]);
+        assert!(sql[2].contains("`events.note`"), "{}", sql[2]);
+        // No expression may address the parent, which is not a readable column.
+        for e in &sql {
+            assert!(!e.contains("`events`"), "addresses the parent: {e}");
+        }
+        // And every projection is distinct, which the bug made false for kind and note.
+        let mut deduped = sql.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), sql.len(), "duplicate projections: {sql:?}");
+    }
+
+    #[test]
+    fn an_identifier_cannot_be_deserialized_around_its_validator() {
+        // `Ident` is rendered into SQL, so the charset check has to hold on every path a value can
+        // arrive by -- including a hand-edited plan.json, not only `Ident::new`.
+        assert!(serde_json::from_str::<Ident>(r#""events""#).is_ok());
+        for hostile in [
+            r#""a`, (SELECT 1) AS b, `c""#,
+            r#""events.kind""#,
+            r#""a b""#,
+            r#""""#,
+        ] {
+            assert!(
+                serde_json::from_str::<Ident>(hostile).is_err(),
+                "{hostile} must not become an Ident"
+            );
+        }
     }
 }

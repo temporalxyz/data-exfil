@@ -681,6 +681,50 @@ pub fn load_pinned(
     Ok(out)
 }
 
+/// Load exactly one table's pinned DDL and its overrides, both required.
+///
+/// `plan` and everything downstream need the overrides: the caps, the cutoff and the per-column
+/// freedom classes all live there, and a missing override file is a scope decision nobody made
+/// rather than a set of defaults to fall back on.
+pub fn load_one(
+    ddl_dir: &std::path::Path,
+    overrides_dir: &std::path::Path,
+    table: &str,
+) -> Result<(PinnedDdl, crate::models::Overrides)> {
+    let ddl_path = ddl_dir.join(format!("{table}.sql"));
+    let text = std::fs::read_to_string(&ddl_path).map_err(|e| {
+        bad(format!("no pinned DDL for this table: {e}"))
+            .with("path", ddl_path.display())
+            .with(
+                "reason",
+                "section 4: the allowlist comes from source control",
+            )
+    })?;
+    let ddl = parse_create_table(&text).map_err(|e| e.with("path", ddl_path.display()))?;
+    if ddl.qualified() != table {
+        return Err(
+            bad("pinned DDL filename disagrees with the table it declares")
+                .with("filename", table.escape_debug())
+                .with("declares", ddl.qualified()),
+        );
+    }
+
+    let over_path = overrides_dir.join(format!("{table}.toml"));
+    let over_text = std::fs::read_to_string(&over_path).map_err(|e| {
+        bad(format!("no pinned overrides for this table: {e}"))
+            .with("path", over_path.display())
+            .with(
+                "reason",
+                "the caps, the cutoff and the per-column freedom classes all live there",
+            )
+    })?;
+    let overrides = toml::from_str::<crate::models::Overrides>(&over_text).map_err(|e| {
+        bad(format!("could not parse overrides: {e}")).with("path", over_path.display())
+    })?;
+
+    Ok((ddl, overrides))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

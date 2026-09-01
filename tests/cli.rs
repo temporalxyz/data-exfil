@@ -113,24 +113,102 @@ fn audit_requires_an_explicit_mode() {
 // -- Phases not yet built. Each of these flips as its build step lands. ------------------------
 
 #[test]
-fn plan_is_not_implemented_and_says_so() {
+fn plan_derives_a_reviewable_contract_without_touching_the_cluster() {
+    // The acceptance criterion for the whole validation core: the exact bound for every column is
+    // readable before anything touches the compromised cluster.
+    let work = scratch();
     salvage()
-        .args(["plan", "--table", "events.hits"])
+        .args(["plan", "--table", "typematrix.typematrix", "--work"])
+        .arg(work.path())
         .assert()
-        .code(3)
-        .stderr(predicates::str::contains("not implemented"));
+        .code(0);
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(work.path().join("plan.json")).unwrap())
+            .unwrap();
+
+    assert_eq!(doc["table"], "typematrix.typematrix");
+    // An unverified plan and a verified one are otherwise indistinguishable on disk.
+    assert_eq!(doc["cluster_cross_checked"], false);
+    assert_eq!(doc["cursor_columns"], serde_json::json!(["ts", "id"]));
+    assert_eq!(doc["cutoff_predicate"], "`ts` < '2026-08-25 00:00:00'");
+
+    // Section 8.7: removal is by column and recorded, never by editing the DDL.
+    let dropped = doc["dropped_columns"].as_array().unwrap();
+    assert_eq!(dropped.len(), 4);
+
+    // Every non-dropped column carries its rules verbatim, which is the point of rules being data.
+    let columns = doc["columns"].as_array().unwrap();
+    assert!(columns.len() > 40);
+    let body = columns.iter().find(|c| c["name"] == "body").unwrap();
+    assert_eq!(body["class"], "open");
+    let ident = columns.iter().find(|c| c["name"] == "ident").unwrap();
+    assert_eq!(ident["class"], "closed");
 }
 
 #[test]
-fn export_is_not_implemented_and_says_so() {
+fn plan_refuses_a_table_with_no_pinned_ddl() {
+    // Section 4: the allowlist comes from source control. A table nobody pinned has no contract,
+    // and inventing one from the server is precisely what this tool must not do.
     let work = scratch();
     salvage()
-        .args(["export", "--table", "events.hits", "--batch", "b1"])
+        .args(["plan", "--table", "events.hits", "--work"])
+        .arg(work.path())
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("source control"));
+}
+
+#[test]
+fn plan_emits_the_whole_document_under_json() {
+    let work = scratch();
+    let out = salvage()
+        .args([
+            "plan",
+            "--table",
+            "typematrix.typematrix",
+            "--json",
+            "--work",
+        ])
+        .arg(work.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // The Nested projections must address their own columns, not the parent.
+    let events = doc["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "events")
+        .unwrap();
+    let sql: Vec<&str> = events["export_sql"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(sql[0].contains("`events.kind`"), "{sql:?}");
+    assert!(sql[1].contains("`events.at`"), "{sql:?}");
+    assert!(sql[2].contains("`events.note`"), "{sql:?}");
+}
+
+#[test]
+fn export_refuses_without_a_cluster_rather_than_guessing_one() {
+    let work = scratch();
+    salvage()
+        .args([
+            "export",
+            "--table",
+            "typematrix.typematrix",
+            "--batch",
+            "b1",
+        ])
         .args(["--bucket", "raw-bucket", "--work"])
         .arg(work.path())
         .assert()
-        .code(3)
-        .stderr(predicates::str::contains("not implemented"));
+        .code(2)
+        .stderr(predicates::str::contains("--clickhouse-url"));
 }
 
 #[test]
@@ -138,34 +216,74 @@ fn a_missing_bucket_is_a_usage_error_not_a_default() {
     // There is no safe default destination for data pulled off a compromised cluster, so the
     // absence of `--bucket` is exit 2 rather than a guess. Exit 3 would be wrong too: that class
     // is resumable, and this is not something a retry fixes.
-    for args in [
-        vec!["export", "--table", "events.hits", "--batch", "b1"],
-        vec![
-            "audit",
-            "--table",
-            "events.hits",
-            "--batch",
-            "b1",
-            "--mode",
-            "enforce",
-        ],
+    // A table that *is* pinned, so the run gets far enough to reach the bucket check rather than
+    // failing earlier on a missing contract.
+    let work = scratch();
+    for (args, expected) in [
+        (
+            vec![
+                "export",
+                "--table",
+                "typematrix.typematrix",
+                "--batch",
+                "b1",
+            ],
+            // Export needs both; it names the cluster first because nothing can be exported
+            // without one, bucket or no bucket.
+            "--clickhouse-url",
+        ),
+        (
+            vec![
+                "audit",
+                "--table",
+                "typematrix.typematrix",
+                "--batch",
+                "b1",
+                "--mode",
+                "enforce",
+            ],
+            "--bucket",
+        ),
     ] {
         salvage()
             .args(&args)
+            .arg("--work")
+            .arg(work.path())
             .assert()
             .code(2)
-            .stderr(predicates::str::contains("--bucket"));
+            .stderr(predicates::str::contains(expected));
     }
 }
 
 #[test]
-fn audit_is_not_implemented_and_says_so() {
+fn audit_refuses_a_batch_whose_ledger_lists_no_pages() {
+    // `PAGES.json` is the completion sentinel. A ledger with no pages is an export that never
+    // finished, and the audit refuses it before pulling a single object.
     let work = scratch();
+    let batch = work.path().join("b1");
+    std::fs::create_dir_all(&batch).unwrap();
+    std::fs::write(
+        batch.join("PAGES.json"),
+        serde_json::json!({
+            "table": "typematrix.typematrix",
+            "batch": "b1",
+            "contract_version": "test",
+            "git_commit": "test",
+            "cutoff_predicate": "1",
+            "total_rows": 0,
+            "server_count": 0,
+            "server_parts_rows": 0,
+            "pages": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+
     salvage()
         .args([
             "audit",
             "--table",
-            "events.hits",
+            "typematrix.typematrix",
             "--batch",
             "b1",
             "--mode",
@@ -174,8 +292,8 @@ fn audit_is_not_implemented_and_says_so() {
         .args(["--bucket", "raw-bucket", "--work"])
         .arg(work.path())
         .assert()
-        .code(3)
-        .stderr(predicates::str::contains("not implemented"));
+        .code(1)
+        .stderr(predicates::str::contains("no pages"));
 }
 
 #[test]
@@ -239,37 +357,87 @@ fn secrets_emits_machine_readable_counts_under_json() {
 }
 
 #[test]
-fn teardown_is_not_implemented_and_says_so() {
+fn teardown_refuses_before_acceptance_and_demands_a_named_owner() {
+    let work = scratch();
+    // Missing --disposition and --owner is a clap usage error: there is no default for either.
     salvage()
-        .args(["teardown", "--table", "events.hits", "--batch", "b1"])
+        .args([
+            "teardown",
+            "--table",
+            "typematrix.typematrix",
+            "--batch",
+            "b1",
+        ])
+        .args(["--bucket", "raw-bucket", "--work"])
+        .arg(work.path())
         .assert()
-        .code(3)
-        .stderr(predicates::str::contains("not implemented"));
+        .code(2);
+
+    // Present but unaccepted: the source is kept until acceptance so there is a second attempt.
+    salvage()
+        .args([
+            "teardown",
+            "--table",
+            "typematrix.typematrix",
+            "--batch",
+            "b1",
+        ])
+        .args(["--disposition", "wipe", "--owner", "R. Okonkwo"])
+        .args(["--bucket", "raw-bucket", "--work"])
+        .arg(work.path())
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("second attempt"));
 }
 
 #[test]
 fn no_subcommand_ever_exits_zero_for_work_it_did_not_do() {
-    // The invariant behind all of the above, asserted directly so it survives the individual
-    // assertions being flipped one at a time.
-    // `secrets` left this list at step 4: it now does its work and exits 0 for it. That is the
-    // progress metric -- the list shrinks as phases become real, and never because an assertion
-    // was relaxed.
+    // Every phase is now built, so this no longer asserts "not implemented". It asserts the
+    // property that survived all of them becoming real: given inputs it cannot satisfy, no
+    // subcommand reports success. A stub that succeeded was always the one failure mode this
+    // project could not tolerate; so is a finished phase that succeeds vacuously.
+    let work = scratch();
     let cases: [&[&str]; 4] = [
+        // No pinned DDL for this table.
         &["plan", "--table", "events.hits"],
-        &["export", "--table", "events.hits", "--batch", "b1"],
+        // No cluster.
+        &[
+            "export",
+            "--table",
+            "typematrix.typematrix",
+            "--batch",
+            "b1",
+        ],
+        // No ledger.
         &[
             "audit",
             "--table",
-            "events.hits",
+            "typematrix.typematrix",
             "--batch",
             "b1",
             "--mode",
             "enforce",
         ],
-        &["teardown", "--table", "events.hits", "--batch", "b1"],
+        // Not accepted.
+        &[
+            "teardown",
+            "--table",
+            "typematrix.typematrix",
+            "--batch",
+            "b1",
+            "--disposition",
+            "retain",
+            "--owner",
+            "someone",
+        ],
     ];
     for args in cases {
-        let out = salvage().args(args).output().unwrap();
+        let out = salvage()
+            .args(args)
+            .args(["--bucket", "raw-bucket", "--work"])
+            .arg(work.path())
+            .output()
+            .unwrap();
         assert_ne!(
             out.status.code(),
             Some(0),

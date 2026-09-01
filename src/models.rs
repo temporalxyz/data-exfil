@@ -84,7 +84,7 @@ pub struct ColumnOverride {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Overrides {
-    /// Column used for the quiesce cutoff predicate.
+    /// Column used for the cutoff predicate.
     ///
     /// Pinned here and never chosen from server data. This, not wall-clock quiet, is what makes
     /// the boundary stable across the two export passes.
@@ -299,8 +299,20 @@ pub struct PlanJson {
     /// The total order -- key tuple first, then every remaining exported column -- without which
     /// two passes of the same page need not come back byte-identical.
     pub order_by: Vec<String>,
+    /// Seeded from the cluster's own estimate, then corrected from our measured output. Zero when
+    /// the plan was built without a cluster.
     pub rows_per_page: u64,
     pub cutoff_predicate: String,
+    /// Whether the cluster was asked to agree with the pinned DDL.
+    ///
+    /// An unverified plan and a verified one are otherwise indistinguishable on disk, and only one
+    /// of them means the table is what source control says it is.
+    pub cluster_cross_checked: bool,
+    /// Columns removed from scope before the run (section 8.7), recorded rather than deleted.
+    pub dropped_columns: Vec<String>,
+    /// The flattened projection, in order. This is the TSV header the export writes and the import
+    /// validates against with `input_format_with_names_use_header=1`.
+    pub output_columns: Vec<String>,
 }
 
 /// One finding. The batch is dead the moment one of these exists.
@@ -378,10 +390,11 @@ pub struct ManifestEnvelope {
     pub pages: Vec<PageEntry>,
     pub total_rows: u64,
     pub total_bytes: u64,
-    /// `count()` and `sum(rows) FROM system.parts` as the compromised server reported them, before
-    /// and after. Server-supplied, so a cross-check and never a proof.
-    pub quiesce_before: Vec<String>,
-    pub quiesce_after: Vec<String>,
+    /// `count()` and `sum(rows) FROM system.parts` as the compromised server reported them.
+    ///
+    /// Server-supplied, so a cross-check and never a proof. Recorded as claims, not facts, and
+    /// carried so a consumer can see the numbers our reconciliation was checked against.
+    pub server_counts: Vec<String>,
     /// Rejection counts by reason and by column. Zero in any batch that ships, by construction --
     /// carried so the survey pass has somewhere to put its inventory.
     pub rejections_by_reason: BTreeMap<String, u64>,

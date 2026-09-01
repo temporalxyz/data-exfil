@@ -18,6 +18,7 @@
 
 pub mod settings;
 pub mod tsv;
+pub mod types;
 
 use crate::abort::Result;
 use crate::clickhouse::settings::Settings;

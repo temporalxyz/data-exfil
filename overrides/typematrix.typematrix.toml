@@ -1,0 +1,112 @@
+# Pinned per-table decisions for `typematrix.typematrix`, overlaid on the type rules derived from
+# the pinned DDL in `ddl/typematrix.typematrix.sql`.
+#
+# Every key is checked: `Overrides` is `deny_unknown_fields`, so a typo here is a hard error rather
+# than a cap you thought you set and never read.
+
+# Section A2. The cutoff, not wall-clock quiet, is what makes the page boundary stable across the
+# two export passes. Column and value are pinned here and never chosen from server data.
+cutoff_column = "ts"
+cutoff_value = "2026-08-25 00:00:00"
+
+# Defaults to the table's ORDER BY key tuple. Stated explicitly so the NOT NULL property is
+# reviewable here rather than inferred: `(a, b) > (x, NULL)` is NULL in SQL, the row is excluded,
+# and rows vanish with no check firing.
+cursor_columns = ["ts", "id"]
+
+# Target uncompressed bytes per page, before the measured correction. 64 MiB.
+page_byte_budget = 67108864
+
+[limits]
+# Before parsing.
+max_compressed_bytes = 268435456
+# During decompression, enforced streaming rather than after the fact.
+max_uncompressed_bytes = 1073741824
+# Section 8.4 gives 100:1 as its worked example.
+max_expansion_ratio = 100
+# During parsing.
+max_rows_per_page = 5000000
+max_fields_per_row = 64
+max_field_bytes = 1048576
+max_array_elements = 4096
+max_nesting_depth = 8
+# Archives (deviation D6; not in the source plan).
+max_tar_members = 16
+max_tar_member_bytes = 1073741824
+max_tar_name_bytes = 128
+# Section 8.6 bounded decodings, capped so the decoder does not become a bomb by another name.
+max_decode_rounds = 1
+max_decode_expansion_ratio = 8
+# Enforced by us in the copy loop; nothing in the HTTP stack provides a total budget.
+wall_clock_secs = 3600
+
+# -- column classes ---------------------------------------------------------------------------
+#
+# Section 8.5: push every column that can be into Closed or Constrained. The count of Open columns
+# is the actual injection exposure of this salvage, and it is exactly one here -- `body` -- named
+# and justified below.
+#
+# Columns not listed inherit Closed, which is the fail-closed default: a column nobody classified
+# is not silently treated as free text.
+
+[columns.ident]
+class = "closed"
+pattern = "^[A-Za-z0-9_-]{1,64}$"
+
+# The one Open column. Free-text message bodies cannot be pattern-constrained without corrupting
+# the record, so detection here is a flag and not a gate, and the length cap is the real bound.
+[columns.body]
+class = "open"
+max_len = 8192
+
+[columns.nullable_text]
+class = "constrained"
+# Section 8.5's own worked example of a constrained set.
+pattern = "^[A-Za-z0-9 .'-]{1,120}$"
+
+[columns.low_card]
+class = "constrained"
+pattern = "^[a-z_]{1,32}$"
+
+[columns.low_card_nullable]
+class = "constrained"
+pattern = "^[a-z_]{1,32}$"
+
+# Section 8.2: "Prefer hex for arbitrary strings and blobs -- it removes delimiter, control-byte and
+# escape ambiguity entirely, and is the default choice wherever a column allows it." This column
+# allows it; `ident` does not, because hex would defeat the exact regex that makes it Closed.
+[columns.blob]
+class = "closed"
+hex = true
+
+# Enum ids, never labels. Listed here so the source-controlled set is the authority rather than the
+# attacker-authored DDL the ids were read from.
+[columns.status]
+class = "closed"
+enum_ids = [1, 4, -3, 100]
+
+[columns.region]
+class = "closed"
+enum_ids = [1000, -2000]
+
+# -- dropped columns (sections 8.7 and 11) ------------------------------------------------------
+#
+# The only permitted removal is by column, decided before the run. These are the classes section 11
+# names: URL, filename/path, template, serialized object. Dropping them is recorded here rather than
+# achieved by deleting them from the DDL, so the manifest can say what was excluded and why.
+
+[columns.source_url]
+class = "closed"
+drop = true
+
+[columns.attachment_path]
+class = "closed"
+drop = true
+
+[columns.render_template]
+class = "closed"
+drop = true
+
+[columns.payload_serialized]
+class = "closed"
+drop = true

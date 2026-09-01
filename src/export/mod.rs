@@ -21,7 +21,7 @@ pub mod run;
 
 use std::path::Path;
 
-use crate::abort::{PartialOutput, Result, SalvageError, StagingDir, abort};
+use crate::abort::{PartialOutput, Result, SalvageError, StagingDir, abort, usage};
 use crate::archive::{ArchiveMember, write_targz};
 use crate::clickhouse::QueryRunner;
 use crate::clickhouse::ddl::PinnedDdl;
@@ -43,6 +43,59 @@ pub struct ExportOptions {
     pub resume: bool,
     pub contract_version: String,
     pub git_commit: String,
+    /// Days of Unlocked object retention on every object this run creates. Zero means none --
+    /// see [`crate::cli::Common::retain_days`] for why that is now an explicit choice.
+    pub retain_days: u32,
+}
+
+/// The recorded outcome of the previous run of this batch.
+///
+/// `--resume` is documented as "honoured only after an infrastructure error", and the refusal was
+/// documented rather than enforced: `resume` was a plain bool whose only effect was to soften a
+/// 412 into verify-and-skip. Nothing read a prior outcome, so a run that aborted on a payload
+/// match could be resumed, and because the source is live and the cutoff is a `WHERE` rather than
+/// a freeze, the offending row might simply not come back the second time -- delivering exactly
+/// the subset section 8.0 forbids.
+///
+/// One byte of state, next to the work dir rather than inside the staging dir, because the staging
+/// dir is removed on abort by design.
+fn outcome_path(opts: &ExportOptions) -> std::path::PathBuf {
+    opts.work.join(format!("{}.outcome", opts.batch))
+}
+
+/// Refuse a resume that would continue past a finding.
+fn check_resumable(opts: &ExportOptions) -> Result<()> {
+    if !opts.resume {
+        return Ok(());
+    }
+    let path = outcome_path(opts);
+    let recorded = std::fs::read_to_string(&path).unwrap_or_default();
+    if recorded.trim() == "abort" {
+        return usage("this batch ended in a finding and cannot be resumed").map_err(
+            |e: SalvageError| {
+                e.with("batch", opts.batch.as_str())
+                    .with("recorded_outcome", "abort")
+                    .with(
+                        "reason",
+                        "section 8.0: drop the column, reclassify it, or remove the table, then \
+                         re-run from the start with a new --batch",
+                    )
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Record how this run ended, so a later `--resume` can refuse to continue past a finding.
+fn record_outcome(opts: &ExportOptions, result: &Result<PagesJson>) {
+    let verdict = match result {
+        Ok(_) => "ok",
+        Err(e) if e.exit_code() == crate::abort::ExitCode::Abort => "abort",
+        Err(_) => "infra",
+    };
+    // Best effort: a failure to record must not mask the finding itself.
+    let _ = std::fs::create_dir_all(&opts.work);
+    let _ = std::fs::write(outcome_path(opts), verdict);
 }
 
 /// Run the export pipeline for one table.
@@ -67,13 +120,31 @@ pub fn run_export(
     rows_per_page: u64,
     opts: &ExportOptions,
 ) -> Result<PagesJson> {
+    check_resumable(opts)?;
+    let result = run_export_inner(ddl, overrides, runner, store, facts, rows_per_page, opts);
+    record_outcome(opts, &result);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_export_inner(
+    ddl: &PinnedDdl,
+    overrides: &Overrides,
+    runner: &dyn QueryRunner,
+    store: &dyn ObjectStore,
+    facts: &plan::ClusterFacts,
+    rows_per_page: u64,
+    opts: &ExportOptions,
+) -> Result<PagesJson> {
     let cutoff = cutoff_predicate(ddl, overrides)?;
     let cursor = select_cursor(ddl, overrides)?;
     let order = total_order(&cursor, ddl, overrides);
 
     // Seeded from the cluster, floored at one row: a page of zero rows would loop forever.
+    // `PageContext::new` additionally clamps it to the pinned `max_rows_per_page`, so a server
+    // under-reporting its own byte totals cannot choose how much we read in one request.
     let per_page = rows_per_page.max(1);
-    let ctx = PageContext::new(ddl, overrides, &cursor, &order, &cutoff, per_page)?;
+    let mut ctx = PageContext::new(ddl, overrides, &cursor, &order, &cutoff, per_page)?;
 
     let dest = opts.work.join(&opts.batch);
     let mut staging = StagingDir::inside(dest)?;
@@ -95,6 +166,12 @@ pub fn run_export(
         if outcome.short {
             break;
         }
+
+        // Re-derive the next page's size from the bytes this page actually produced. The server's
+        // estimate is the seed and nothing more: from here the sizing depends on our own measured
+        // output, which is what three separate doc comments claimed and none delivered.
+        ctx.resize_from(&outcome)?;
+
         if outcome.cursor_literals.is_empty() {
             return abort("a full page produced no cursor to advance from")
                 .map_err(|e: SalvageError| e.with("page", index));
@@ -237,7 +314,7 @@ fn push_object(
         sha256_hex: sha.to_owned(),
         // Governance, never Locked (addition A5): locked retention would hold the attacker's data
         // immutably and indefinitely and block deleting the bucket at all.
-        retain_until: None,
+        retain_until: crate::gcs::retain_until_days(opts.retain_days),
         hold: true,
         content_type: "application/gzip",
     };
@@ -308,6 +385,7 @@ mod tests {
             resume: false,
             contract_version: "test".to_owned(),
             git_commit: "test".to_owned(),
+            retain_days: 7,
         }
     }
 
@@ -397,6 +475,221 @@ mod tests {
         assert!(!dir.path().join(".b1.staging").exists());
     }
 
+    /// A page of `n` rows starting at `id = first`, all sharing one timestamp so the caller
+    /// controls key-group shape by choosing ids.
+    fn page_at(ts: u64, first: u64, n: u64) -> Vec<u8> {
+        let mut out = String::from("ts\tid\tbody\n");
+        for i in 0..n {
+            out.push_str(&format!("{ts}\t{}\trow\n", first + i));
+        }
+        out.into_bytes()
+    }
+
+    #[test]
+    fn the_cursor_advances_across_pages_and_every_row_is_exported_once() {
+        // Multi-page pagination had no test anywhere: every fixture returned one short page and
+        // `a7d` asserted `pages.len() == 1`. Cursor advance, the seek predicate and the key-group
+        // extension were all unexercised -- which is where four separate defects were living.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new()
+            // Registered most-specific first: the group-extension equality, then the seek, then
+            // the opening page.
+            .on("= (", page_at(1785000000, 2, 1))
+            .on("> (", page_at(1785000001, 3, 1))
+            .on("SELECT", page_at(1785000000, 1, 2));
+
+        let pages = run_export(
+            &ddl(),
+            &overrides(),
+            &runner,
+            &store(dir.path()),
+            &facts(3),
+            2,
+            &opts(dir.path()),
+        )
+        .unwrap_or_else(|e| panic!("a two-page export must succeed: {e}"));
+
+        assert_eq!(pages.pages.len(), 2, "the run must not stop after page 0");
+        assert_eq!(pages.total_rows, 3);
+        assert!(pages.reconciles());
+
+        // The second query must carry a seek built from the first page's last key, not an OFFSET.
+        let sql: Vec<String> = runner.recorded().into_iter().map(|q| q.sql).collect();
+        assert!(
+            sql.iter().any(|q| q.contains("(`ts`, `id`) > (")),
+            "no keyset seek was issued: {sql:?}"
+        );
+        assert!(
+            !sql.iter().any(|q| q.to_uppercase().contains("OFFSET")),
+            "OFFSET must never appear: {sql:?}"
+        );
+    }
+
+    #[test]
+    fn every_pushed_object_carries_the_requested_unlocked_retention() {
+        // Addition A5's retention code was correct, tested and unreachable: every production call
+        // site passed `retain_until: None`, so a temporary hold released at teardown was the only
+        // protection any object ever carried. `LocalStore` ignoring the field is why no test could
+        // notice -- an oracle that drops a control cannot fail a caller that forgets it.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        run_export(
+            &ddl(),
+            &overrides(),
+            &one_page_cluster(2),
+            &s,
+            &facts(2),
+            10,
+            &opts(dir.path()),
+        )
+        .unwrap();
+
+        for name in ["db.t/b1/page-0000.tar.gz", "db.t/b1/PAGES.json"] {
+            let object = ObjectName::new(name).unwrap();
+            assert!(
+                s.retain_until(&object).unwrap().is_some(),
+                "{name} was pushed without retention"
+            );
+        }
+
+        // Zero days is a real choice and stays a choice: no retention requested, none recorded.
+        let bare = tempfile::tempdir().unwrap();
+        let s2 = store(bare.path());
+        run_export(
+            &ddl(),
+            &overrides(),
+            &one_page_cluster(2),
+            &s2,
+            &facts(2),
+            10,
+            &ExportOptions {
+                retain_days: 0,
+                ..opts(bare.path())
+            },
+        )
+        .unwrap();
+        assert!(
+            s2.retain_until(&ObjectName::new("db.t/b1/page-0000.tar.gz").unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resume_is_refused_after_a_finding_and_allowed_after_an_infrastructure_error() {
+        // `--resume` was a bool with one effect: softening a 412 into verify-and-skip. Nothing
+        // read a prior outcome, so a run that aborted on a finding could be resumed -- and since
+        // the source is live and the cutoff is a `WHERE` rather than a freeze, the offending row
+        // might simply not come back, delivering the subset section 8.0 forbids.
+        let dir = tempfile::tempdir().unwrap();
+        let base = opts(dir.path());
+
+        // A run that ends in a finding.
+        let runner = FakeRunner::new().on("SELECT", page_at(1785000000, 1, 5));
+        let err = run_export(
+            &ddl(),
+            &overrides(),
+            &runner,
+            &store(dir.path()),
+            &facts(5),
+            2,
+            &base,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected a finding"));
+        assert_eq!(err.exit_code(), crate::abort::ExitCode::Abort, "{err}");
+
+        // Resuming it is refused, and refused as a Usage error -- Infra is the resumable class and
+        // this is precisely the case that must not be.
+        let resumed = ExportOptions {
+            resume: true,
+            ..opts(dir.path())
+        };
+        let refused = run_export(
+            &ddl(),
+            &overrides(),
+            &FakeRunner::new().on("SELECT", page_at(1785000000, 1, 1)),
+            &store(dir.path()),
+            &facts(1),
+            2,
+            &resumed,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a resume past a finding must be refused"));
+        assert_eq!(
+            refused.exit_code(),
+            crate::abort::ExitCode::Usage,
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("cannot be resumed"),
+            "{refused}"
+        );
+
+        // An infrastructure outcome stays resumable: that is the whole point of the 1-vs-3 split.
+        std::fs::write(dir.path().join("b1.outcome"), "infra").unwrap();
+        run_export(
+            &ddl(),
+            &overrides(),
+            &FakeRunner::new().on("SELECT", page_at(1785000000, 1, 1)),
+            &store(dir.path()),
+            &facts(1),
+            2,
+            &ExportOptions {
+                resume: true,
+                batch: "b1".to_owned(),
+                ..opts(dir.path())
+            },
+        )
+        .unwrap_or_else(|e| panic!("an infra outcome must stay resumable: {e}"));
+    }
+
+    #[test]
+    fn a_page_longer_than_its_own_limit_is_a_finding() {
+        // The extension gate tested `rows == rows_per_page`, so a page returning *more* than its
+        // LIMIT skipped extension entirely and the cursor then advanced past a partly-consumed key
+        // group. Nothing anywhere asserted the "every page is exactly rows_per_page except the
+        // last" invariant the design states.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new().on("SELECT", page_at(1785000000, 1, 5));
+        let err = run_export(
+            &ddl(),
+            &overrides(),
+            &runner,
+            &store(dir.path()),
+            &facts(5),
+            2,
+            &opts(dir.path()),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a page over its LIMIT must abort"));
+        assert!(
+            err.to_string().contains("more rows than its LIMIT"),
+            "{err}"
+        );
+        assert!(!dir.path().join("b1").exists(), "nothing may be promoted");
+    }
+
+    #[test]
+    fn a_group_extension_that_disagrees_with_itself_aborts() {
+        // The extension read once and appended, so the tail of an extended page shipped with no
+        // completeness signal while the recorded pass hashes described only the diffed prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = HostileRunner::new(Hostility::DifferentOnSecondCall);
+        let err = run_export(
+            &ddl(),
+            &overrides(),
+            &runner,
+            &store(dir.path()),
+            &facts(2),
+            2,
+            &opts(dir.path()),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a non-deterministic source must abort"));
+        assert_eq!(err.exit_code(), crate::abort::ExitCode::Abort, "{err}");
+    }
+
     #[test]
     fn a_row_count_the_server_contradicts_aborts_before_promotion() {
         // The three-number agreement. Here the server claims ten rows and streams three.
@@ -412,7 +705,11 @@ mod tests {
             &opts(dir.path()),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("do not agree"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("does not match the server's count()"),
+            "{err}"
+        );
         assert!(!dir.path().join("b1").exists(), "nothing may be promoted");
     }
 

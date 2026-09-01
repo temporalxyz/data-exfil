@@ -48,10 +48,13 @@ pub struct ClusterFacts {
     pub uncompressed_bytes: u64,
     /// `count()` under the cutoff.
     pub row_count: u64,
-    /// `sum(rows) FROM system.parts WHERE active`.
+    /// `sum(rows) FROM system.parts WHERE active`, for the **whole table**.
     ///
-    /// The third number in the reconciliation. Both this and `row_count` come from the
-    /// compromised server, so agreement with what we streamed is a cross-check and never a proof.
+    /// The third number in the reconciliation, and the only one that is not scoped to the cutoff:
+    /// `system.parts` counts granules, and a part can straddle the cutoff, so there is no
+    /// predicate that would scope it without trusting the server to apply one. That makes it an
+    /// upper bound rather than an equal -- see [`reconcile`]. Both this and `row_count` come from
+    /// the compromised server, so agreement with what we streamed is a cross-check, never a proof.
     pub parts_rows: u64,
 }
 
@@ -209,8 +212,18 @@ pub fn build(
     for column in &ddl.columns {
         let over = overrides.columns.get(column.name.as_str());
         let is_dropped = over.is_some_and(|o| o.drop);
-        let rules = rules_for(&column.ty, overrides.limits.max_array_elements)
+        let mut rules = rules_for(&column.ty, overrides.limits.max_array_elements)
             .map_err(|e| e.with("column", column.name.as_str()))?;
+        // Section 8.2's prefer-hex directive, per column. This is the only consumer of
+        // `ColumnOverride.hex`; before it existed the flag was pinned, documented and inert.
+        if overrides
+            .columns
+            .get(column.name.as_str())
+            .is_some_and(|o| o.hex)
+        {
+            crate::clickhouse::types::apply_hex_override(&column.ty, &mut rules)
+                .map_err(|e| e.with("column", column.name.as_str()))?;
+        }
 
         let export_sql = if is_dropped {
             Vec::new()
@@ -333,18 +346,39 @@ fn parse_u64(s: &str) -> Result<u64> {
 /// handled out of band, and nothing in this tool attempts it or verifies it. What this checks is
 /// our own export: that the pages we wrote add up to the table we were told about.
 pub fn reconcile(streamed: u64, facts: &ClusterFacts) -> Result<()> {
-    if streamed == facts.row_count && streamed == facts.parts_rows {
-        return Ok(());
+    // The two cutoff-scoped numbers must be exactly equal: `count()` carries the same `WHERE` the
+    // pages did, so a dropped page or a short read shows up here as an inequality.
+    if streamed != facts.row_count {
+        return abort("the streamed row count does not match the server's count()").map_err(
+            |e: SalvageError| {
+                e.with("streamed", streamed)
+                    .with("server_count", facts.row_count)
+                    .with("cutoff_scoped", "both")
+                    .with(
+                        "reason",
+                        "a page was dropped, or the server returned fewer rows than it counted",
+                    )
+            },
+        );
     }
-    abort("the three row counts do not agree").map_err(|e: SalvageError| {
-        e.with("streamed", streamed)
-            .with("server_count", facts.row_count)
-            .with("server_parts_rows", facts.parts_rows)
-            .with(
-                "reason",
-                "a page was dropped, or the server's two numbers are inconsistent with each other",
-            )
-    })
+    // `parts_rows` is the whole table, cutoff included and excluded alike, so it can only ever be
+    // an upper bound. Demanding equality here would abort every run against a table that is still
+    // receiving rows above the cutoff -- which is every live table. Streaming *more* than the
+    // parts total is still a contradiction, because no predicate can select rows that no part
+    // holds, and that is what this arm catches.
+    if streamed > facts.parts_rows {
+        return abort("more rows were streamed than the server's parts hold").map_err(
+            |e: SalvageError| {
+                e.with("streamed", streamed)
+                    .with("server_parts_rows", facts.parts_rows)
+                    .with(
+                        "reason",
+                        "the server's own two numbers are inconsistent with each other",
+                    )
+            },
+        );
+    }
+    Ok(())
 }
 
 /// The projection: one `(output name, SQL expression)` per exported column, in order.
@@ -363,8 +397,19 @@ pub fn projection(ddl: &PinnedDdl, overrides: &Overrides) -> Result<Vec<(String,
         {
             continue;
         }
-        let rules = rules_for(&column.ty, overrides.limits.max_array_elements)
+        let mut rules = rules_for(&column.ty, overrides.limits.max_array_elements)
             .map_err(|e| e.with("column", column.name.as_str()))?;
+        // Section 8.2's prefer-hex directive, per column. This is the only consumer of
+        // `ColumnOverride.hex`; before it existed the flag was pinned, documented and inert.
+        if overrides
+            .columns
+            .get(column.name.as_str())
+            .is_some_and(|o| o.hex)
+        {
+            crate::clickhouse::types::apply_hex_override(&column.ty, &mut rules)
+                .map_err(|e| e.with("column", column.name.as_str()))?;
+        }
+
         for projected in &rules.columns {
             out.push((
                 format!("{}{}", column.name.as_str(), projected.suffix),
@@ -442,6 +487,29 @@ mod tests {
         reconcile(1000, &facts).unwrap();
         // A dropped page shows up here and nowhere else.
         assert!(reconcile(999, &facts).is_err());
+
+        // `parts_rows` is the whole table while `row_count` carries the cutoff, so a table still
+        // taking writes above the cutoff must still reconcile. Requiring equality against an
+        // unscoped parts total made a successful run impossible on any live table.
+        let live = ClusterFacts {
+            parts_rows: 9_999,
+            ..facts.clone()
+        };
+        reconcile(1000, &live).unwrap();
+
+        // Streaming more than the parts hold is the server contradicting itself.
+        let short = ClusterFacts {
+            row_count: 20_000,
+            parts_rows: 1_000,
+            ..facts.clone()
+        };
+        let err = reconcile(20_000, &short)
+            .err()
+            .unwrap_or_else(|| panic!("streaming past the parts total must abort"));
+        assert!(
+            err.to_string().contains("parts hold"),
+            "wrong reason: {err}"
+        );
 
         // Addition A1: the throw-mode block rides on the introspection queries too. A query that
         // slipped out without it could be truncated just as quietly as a page read.

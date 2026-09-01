@@ -25,6 +25,11 @@ struct Stored {
     size: u64,
     sha256_hex: Option<String>,
     hold: bool,
+    /// Modelled, not ignored. Every production call site passed `retain_until: None` while the
+    /// retention code sat correct, tested and unreachable -- and no test could notice, because
+    /// this store dropped the field. An oracle that ignores a control cannot fail a caller that
+    /// forgets it.
+    retain_until: Option<time::OffsetDateTime>,
     /// Whether this generation is the live one. Noncurrent generations still exist and are still
     /// readable by explicit generation -- that is what object versioning means.
     live: bool,
@@ -99,6 +104,20 @@ impl LocalStore {
         Ok(())
     }
 
+    /// The retention instant recorded for the live generation of `name`, if any.
+    ///
+    /// Exists so a test can assert that a caller actually asked for retention. Addition A5 is a
+    /// control the code could express and never invoked; without this accessor no test could tell
+    /// the difference between "retention set" and "retention silently omitted".
+    pub fn retain_until(&self, name: &ObjectName) -> Result<Option<time::OffsetDateTime>> {
+        let state = self.lock()?;
+        Ok(state
+            .objects
+            .get(name.as_str())
+            .and_then(|vs| vs.iter().find(|v| v.live))
+            .and_then(|v| v.retain_until))
+    }
+
     /// Every generation ever written for a name, newest last. Noncurrent ones included.
     pub fn generations(&self, name: &ObjectName) -> Result<Vec<Generation>> {
         let state = self.lock()?;
@@ -127,6 +146,14 @@ impl LocalStore {
 }
 
 impl ObjectStore for LocalStore {
+    fn location(&self, prefix: &str) -> String {
+        format!(
+            "local://{}/{}",
+            self.root.display(),
+            prefix.trim_start_matches('/')
+        )
+    }
+
     fn create(&self, name: &ObjectName, body: &Path, meta: &ObjectMeta) -> Result<Created> {
         let mut state = self.lock()?;
 
@@ -165,6 +192,7 @@ impl ObjectStore for LocalStore {
                 size: bytes.len() as u64,
                 sha256_hex: Some(meta.sha256_hex.clone()),
                 hold: meta.hold,
+                retain_until: meta.retain_until,
                 live: true,
             });
 

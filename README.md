@@ -18,9 +18,12 @@ pages — a ~100 GB table cannot be sorted whole, held on one disk, or re-run wh
 ```
 salvage secrets                                    # rotation inventory. Run FIRST, at incident time
 salvage plan     --table <db>.<tbl>                # derive the contract; reads no table data
-salvage export   --table <db>.<tbl> --batch <id>   # two passes per page, diffed, packed, pushed
-salvage audit    --table <db>.<tbl> --batch <id> --mode survey|enforce
-salvage teardown --table <db>.<tbl> --batch <id> --disposition <d> --owner <name>
+salvage export   --table <db>.<tbl> --batch <id> --bucket RAW --clickhouse-url URL
+salvage audit    --table <db>.<tbl> --batch <id> --mode survey|enforce \
+                 --bucket RAW --clean-bucket CLEAN --pages-generation N \
+                 --shape-review-signoff --rotation-signoff        # both gate the push
+salvage teardown --table <db>.<tbl> --batch <id> --disposition <d> --owner <name> \
+                 --accepted --rotation-complete                   # both are gates
 ```
 
 ## Exit codes
@@ -70,6 +73,17 @@ which is the fail-closed default.
 > small, named, and justified per column.
 
 That judgement is yours. `overrides/typematrix.typematrix.toml` is the worked example.
+
+## Flags that are gates, not conveniences
+
+| Flag | Why it has no default |
+| --- | --- |
+| `--bucket` / `--clean-bucket` | Two buckets, and the audit refuses a run where they resolve to the same destination. Section 5 puts clean in a separate account so the credential that wrote raw cannot reach it; sharing one also makes the consumer contract's "re-run from raw, never re-derive from clean" unenforceable. |
+| `--pages-generation` | The Controller pins `PAGES.json`'s generation out of band. Without it the audit would resolve the live one, making the producer the authority over its own output. `--unpinned-ledger` proceeds without a pin and records that the run had none. |
+| `--clickhouse-image` | Required for `--runner docker`/`podman`, and it must be `repo@sha256:<64 hex>`. A tag resolves at run time and can be moved, so a tag is not a pin. 25.3 is refused by name -- it is the compromised cluster's own end-of-support build. |
+| `--retain-days` | Unlocked object retention, never Locked. Zero means none, and that is a choice rather than an accident. |
+| `--shape-review-signoff`, `--rotation-signoff` | Both block the push. Neither is ever set by this code. |
+| `--accepted`, `--rotation-complete` | Both block teardown. |
 
 ## Placeholders to fill before a run
 

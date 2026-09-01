@@ -721,6 +721,11 @@ pub fn load_one(
     let overrides = toml::from_str::<crate::models::Overrides>(&over_text).map_err(|e| {
         bad(format!("could not parse overrides: {e}")).with("path", over_path.display())
     })?;
+    // Parsing is not enough: a cap can be correctly spelled, correctly typed, and still disable
+    // the control it is meant to bound.
+    overrides
+        .validate()
+        .map_err(|e| e.with("path", over_path.display()))?;
 
     Ok((ddl, overrides))
 }

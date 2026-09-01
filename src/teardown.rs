@@ -90,6 +90,9 @@ pub struct TeardownPlan {
     /// Every row of `SECRETS-ROTATION.md` is done.
     pub rotation_complete: bool,
     pub dry_run: bool,
+    /// When the disposition was recorded, as `YYYY-MM-DD`. Section A6 asks for "a named owner
+    /// **and date**"; the owner was written and the date was not.
+    pub recorded_at: String,
 }
 
 /// Run teardown.
@@ -124,15 +127,22 @@ pub fn run_teardown(plan: &TeardownPlan, store: &dyn ObjectStore) -> Result<Stri
         });
     }
 
+    // Enumerate on a dry run too. `store.list` is a **read**; only `set_hold` is the effectful
+    // leaf. Guarding both meant a dry run never learned what holds existed, so `render` fell into
+    // the empty branch and the report asserted "No temporary holds were outstanding" about a live
+    // estate it had not looked at -- a false statement in the one artifact that is the record of
+    // the teardown decision. The stated acceptance criterion for `--dry-run` is that every
+    // validator still runs and only the effectful leaf is stubbed; this was the one phase that
+    // broke it.
     let mut released = Vec::new();
-    if !plan.dry_run {
-        // Holds are the only part of the estate this tool holds credentials for. Released here so
-        // the objects *can* be deleted; the deletion itself is the operator's, below.
-        for stat in store.list(&plan.raw_prefix)? {
-            if stat.hold {
+    for stat in store.list(&plan.raw_prefix)? {
+        if stat.hold {
+            if !plan.dry_run {
+                // Holds are the only part of the estate this tool holds credentials for. Released
+                // here so the objects *can* be deleted; the deletion itself is the operator's.
                 store.set_hold(&stat.name, stat.generation, false)?;
-                released.push(stat.name.as_str().to_owned());
             }
+            released.push(stat.name.as_str().to_owned());
         }
     }
 
@@ -143,6 +153,16 @@ pub fn run_teardown(plan: &TeardownPlan, store: &dyn ObjectStore) -> Result<Stri
 fn render(plan: &TeardownPlan, released: &[String]) -> String {
     let mut md = String::new();
     let w = &mut md;
+    if plan.dry_run {
+        // A dry run used to write a report ending "Acceptance: confirmed. Rotation: complete."
+        // with nothing distinguishing it from a real one -- so it could later be read as the
+        // record of a teardown that never happened, whose hold list was wrong.
+        let _ = writeln!(
+            w,
+            "> **DRY RUN — nothing was released and nothing was destroyed.**\n>\n\
+             > This document records what *would* happen. It is not a record that it did.\n"
+        );
+    }
     let _ = writeln!(
         w,
         "# Teardown -- `{}`, batch `{}`\n",
@@ -202,8 +222,15 @@ fn render(plan: &TeardownPlan, released: &[String]) -> String {
 
     let _ = writeln!(
         w,
-        "\n## Sign-off\n\nRecorded by **{}**. Acceptance: confirmed. Rotation: complete.",
-        plan.owner
+        "\n## Sign-off\n\nRecorded by **{}** on {}. Acceptance: confirmed. Rotation: complete.{}",
+        plan.owner,
+        // The requirement is "a named owner **and date**"; the date was never written.
+        plan.recorded_at,
+        if plan.dry_run {
+            "\n\n**This was a dry run. Nothing above was carried out.**"
+        } else {
+            ""
+        }
     );
     md
 }
@@ -232,6 +259,7 @@ mod tests {
             raw_prefix: "events.hits/b1".to_owned(),
             disposition: Disposition::SnapshotThenWipe,
             owner: "R. Okonkwo".to_owned(),
+            recorded_at: "2026-09-01".to_owned(),
             accepted: true,
             rotation_complete: true,
             dry_run: false,
@@ -255,6 +283,53 @@ mod tests {
             Created::Fresh(_)
         ));
         store
+    }
+
+    #[test]
+    fn a_dry_run_enumerates_holds_and_marks_the_report_as_a_dry_run() {
+        // `store.list` is a read, not the effectful leaf. Guarding it too meant a dry run never
+        // learned what holds existed, so the report claimed "No temporary holds were outstanding"
+        // about a live estate it had not looked at -- and it said so in a document that was
+        // otherwise indistinguishable from a real teardown record.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("store")).unwrap();
+        let store = crate::testkit::LocalStore::new(dir.path().join("store"));
+
+        let body_path = dir.path().join("obj");
+        std::fs::write(&body_path, b"x").unwrap();
+        let name = crate::gcs::ObjectName::new("events.hits/b1/page-0000.tar.gz").unwrap();
+        store
+            .create(
+                &name,
+                &body_path,
+                &crate::gcs::ObjectMeta {
+                    sha256_hex: "0".repeat(64),
+                    retain_until: None,
+                    hold: true,
+                    content_type: "application/gzip",
+                },
+            )
+            .unwrap();
+
+        let mut p = plan();
+        p.dry_run = true;
+        let md = run_teardown(&p, &store).unwrap();
+
+        assert!(md.contains("DRY RUN"), "the report must say so: {md}");
+        assert!(
+            md.contains("page-0000.tar.gz"),
+            "a dry run must still enumerate the holds it would release: {md}"
+        );
+        assert!(
+            !md.contains("No temporary holds were outstanding"),
+            "the report must not claim an empty estate it never looked at"
+        );
+        // And the hold is genuinely still set: only the effectful leaf was stubbed.
+        assert!(store.stat(&name).unwrap().unwrap().hold);
+
+        // The date is recorded alongside the owner, which section A6 asks for and which was
+        // never written.
+        assert!(md.contains(&p.recorded_at), "no date in the sign-off: {md}");
     }
 
     #[test]

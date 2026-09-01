@@ -36,6 +36,11 @@
 //! - **`SetMatches::len()` returns the set size, not the match count.** Using it for "did anything
 //!   match" makes the answer always yes. Every count here goes through `.iter().count()`.
 
+#![deny(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::integer_division
+)]
 use std::sync::OnceLock;
 
 use regex::bytes::{RegexSet, RegexSetBuilder};
@@ -403,15 +408,40 @@ pub fn scan(value: &[u8], limits: &Limits) -> Result<ScanResult> {
 
     for (via, decoded) in decodings(value, limits)? {
         record(via, cat.matches(&decoded), &mut out);
+
+        // Decoding and normalisation **compose**. Scanning `raw`, `NFC(raw)`, `NFKC(raw)` and
+        // `decode(raw)` covers four forms and misses the one that matters most: the fullwidth
+        // `%EF%BC%9Cscript%EF%BC%9E` percent-decodes to `＜script＞`, whose NFKC form is
+        // `<script>`. The raw value is pure ASCII so neither normalisation of it changes anything,
+        // and the decoded value was never normalised -- so the fold that would have caught it
+        // never happened. Section 8.6 asks for detection "after decoding **and** after
+        // normalisation", which is a composition and not a list.
+        if let Ok(text) = std::str::from_utf8(&decoded) {
+            let nfkc: String = text.nfkc().collect();
+            if nfkc.as_bytes() != decoded.as_slice() {
+                record("nfkc", cat.matches(nfkc.as_bytes()), &mut out);
+            }
+            let nfc: String = text.nfc().collect();
+            if nfc.as_bytes() != decoded.as_slice() {
+                record("nfc", cat.matches(nfc.as_bytes()), &mut out);
+            }
+        }
     }
 
     Ok(out)
 }
 
-/// Bounded single-round decodings.
+/// Bounded decodings, applied for up to `max_decode_rounds` rounds.
 ///
 /// Rounds and expansion are both capped. Without that this becomes a decompression bomb by another
 /// name: base64 of base64 of base64 costs nothing to write and unbounded memory to follow.
+///
+/// `max_decode_rounds` is now a **loop count**. It used to be tested only for `== 0`, with a single
+/// round hardcoded after it, so every value above zero behaved identically and raising the pinned
+/// number bought nothing while reading as though it had. A doubly-encoded payload --
+/// `%253Cscript%253E` decodes once to `%3Cscript%3E`, which matches nothing -- walked straight
+/// through. Note the cap is still a cap: it bounds the work, and reaching it is not an error,
+/// because a value that is legitimately deep is a value we simply stop unwrapping.
 pub fn decodings(value: &[u8], limits: &Limits) -> Result<Vec<(&'static str, Vec<u8>)>> {
     let mut out: Vec<(&'static str, Vec<u8>)> = Vec::new();
     if limits.max_decode_rounds == 0 {
@@ -425,18 +455,36 @@ pub fn decodings(value: &[u8], limits: &Limits) -> Result<Vec<(&'static str, Vec
     )
     .unwrap_or(usize::MAX);
 
-    let push = |via: &'static str, bytes: Vec<u8>, out: &mut Vec<(&'static str, Vec<u8>)>| {
-        if bytes.is_empty() || bytes == value || bytes.len() > budget {
-            return;
-        }
-        out.push((via, bytes));
-    };
+    // Everything seen so far, so a decoder that returns its input -- or two decoders that converge
+    // on the same bytes -- cannot make the loop spin or the output repeat.
+    let mut seen: Vec<Vec<u8>> = vec![value.to_vec()];
+    let mut frontier: Vec<Vec<u8>> = vec![value.to_vec()];
 
-    push("percent", percent_decode(value), &mut out);
-    push("html_entity", html_entity_decode(value), &mut out);
-    push("unicode_escape", unicode_escape_decode(value), &mut out);
-    if let Some(bytes) = base64_decode_if_plausible(value, budget) {
-        push("base64", bytes, &mut out);
+    for _ in 0..limits.max_decode_rounds {
+        let mut next: Vec<Vec<u8>> = Vec::new();
+        for current in &frontier {
+            let candidates = [
+                ("percent", percent_decode(current)),
+                ("html_entity", html_entity_decode(current)),
+                ("unicode_escape", unicode_escape_decode(current)),
+                (
+                    "base64",
+                    base64_decode_if_plausible(current, budget).unwrap_or_default(),
+                ),
+            ];
+            for (via, bytes) in candidates {
+                if bytes.is_empty() || bytes.len() > budget || seen.contains(&bytes) {
+                    continue;
+                }
+                seen.push(bytes.clone());
+                out.push((via, bytes.clone()));
+                next.push(bytes);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
     }
     Ok(out)
 }
@@ -519,27 +567,72 @@ fn unicode_escape_decode(value: &[u8]) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Decode the longest plausible base64 **run** inside `value`, not just a whole-value blob.
+///
+/// The old rule was `value.iter().all(is_base64_char)`, so base64 only decoded when the entire
+/// field was base64 and nothing else. That is not how a credential arrives: it arrives inside a
+/// JSON blob, a connection string, a log line. `{"backup":"LS0tLS1CRUdJTiBSU0Eg..."}` failed the
+/// `all` on its very first byte, so the secret classes -- which the module documents as running
+/// "on every bounded decoding, because a base64-wrapped key is still a key" -- never saw it.
+///
+/// Scanning runs keeps the same protection against decoding ordinary words into noise: a run must
+/// still be long enough to carry something, and must still actually decode.
 fn base64_decode_if_plausible(value: &[u8], budget: usize) -> Option<Vec<u8>> {
+    const MIN_RUN: usize = 16;
+    if value.len() > budget.saturating_mul(4) {
+        return None;
+    }
+    let is_b64 =
+        |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_');
+
+    let mut best: Option<Vec<u8>> = None;
+    let mut start = 0usize;
+    while start < value.len() {
+        if !is_b64(&value[start]) {
+            start = start.saturating_add(1);
+            continue;
+        }
+        let mut end = start;
+        while end < value.len() && is_b64(&value[end]) {
+            end = end.saturating_add(1);
+        }
+        let run = &value[start..end];
+        if run.len() >= MIN_RUN
+            && run.len() <= budget
+            && let Some(decoded) = decode_run(run)
+        {
+            {
+                // Longest wins: a wrapper's own alphanumerics can form short runs either side of
+                // the payload, and the payload is the long one.
+                if best.as_ref().is_none_or(|b| decoded.len() > b.len()) {
+                    best = Some(decoded);
+                }
+            }
+        }
+        start = end;
+    }
+    best
+}
+
+fn decode_run(run: &[u8]) -> Option<Vec<u8>> {
     use base64::Engine as _;
-    // "Plausibly base64": long enough to carry something, and made only of the alphabet. Trying
-    // every short value would decode ordinary words into noise and flood the inventory.
-    if value.len() < 16 || value.len() > budget {
-        return None;
-    }
-    let plausible = value
-        .iter()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
-    if !plausible {
-        return None;
-    }
+    // Four engines, because the padded URL-safe form decodes under neither of the original two:
+    // `STANDARD` rejects `-` and `_`, and `URL_SAFE_NO_PAD` rejects `=`.
     base64::engine::general_purpose::STANDARD
-        .decode(value)
+        .decode(run)
         .ok()
         .or_else(|| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(value)
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(run)
                 .ok()
         })
+        .or_else(|| base64::engine::general_purpose::URL_SAFE.decode(run).ok())
+        .or_else(|| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(run)
+                .ok()
+        })
+        .filter(|d| !d.is_empty())
 }
 
 #[cfg(test)]
@@ -563,6 +656,67 @@ mod tests {
             max_decode_expansion_ratio: 8,
             wall_clock_secs: 30,
         }
+    }
+
+    #[test]
+    fn a_doubly_encoded_payload_is_caught_because_rounds_actually_loop() {
+        // `max_decode_rounds` was only ever tested for `== 0`, with one round hardcoded after it,
+        // so every value above zero behaved identically. `%253Cscript%253E` decodes once to
+        // `%3Cscript%3E`, which matches nothing, and walked straight through.
+        let mut l = limits();
+        l.max_decode_rounds = 2;
+        let doubled = b"%253Cscript%253Ealert(1)%253C%2Fscript%253E";
+        let hit = scan(doubled, &l).unwrap();
+        assert!(
+            hit.classes.iter().any(|c| c.contains("html_js")),
+            "two rounds must reach the payload: {:?}",
+            hit.classes
+        );
+
+        // One round is not enough for this value, which is what makes the knob meaningful.
+        l.max_decode_rounds = 1;
+        let once = scan(doubled, &l).unwrap();
+        assert!(
+            !once.classes.iter().any(|c| c.contains("html_js")),
+            "a single round cannot reach it; the cap is still a cap"
+        );
+    }
+
+    #[test]
+    fn a_decoded_value_is_normalised_before_it_is_scanned() {
+        // `scan` covered raw, NFC(raw), NFKC(raw) and decode(raw) -- four forms, missing the
+        // composition. The fullwidth form is pure ASCII once percent-encoded, so neither
+        // normalisation of the *raw* value changes anything, and the decoded value was never
+        // normalised.
+        let hit = scan("%EF%BC%9Cscript%EF%BC%9E".as_bytes(), &limits()).unwrap();
+        assert!(
+            hit.classes.iter().any(|c| c.contains("html_js")),
+            "decode then NFKC must compose: {:?}",
+            hit.classes
+        );
+    }
+
+    #[test]
+    fn a_base64_secret_wrapped_in_json_is_still_found() {
+        use base64::Engine as _;
+        // The old rule required the *entire* field to be base64, so a key inside a JSON blob --
+        // which is how a credential actually arrives -- was never decoded, contradicting this
+        // module's own "a base64-wrapped key is still a key".
+        let pem = "-----BEGIN RSA PRIVATE KEY-----";
+        let wrapped = format!(
+            "{{\"backup\":\"{}\"}}",
+            base64::engine::general_purpose::STANDARD.encode(pem)
+        );
+        let hit = scan(wrapped.as_bytes(), &limits()).unwrap();
+        assert!(
+            !hit.is_clean(),
+            "an embedded base64 key must be found: {:?}",
+            hit.classes
+        );
+
+        // And a bare blob still works, so the run scan is a superset of what it replaced.
+        let bare = base64::engine::general_purpose::STANDARD.encode(pem);
+        assert!(!scan(bare.as_bytes(), &limits()).unwrap().is_clean());
     }
 
     #[test]

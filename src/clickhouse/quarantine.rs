@@ -129,8 +129,18 @@ pub fn output_columns(ddl: &PinnedDdl, overrides: &Overrides) -> Result<Vec<Outp
                 .with("cap", overrides.limits.max_nesting_depth));
         }
 
-        let rules = rules_for(&column.ty, overrides.limits.max_array_elements)
+        let mut rules = rules_for(&column.ty, overrides.limits.max_array_elements)
             .map_err(|e| e.with("column", column.name.as_str()))?;
+        // Section 8.2's prefer-hex directive, per column. This is the only consumer of
+        // `ColumnOverride.hex`; before it existed the flag was pinned, documented and inert.
+        if overrides
+            .columns
+            .get(column.name.as_str())
+            .is_some_and(|o| o.hex)
+        {
+            crate::clickhouse::types::apply_hex_override(&column.ty, &mut rules)
+                .map_err(|e| e.with("column", column.name.as_str()))?;
+        }
 
         for projected in &rules.columns {
             let name = format!("{}{}", column.name.as_str(), projected.suffix);

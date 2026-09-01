@@ -110,6 +110,15 @@ fn cmd_teardown(cli: &Cli, args: &salvage::cli::TeardownArgs) -> Result<()> {
         accepted: args.accepted,
         rotation_complete: args.rotation_complete,
         dry_run: cli.common.dry_run,
+        recorded_at: {
+            let now = time::OffsetDateTime::now_utc();
+            format!(
+                "{:04}-{:02}-{:02}",
+                now.year(),
+                u8::from(now.month()),
+                now.day()
+            )
+        },
     };
 
     let body = run_teardown(&plan, &store)?;
@@ -124,6 +133,7 @@ fn cmd_audit(cli: &Cli, args: &salvage::cli::AuditArgs) -> Result<()> {
     let batch = args.batch.batch.as_str().to_owned();
     let (ddl, overrides) = ddl::load_one(&cli.common.ddl_dir, &cli.common.overrides_dir, &table)?;
     let store = object_store(cli, Some(&overrides.limits))?;
+    let clean_store = clean_object_store(cli, Some(&overrides.limits))?;
 
     // `PAGES.json` is the completion sentinel. Its absence means the export never finished, and a
     // prefix without it is an incomplete run a consumer must treat as absent.
@@ -136,19 +146,43 @@ fn cmd_audit(cli: &Cli, args: &salvage::cli::AuditArgs) -> Result<()> {
         })?
     } else {
         let name = salvage::gcs::ObjectName::new(format!("{raw_prefix}/PAGES.json"))?;
-        let stat = store.stat(&name)?.ok_or_else(|| SalvageError::Abort {
-            reason: "no PAGES.json: the export never finished".to_owned(),
-            context: vec![("prefix", raw_prefix.clone())],
-        })?;
-        // The Controller pins this generation out of band; reading the live one is a convenience
-        // for a single-operator run and is recorded as such.
-        tracing::warn!(
-            generation = %stat.generation,
-            "using the live PAGES.json generation; the Controller's pinned value is the control"
-        );
+        // Section 5: the Controller pins and approves version ids, and a reader never resolves
+        // "latest under prefix". `PAGES.json` is the root of trust for every page generation and
+        // hash in the run, so resolving it live makes the producer the authority over its own
+        // output -- exactly what section 1 forbids. Require the pinned value, or an explicit
+        // acknowledgement that this run is doing without one.
+        let generation = match cli.common.pages_generation {
+            Some(g) => salvage::gcs::Generation(g),
+            None if cli.common.unpinned_ledger => {
+                let stat = store.stat(&name)?.ok_or_else(|| SalvageError::Abort {
+                    reason: "no PAGES.json: the export never finished".to_owned(),
+                    context: vec![("prefix", raw_prefix.clone())],
+                })?;
+                tracing::warn!(
+                    generation = %stat.generation,
+                    "--unpinned-ledger: reading the live PAGES.json generation. The Controller's \
+                     pinned value is the control this replaces."
+                );
+                stat.generation
+            }
+            None => {
+                return Err(SalvageError::Usage {
+                    reason: "--pages-generation is required: the Controller pins it out of band"
+                        .to_owned(),
+                    context: vec![
+                        ("prefix", raw_prefix.clone()),
+                        (
+                            "alternative",
+                            "pass --unpinned-ledger to read the live generation and record that                              this run had no Controller pin"
+                                .to_owned(),
+                        ),
+                    ],
+                });
+            }
+        };
         let dest = cli.common.work.join("PAGES.json");
         std::fs::create_dir_all(&cli.common.work).ok();
-        store.get_pinned(&name, stat.generation, &dest)?;
+        store.get_pinned(&name, generation, &dest)?;
         std::fs::read_to_string(&dest).map_err(|e| SalvageError::Infra {
             reason: format!("could not read the pulled ledger: {e}"),
             context: Vec::new(),
@@ -162,6 +196,7 @@ fn cmd_audit(cli: &Cli, args: &salvage::cli::AuditArgs) -> Result<()> {
         })?;
 
     let opts = audit::AuditOptions {
+        retain_days: cli.common.retain_days,
         batch: batch.clone(),
         work: cli.common.work.clone(),
         raw_prefix,
@@ -186,7 +221,7 @@ fn cmd_audit(cli: &Cli, args: &salvage::cli::AuditArgs) -> Result<()> {
                 salvage::cli::Runner::Podman => "podman".to_owned(),
                 salvage::cli::Runner::Local => "clickhouse-client".to_owned(),
             },
-            image: cli.common.clickhouse_image.clone(),
+            image: cli.common.clickhouse_image.clone().unwrap_or_default(),
             host: cli.common.insert_host.clone(),
             max_memory_usage: overrides.limits.max_uncompressed_bytes,
             max_insert_block_size: overrides.limits.max_rows_per_page.min(65_536),
@@ -194,7 +229,15 @@ fn cmd_audit(cli: &Cli, args: &salvage::cli::AuditArgs) -> Result<()> {
         dry_run: cli.common.dry_run,
     };
 
-    let report = audit::run_audit(&ddl, &overrides, &store, &inserter, &ledger, &opts)?;
+    let report = audit::run_audit(
+        &ddl,
+        &overrides,
+        &store,
+        &clean_store,
+        &inserter,
+        &ledger,
+        &opts,
+    )?;
     if cli.common.json {
         let rendered = serde_json::to_string_pretty(&report).map_err(|e| SalvageError::Infra {
             reason: format!("could not render the report: {e}"),
@@ -241,6 +284,7 @@ fn cmd_export(cli: &Cli, args: &salvage::cli::ExportArgs) -> Result<()> {
     let doc = plan::build(&ddl, &overrides, Some(&facts))?;
 
     let opts = export::ExportOptions {
+        retain_days: cli.common.retain_days,
         batch: batch.clone(),
         work: cli.common.work.clone(),
         bucket_prefix: format!("{table}/{batch}"),
@@ -429,7 +473,27 @@ fn object_store(cli: &Cli, limits: Option<&salvage::limits::Limits>) -> Result<H
             reason: "--bucket is required for this subcommand".to_owned(),
             context: Vec::new(),
         })?;
+    store_for(cli, limits, bucket.as_str())
+}
 
+/// The clean-side store. A distinct bucket, not a distinct prefix -- see [`Common::clean_bucket`].
+fn clean_object_store(cli: &Cli, limits: Option<&salvage::limits::Limits>) -> Result<HttpStore> {
+    let bucket = cli
+        .common
+        .clean_bucket
+        .as_ref()
+        .ok_or_else(|| SalvageError::Usage {
+            reason: "--clean-bucket is required for this subcommand".to_owned(),
+            context: Vec::new(),
+        })?;
+    store_for(cli, limits, bucket.as_str())
+}
+
+fn store_for(
+    cli: &Cli,
+    limits: Option<&salvage::limits::Limits>,
+    bucket: &str,
+) -> Result<HttpStore> {
     let session_dir = cli
         .common
         .session_dir
@@ -464,7 +528,7 @@ fn object_store(cli: &Cli, limits: Option<&salvage::limits::Limits>) -> Result<H
         TransferBudget::from_limits,
     );
 
-    HttpStore::new(bucket.as_str(), tokens, budget, session_dir)
+    HttpStore::new(bucket, tokens, budget, session_dir)
 }
 
 fn init_logging(cli: &Cli) {

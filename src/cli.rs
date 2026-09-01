@@ -189,23 +189,60 @@ pub struct Common {
     /// Section 3 wants independently built and verified images; a tag is mutable, so a tag is not
     /// a pin. Choose from section 3's supported list -- 26.7, 26.6, 26.5, 26.3 or 25.8 -- and never
     /// 25.3, which is the compromised cluster's own end-of-support build.
-    #[arg(
-        long,
-        global = true,
-        default_value = "clickhouse/clickhouse-server:26.7"
-    )]
-    pub clickhouse_image: String,
+    /// There is deliberately **no default**. A default would have to be a tag -- which is exactly
+    /// what this flag exists to forbid -- and the previous one sat directly beneath the sentence
+    /// above saying a tag is not a pin, while nothing read the field at all.
+    #[arg(long, global = true)]
+    pub clickhouse_image: Option<String>,
 
     /// Host the disposable ClickHouse answers on.
     #[arg(long, global = true, default_value = "127.0.0.1")]
     pub insert_host: String,
 
-    /// Bucket this invocation reads from or writes to.
+    /// The raw bucket: where `export` writes and where `audit` reads from.
     ///
     /// Required by `export` and `audit`; `plan`, `secrets` and `teardown` touch no bucket, so it
     /// is optional here and checked in the dispatcher rather than by clap.
     #[arg(long, global = true)]
     pub bucket: Option<BucketName>,
+
+    /// The clean bucket: where `audit` writes the regenerated batch.
+    ///
+    /// Required by `audit`, and it must be a **different** bucket from `--bucket`. Section 5 puts
+    /// clean in a separate account precisely so that the credential which wrote the raw side
+    /// cannot reach it; sharing one bucket also breaks the consumer contract's escalation rule,
+    /// which says to re-run from raw and never re-derive from clean.
+    #[arg(long, global = true)]
+    pub clean_bucket: Option<BucketName>,
+
+    /// Days of Unlocked object retention to set on every object this run creates.
+    ///
+    /// Addition A5: **Unlocked (governance) retention, never Locked.** Locked retention would make
+    /// the raw bucket hold the attacker's data immutably and leave the bucket undeletable until
+    /// every retain-until passed, which is a liability rather than a control. Unlocked lets an
+    /// authorized identity remove it at teardown, which is what `teardown`'s checklist assumes.
+    ///
+    /// Zero means no retention, and that is a real choice rather than the accidental default it
+    /// used to be: every call site passed `None`, so the retention code was correct, tested and
+    /// unreachable, and a temporary hold released at teardown was the only protection applied.
+    #[arg(long, global = true, default_value_t = 0)]
+    pub retain_days: u32,
+
+    /// The exact generation of `PAGES.json` to read, as pinned by the Controller out of band.
+    ///
+    /// Section 5: readers address an exact object version, never "latest under prefix", and the
+    /// Controller -- not the producer -- approves what moves forward. Without this the audit
+    /// resolves the live generation, which makes the producer's own ledger the root of trust for
+    /// every page generation and hash in the run.
+    #[arg(long, global = true)]
+    pub pages_generation: Option<u64>,
+
+    /// Proceed without a Controller-pinned `PAGES.json` generation, reading the live one instead.
+    ///
+    /// A single-operator convenience and a recorded deviation, not a default. It is a flag rather
+    /// than a fallback so that the weaker mode appears in the shell history and in `report.json`.
+    #[arg(long, global = true)]
+    pub unpinned_ledger: bool,
 
     /// Directory holding resumable-upload sessions, so an interrupted multi-GB page push resumes
     /// rather than restarting. Defaults to a subdirectory of `--work`.
@@ -264,7 +301,7 @@ pub enum Command {
     /// byte for byte.
     /// DOES NOT PROVE: that the rows are true, or that they are all of what existed.
     /// ABORTS ON: a pinned setting the server does not know, a settings constraint, a row-count
-    /// disagreement, a page-count mismatch, or any difference between two passes.
+    /// disagreement, a page longer than its own LIMIT, or any difference between two passes.
     Export(ExportArgs),
 
     /// Stream the batch down, audit it, insert-test it against a dummy DB, re-tar, push to clean.
@@ -280,12 +317,17 @@ pub enum Command {
     ///
     /// PROVES: nothing about the data. It is an inventory, not a check.
     /// DOES NOT PROVE: that the listed secrets are all of them.
-    /// ABORTS ON: pinned DDL that cannot be parsed.
+    /// REFUSES (exit 2, usage): pinned DDL that cannot be parsed -- a source-control problem,
+    /// not a finding about the data.
     Secrets,
 
     /// Release holds, destroy the estate, record the source disposition.
     ///
-    /// PROVES: the estate is gone and the source's fate is written down rather than defaulted.
+    /// PROVES: the source's fate is written down rather than defaulted, and the temporary holds
+    /// this tool set are released so the estate *can* be destroyed.
+    /// DOES NOT PROVE: that the estate is gone. Deleting instances, disks, keys, service accounts
+    /// and buckets needs credentials this tool deliberately never holds; the checklist it emits is
+    /// a list of things nobody has done yet.
     /// DOES NOT PROVE: that no copy was taken while the batch existed.
     /// ABORTS ON: acceptance or rotation not signed off.
     Teardown(TeardownArgs),
@@ -303,10 +345,6 @@ pub struct ExportArgs {
     pub table: TableArg,
     #[command(flatten)]
     pub batch: BatchArg,
-
-    /// Re-run a single page by index. For recovering from an infrastructure error only.
-    #[arg(long)]
-    pub page: Option<u32>,
 
     /// Resume an interrupted run. Honoured only after exit 3; refuses to continue past a finding.
     ///
@@ -336,10 +374,6 @@ pub struct AuditArgs {
     pub table: TableArg,
     #[command(flatten)]
     pub batch: BatchArg,
-
-    /// Re-run a single page by index.
-    #[arg(long)]
-    pub page: Option<u32>,
 
     /// survey enumerates every finding and writes nothing forward;
     /// enforce is the production run and is expected to find nothing.

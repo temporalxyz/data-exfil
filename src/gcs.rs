@@ -40,7 +40,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::abort::{PartialOutput, Result, SalvageError, infra, usage};
+use crate::abort::{PartialOutput, Result, SalvageError, abort, infra, usage};
 use crate::limits::{OrOverflow as _, TransferBudget, copy_bounded};
 
 /// A GCS object generation. Named `Generation`, never `gen` -- `gen` is a reserved keyword in
@@ -174,6 +174,14 @@ pub trait ObjectStore {
 
     /// Set or release a temporary hold on one generation.
     fn set_hold(&self, name: &ObjectName, generation: Generation, hold: bool) -> Result<()>;
+
+    /// A stable identity for "where a prefix under this store actually lives".
+    ///
+    /// Exists so a caller holding two stores can tell whether they are the same destination.
+    /// `audit` reads from raw and writes to clean, and pointing both at one bucket produces a run
+    /// that passes every validation and then dies at the create-only push -- so the check has to
+    /// be possible before any byte moves, and it has to compare the *store*, not just the prefix.
+    fn location(&self, prefix: &str) -> String;
 }
 
 // -- pure wire-format shaping ------------------------------------------------------------------
@@ -242,6 +250,18 @@ pub fn crc32c_header(body: &[u8]) -> String {
 }
 
 /// Render a retain-until instant the way the JSON API wants it.
+/// A retain-until instant `days` from now, or `None` for no retention.
+///
+/// Addition A5 is Unlocked retention only. There is no path in this crate that can request Locked:
+/// `ObjectMeta` carries an instant, and [`init_metadata`] renders `"mode": "Unlocked"` beside it.
+#[must_use]
+pub fn retain_until_days(days: u32) -> Option<OffsetDateTime> {
+    if days == 0 {
+        return None;
+    }
+    OffsetDateTime::now_utc().checked_add(time::Duration::days(i64::from(days)))
+}
+
 pub fn retain_until_rfc3339(at: OffsetDateTime) -> Result<String> {
     at.format(&Rfc3339)
         .map_err(|e| infra::<()>(format!("could not format retain-until: {e}")).unwrap_err())
@@ -432,6 +452,10 @@ impl HttpStore {
 }
 
 impl ObjectStore for HttpStore {
+    fn location(&self, prefix: &str) -> String {
+        format!("gs://{}/{}", self.bucket, prefix.trim_start_matches('/'))
+    }
+
     fn create(&self, name: &ObjectName, body: &Path, meta: &ObjectMeta) -> Result<Created> {
         let total = std::fs::metadata(body)
             .map_err(|e| {
@@ -442,11 +466,45 @@ impl ObjectStore for HttpStore {
             .len();
 
         let session_path = self.session_path(name);
-        let session_uri = match std::fs::read_to_string(&session_path) {
+        let stored = match std::fs::read_to_string(&session_path) {
             // An interrupted push. Ask the session how much it committed and continue from there;
             // restarting a multi-GB page over a hostile link is not a recovery strategy.
-            Ok(uri) if !uri.trim().is_empty() => uri.trim().to_owned(),
-            _ => {
+            Ok(uri) if !uri.trim().is_empty() => {
+                let uri = uri.trim().to_owned();
+                // The work dir sits on the dirty side. A stored URI is a capability, and using it
+                // unvalidated meant anything able to write that file could redirect the next
+                // resume -- and the whole page with it -- to an arbitrary endpoint.
+                check_session_uri(&uri)?;
+                match self.session_state(&uri, total)? {
+                    ResumeAction::Continue(_) => Some(uri),
+                    ResumeAction::Complete => {
+                        // The upload finished but we died before recording it. Previously this
+                        // fell through to `infra("upload finished without a completion response")`
+                        // *without* removing the session file, so every subsequent resume repeated
+                        // the same error and the page could neither complete nor be skipped.
+                        let _ = std::fs::remove_file(&session_path);
+                        let existing = self.get_metadata(name, None)?.ok_or_else(|| {
+                            infra::<()>("the upload session reports complete but no object exists")
+                                .unwrap_err()
+                                .with("object", name)
+                        })?;
+                        return Ok(Created::Fresh(existing.generation));
+                    }
+                    ResumeAction::Reinitiate => {
+                        // Dead or expired. Starting over is correct here and only here -- the
+                        // object never went live, so create-only has not been spent. The old code
+                        // said exactly this in a comment and then PUT chunk 0 to the dead URI.
+                        let _ = std::fs::remove_file(&session_path);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let session_uri = match stored {
+            Some(uri) => uri,
+            None => {
                 let init = self
                     .client
                     .post(resumable_init_url(&self.bucket, name))
@@ -607,11 +665,6 @@ impl HttpStore {
             .map_err(|e| infra::<()>(format!("could not open upload body: {e}")).unwrap_err())?;
 
         let mut offset = self.committed_offset(session_uri, total)?;
-        if offset > 0 {
-            file.seek(SeekFrom::Start(offset)).map_err(|e| {
-                infra::<()>(format!("could not seek to resume point: {e}")).unwrap_err()
-            })?;
-        }
 
         loop {
             if Instant::now() > deadline {
@@ -620,18 +673,24 @@ impl HttpStore {
                     .map(|()| Generation(0));
             }
 
-            let remaining = total.saturating_sub(offset);
-            if remaining == 0 {
+            let Some((this_chunk, range)) = next_chunk(offset, total, UPLOAD_CHUNK_BYTES) else {
                 break;
-            }
-            let this_chunk = remaining.min(UPLOAD_CHUNK_BYTES);
+            };
+
+            // Seek **every** iteration, not once before the loop. The file cursor advances by what
+            // was *sent*; `offset` is re-derived below from what the server says it *committed*.
+            // GCS may commit fewer bytes than were sent, and when it does the two diverge: the
+            // next read takes bytes from the old position while labelling them with the new
+            // offset, so the object is assembled from the wrong bytes at the wrong places -- with
+            // a per-chunk CRC32C that matches what was sent, so nothing on the wire objects.
+            file.seek(SeekFrom::Start(offset)).map_err(|e| {
+                infra::<()>(format!("could not seek to the upload offset: {e}")).unwrap_err()
+            })?;
+
             let mut buf = vec![0u8; usize::try_from(this_chunk).or_overflow("chunk->usize")?];
             file.read_exact(&mut buf).map_err(|e| {
                 infra::<()>(format!("short read from upload body: {e}")).unwrap_err()
             })?;
-
-            let last = buf.len() as u64;
-            let range = format!("bytes {}-{}/{}", offset, offset + last - 1, total);
             let resp = self
                 .client
                 .put(session_uri)
@@ -650,7 +709,20 @@ impl HttpStore {
                 // 308 Resume Incomplete: more to send. Trust the server's committed offset over
                 // our own arithmetic -- it is the one that decides what was durably written.
                 308 => {
-                    offset = committed_from_range(resp.headers()).unwrap_or(offset + last);
+                    let committed = committed_from_range(resp.headers())
+                        .unwrap_or_else(|| offset.saturating_add(this_chunk));
+                    // A server that never advances would otherwise spin here forever, reading
+                    // ever-later bytes and writing them all to the same offset.
+                    if committed <= offset {
+                        return infra("the upload session stopped making progress").map_err(
+                            |e: SalvageError| {
+                                e.with("offset", offset)
+                                    .with("committed", committed)
+                                    .with("sent", this_chunk)
+                            },
+                        );
+                    }
+                    offset = committed;
                 }
                 200 | 201 => {
                     let body = read_bounded_body(resp, MAX_JSON_RESPONSE_BYTES)?;
@@ -671,6 +743,22 @@ impl HttpStore {
         }
 
         infra("upload finished without a completion response")
+    }
+
+    /// Ask an existing session what state it is in.
+    fn session_state(&self, session_uri: &str, total: u64) -> Result<ResumeAction> {
+        let resp = self
+            .client
+            .put(session_uri)
+            .header(reqwest::header::CONTENT_RANGE, format!("bytes */{total}"))
+            .header(reqwest::header::CONTENT_LENGTH, "0")
+            .timeout(Duration::from_secs(60))
+            .send()
+            .map_err(|e| {
+                infra::<()>(format!("could not query upload session: {e}")).unwrap_err()
+            })?;
+        let status = resp.status().as_u16();
+        Ok(resume_action(status, committed_from_range(resp.headers())))
     }
 
     /// Ask an existing session how many bytes it has durably committed.
@@ -694,6 +782,78 @@ impl HttpStore {
             _ => Ok(0),
         }
     }
+}
+
+/// What to do with an existing resumable-upload session.
+///
+/// Extracted as a value rather than left inline because this whole block had **no test coverage of
+/// any kind** -- no test in the crate exercises `HttpStore`'s network methods -- and three of the
+/// four bugs found here lived in the branch that decides this. A pure function is cheaper to test
+/// than an HTTP mock and would have caught all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeAction {
+    /// The session is live and has committed this many bytes. Continue from there.
+    Continue(u64),
+    /// The session already finished. The object exists; fetch its generation and drop the session.
+    Complete,
+    /// The session is dead or expired. Discard it and initiate a new one -- create-only has not
+    /// been spent, because the object never went live.
+    Reinitiate,
+}
+
+/// Decide from a session-status response.
+#[must_use]
+pub fn resume_action(status: u16, committed: Option<u64>) -> ResumeAction {
+    match status {
+        308 => ResumeAction::Continue(committed.unwrap_or(0)),
+        200 | 201 => ResumeAction::Complete,
+        _ => ResumeAction::Reinitiate,
+    }
+}
+
+/// The next chunk to send, as `(length, Content-Range)`.
+///
+/// `None` when nothing is left. Rendering the header here rather than at the call site is what
+/// lets the inclusive-end arithmetic be asserted directly.
+#[must_use]
+pub fn next_chunk(offset: u64, total: u64, chunk: u64) -> Option<(u64, String)> {
+    let remaining = total.saturating_sub(offset);
+    if remaining == 0 {
+        return None;
+    }
+    let len = remaining.min(chunk);
+    let last = offset.saturating_add(len).saturating_sub(1);
+    Some((len, format!("bytes {offset}-{last}/{total}")))
+}
+
+/// Whether a persisted session URI is safe to send a multi-gigabyte page to.
+///
+/// The URI is read back from the work dir, which on the export host sits on the dirty side. It was
+/// used verbatim: no scheme check, no host check. Anything able to write that file could redirect
+/// the next `--resume` to an arbitrary endpoint, and the run would then fail with an infrastructure
+/// error that reads like a flaky bucket.
+pub fn check_session_uri(uri: &str) -> Result<()> {
+    let rest = uri.strip_prefix("https://").ok_or_else(|| {
+        abort::<()>("the stored upload session URI is not https")
+            .unwrap_err()
+            .with("uri", uri.chars().take(120).collect::<String>())
+    })?;
+    let host = rest
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if host != "storage.googleapis.com" && !host.ends_with(".storage.googleapis.com") {
+        return abort("the stored upload session URI points somewhere unexpected").map_err(
+            |e: SalvageError| {
+                e.with("host", host.to_owned())
+                    .with("expected", "storage.googleapis.com")
+            },
+        );
+    }
+    Ok(())
 }
 
 /// Parse the committed byte count out of a 308's `Range: bytes=0-N` header.
@@ -887,6 +1047,65 @@ mod tests {
         // An empty page is a bug elsewhere, but the header must still be well formed rather than
         // absent -- GCS treats a missing hash as "no integrity claim", which is not what we mean.
         assert_eq!(crc32c_header(b""), "AAAAAA==");
+    }
+
+    #[test]
+    fn resume_action_covers_every_session_state() {
+        // This block had no test coverage of any kind -- no test in the crate exercises
+        // `HttpStore`'s network methods -- and three separate wedges lived in the branch that
+        // decides this. Extracting it as a value is what makes it assertable without an HTTP mock.
+        assert_eq!(resume_action(308, Some(4096)), ResumeAction::Continue(4096));
+        assert_eq!(resume_action(308, None), ResumeAction::Continue(0));
+        // A finished session used to fall through to an infra error *without* removing the session
+        // file, so every retry repeated it and the page could neither complete nor be skipped.
+        assert_eq!(resume_action(200, None), ResumeAction::Complete);
+        assert_eq!(resume_action(201, None), ResumeAction::Complete);
+        // A dead session used to PUT chunk 0 to the dead URI, contrary to its own comment.
+        assert_eq!(resume_action(404, None), ResumeAction::Reinitiate);
+        assert_eq!(resume_action(410, None), ResumeAction::Reinitiate);
+    }
+
+    #[test]
+    fn next_chunk_renders_an_inclusive_content_range_and_ends_cleanly() {
+        // Off-by-one here corrupts silently: the range is inclusive at both ends.
+        assert_eq!(next_chunk(0, 10, 4), Some((4, "bytes 0-3/10".to_owned())));
+        assert_eq!(
+            next_chunk(8, 10, 4),
+            Some((2, "bytes 8-9/10".to_owned())),
+            "the final chunk is short and still carries the real total"
+        );
+        assert_eq!(next_chunk(10, 10, 4), None, "nothing left to send");
+        // A single-byte object must not underflow the inclusive end.
+        assert_eq!(next_chunk(0, 1, 4), Some((1, "bytes 0-0/1".to_owned())));
+    }
+
+    #[test]
+    fn a_stored_session_uri_must_be_https_and_point_at_gcs() {
+        // The URI is read back from the work dir, which on the export host sits on the dirty side.
+        // It was used verbatim, so anything able to write that file could redirect the next
+        // `--resume` -- and the whole multi-GB page with it -- to an arbitrary endpoint.
+        check_session_uri("https://storage.googleapis.com/upload/storage/v1/b/x?upload_id=1")
+            .unwrap();
+
+        for bad in [
+            "http://storage.googleapis.com/upload",
+            "https://example.invalid/upload",
+            "https://storage.googleapis.com.example.invalid/upload",
+            "https://user@example.invalid/upload",
+            "",
+        ] {
+            assert!(
+                check_session_uri(bad).is_err(),
+                "must refuse a session URI of {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retain_until_days_is_zero_or_a_real_instant() {
+        assert!(retain_until_days(0).is_none(), "zero means no retention");
+        let at = retain_until_days(7).expect("seven days must produce an instant");
+        assert!(at > time::OffsetDateTime::now_utc());
     }
 
     #[test]

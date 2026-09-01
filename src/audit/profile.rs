@@ -19,6 +19,11 @@
 //! and compare -- two independent derivations of the same numbers, which is the nearest thing to a
 //! second opinion this topology has.
 
+#![deny(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::integer_division
+)]
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -55,10 +60,13 @@ impl ColumnProfile {
         if self.rows == 0 {
             return 0.0;
         }
-        #[allow(clippy::cast_precision_loss)]
-        {
-            self.nulls as f64 / self.rows as f64
-        }
+        // The only float in the crate, and only ever displayed. `u32::try_from` keeps both
+        // operands inside f64's exactly-representable range, so the ratio cannot silently lose
+        // precision the way a raw `as f64` on a u64 can past 2^53 rows.
+        let nulls =
+            f64::from(u32::try_from(self.nulls.min(u64::from(u32::MAX))).unwrap_or(u32::MAX));
+        let rows = f64::from(u32::try_from(self.rows.min(u64::from(u32::MAX))).unwrap_or(u32::MAX));
+        if rows == 0.0 { 0.0 } else { nulls / rows }
     }
 }
 
@@ -121,7 +129,11 @@ pub fn profile(table: &str, batch: &str, header: &[String], rows: &[Vec<Field>])
                         _ => col.max_value = Some(text.clone()),
                     }
                     if let Some(c) = counters.get_mut(i) {
-                        *c.entry(text.clone()).or_insert(0) += 1;
+                        // Saturating, like every other counter in the crate. This was the one
+                        // unguarded `+=` in non-test code, in the module the denied-arithmetic
+                        // header had been left off.
+                        let slot = c.entry(text.clone()).or_insert(0u64);
+                        *slot = slot.saturating_add(1);
                     }
                     key.push_str(&text);
                     key.push('\u{1}');
@@ -268,11 +280,33 @@ pub fn render_markdown(p: &Profile) -> String {
     md
 }
 
+/// Render one salvaged value safely into the markdown a human signs off on.
+///
+/// This is the artifact a reviewer reads before promotion, and its values are attacker-authored by
+/// assumption. `|` and a backtick were escaped; newlines and control bytes were not -- and decoded
+/// values legitimately contain them, because `\n` decodes to a real 0x0A and the whole point of
+/// `Field` is that it survives. A value well under the length cap could therefore close the table
+/// and inject a blockquote in the tool's own voice, immediately beside the callouts the reviewer
+/// is there to read. `bounds.rs` goes to real trouble to keep raw control bytes out of a finding
+/// message; the document a person actually reads had no such guard.
 fn truncate(s: &str) -> String {
     const MAX: usize = 40;
-    if s.chars().count() <= MAX {
-        return s.replace('|', "\\|").replace('`', "'");
-    }
     let head: String = s.chars().take(MAX).collect();
-    format!("{}...", head.replace('|', "\\|").replace('`', "'"))
+    let mut out = String::with_capacity(head.len());
+    for ch in head.chars() {
+        match ch {
+            '|' => out.push_str("\\|"),
+            '`' => out.push('\''),
+            // Every C0 control, DEL, and the Unicode line/paragraph separators -- anything that
+            // could end a table row or start a new markdown block.
+            c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => {
+                out.push_str(&format!("\\x{:02X}", u32::from(c).min(0xFF)));
+            }
+            c => out.push(c),
+        }
+    }
+    if s.chars().count() > MAX {
+        out.push_str("...");
+    }
+    out
 }

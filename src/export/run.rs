@@ -21,13 +21,14 @@
 use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use crate::abort::{PartialOutput, Result, SalvageError, abort};
+use crate::abort::{PartialOutput, Result, SalvageError, abort, usage};
 use crate::clickhouse::ddl::PinnedDdl;
 use crate::clickhouse::settings::EXPORT_SETTINGS;
 use crate::clickhouse::types::{Ident, rules_for};
 use crate::clickhouse::{Query, QueryKind, QueryRunner, tsv};
 use crate::export::diff::{Hasher, assert_passes_agree};
 use crate::export::plan::projection;
+use crate::limits::OrOverflow;
 use crate::models::Overrides;
 use crate::pages::{cursor_literal, group_predicate, seek_predicate};
 
@@ -61,6 +62,7 @@ impl<'a> PageContext<'a> {
             return abort("page size is zero; a page must hold at least one row")
                 .map_err(|e: SalvageError| e.with("table", ddl.qualified()));
         }
+        let rows_per_page = clamp_page_rows(rows_per_page, overrides)?;
         Ok(Self {
             ddl,
             overrides,
@@ -87,6 +89,12 @@ impl<'a> PageContext<'a> {
             .map(Ident::quoted)
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// Adopt a page size re-derived from our own measured output.
+    pub fn resize_from(&mut self, outcome: &PageOutcome) -> Result<()> {
+        self.rows_per_page = resize_from_measured(self.rows_per_page, outcome, self.overrides)?;
+        Ok(())
     }
 
     /// The page query. Explicit columns, never `SELECT *` (section 4).
@@ -120,6 +128,39 @@ impl<'a> PageContext<'a> {
             self.overrides.limits.max_rows_per_page
         ))
     }
+}
+
+/// Hold a page size inside the pinned caps.
+///
+/// The seed is `page_byte_budget / bytes_per_row`, and `bytes_per_row` comes from the compromised
+/// server. A source under-reporting `data_uncompressed_bytes` drives the divisor toward one and
+/// the quotient toward the whole budget in rows -- and that page is then streamed twice. Clamping
+/// here is what stops the server choosing how much we read in one request.
+fn clamp_page_rows(rows: u64, overrides: &Overrides) -> Result<u64> {
+    let cap = overrides.limits.max_rows_per_page;
+    if cap == 0 {
+        return usage("max_rows_per_page is zero; no page size can satisfy it")
+            .map_err(|e: SalvageError| e.with("cap", cap));
+    }
+    Ok(rows.clamp(1, cap))
+}
+
+/// Re-derive the page size from bytes we measured ourselves.
+///
+/// The seed comes from the server; every page after the first does not have to. This is the
+/// feedback loop the module header, `pages.rs` and `plan.rs` all describe and none implemented --
+/// `rows_per_page` was computed once and read-only for the whole run, so the compromised cluster's
+/// arithmetic governed every request rather than just the first.
+fn resize_from_measured(current: u64, outcome: &PageOutcome, overrides: &Overrides) -> Result<u64> {
+    if outcome.rows == 0 || outcome.bytes == 0 {
+        return Ok(current);
+    }
+    let measured =
+        crate::limits::div_floor(outcome.bytes, outcome.rows, "measured_bytes_per_row")?.max(1);
+    clamp_page_rows(
+        crate::pages::rows_per_page(overrides.page_byte_budget, measured)?,
+        overrides,
+    )
 }
 
 /// What one page produced.
@@ -159,8 +200,20 @@ fn stream(
 
     loop {
         let n = std::io::Read::read(&mut reader, &mut chunk).map_err(|e| {
-            if crate::clickhouse::client::is_budget_overrun(&e) {
-                abort::<()>("page read exceeded its budget")
+            // Only the byte cap is a finding. A wall-clock overrun on a congested link is
+            // infrastructure and stays resumable; treating it as a finding killed the whole
+            // table's batch and made `--resume` refuse to pick it up, for a slow network.
+            if crate::clickhouse::client::is_byte_cap_overrun(&e) {
+                abort::<()>("the page exceeded its byte cap")
+                    .unwrap_err()
+                    .with("detail", e.to_string())
+                    .with(
+                        "reason",
+                        "the server sent more than it declared, which is the server \
+                         contradicting itself",
+                    )
+            } else if crate::clickhouse::client::is_budget_overrun(&e) {
+                crate::abort::infra::<()>("the page read exceeded its wall-clock budget")
                     .unwrap_err()
                     .with("detail", e.to_string())
             } else {
@@ -256,10 +309,13 @@ fn inspect(path: &Path, ctx: &PageContext<'_>) -> Result<PageShape> {
         while line.last() == Some(&b'\n') {
             line.pop();
         }
-        if line.is_empty() {
-            continue;
-        }
-
+        // No empty-line skip. `read_until` returns 0 at EOF, so a trailing newline never produces
+        // a phantom final line -- which means a skip here could only ever swallow a *real* row.
+        // For a single-column projection an empty string is a legal value and renders as an empty
+        // line, so skipping it dropped the row from the count; if the page was otherwise full that
+        // made a full page look short, and a short page ends the run with the rest of the table
+        // unread. For any wider projection an empty line is a one-field row, which the field-count
+        // check below rejects. Both outcomes are correct; neither needs a special case.
         rows = rows.saturating_add(1);
         if rows > ctx.overrides.limits.max_rows_per_page {
             return abort("page exceeds the pinned row cap")
@@ -358,11 +414,30 @@ pub fn export_page(
     // sentinel, so nothing unchecked may ever reach the final name.
     let mut shape = inspect(guard.path(), ctx)?;
 
+    // A page longer than its own `LIMIT` is the server contradicting the query we sent. It was
+    // silently tolerated: the extension gate below tested `rows == rows_per_page`, so an over-long
+    // page skipped extension entirely and the cursor then advanced with strict `>` past a
+    // partly-consumed key group, losing its tail with no check firing.
+    if shape.rows > ctx.rows_per_page {
+        return abort("the page returned more rows than its LIMIT allows").map_err(
+            |e: SalvageError| {
+                e.with("page", index)
+                    .with("rows_per_page", ctx.rows_per_page)
+                    .with("got", shape.rows)
+                    .with(
+                        "reason",
+                        "the server ignored the LIMIT; every page is exactly rows_per_page \
+                         except the last",
+                    )
+            },
+        );
+    }
+
     // Key-group extension. If every row in the page shares the last cursor tuple, the group is
     // wider than a page and no extension can help -- that is a pinned page size too small for the
     // data, not something to paper over.
     let mut appended = 0u64;
-    if shape.rows == ctx.rows_per_page && !shape.last_cursor.is_empty() {
+    if shape.rows >= ctx.rows_per_page && !shape.last_cursor.is_empty() {
         let literals = literals_for(ctx, &shape.last_cursor)?;
         if shape.trailing_group == shape.rows {
             return abort("a single key group is wider than one page").map_err(
@@ -377,22 +452,35 @@ pub fn export_page(
                 },
             );
         }
-        appended = extend_group(runner, ctx, guard.path(), &literals, shape.trailing_group)?;
+        appended = extend_group(
+            runner,
+            ctx,
+            guard.path(),
+            &literals,
+            &shape.last_cursor,
+            shape.trailing_group,
+        )?;
         if appended > 0 {
             shape = inspect(guard.path(), ctx)?;
         }
     }
 
-    // The extension appends to the file, so the streamed byte count is stale once it runs. Take
-    // the size from the file itself -- it is the artifact that gets packed and shipped.
-    let bytes = if appended > 0 {
-        std::fs::metadata(guard.path())
-            .map_err(|e| {
-                crate::abort::infra::<()>(format!("could not size the page: {e}")).unwrap_err()
-            })?
-            .len()
+    // The extension appends to the file, so both the streamed byte count and the two pass hashes
+    // are stale once it runs. Recompute from the file itself -- that is the artifact that gets
+    // packed and shipped, and a manifest whose hashes describe a prefix of what shipped is worse
+    // than one with no hashes at all. The tail was independently double-read and diffed inside
+    // `extend_group`, so the completeness signal still covers every byte here; both fields carry
+    // the same value because after extension there is one agreed artifact, not two passes.
+    let (pass1, pass2, bytes) = if appended > 0 {
+        let final_bytes = std::fs::read(guard.path()).map_err(|e| {
+            crate::abort::infra::<()>(format!("could not re-read the extended page: {e}"))
+                .unwrap_err()
+        })?;
+        let digest = crate::export::diff::sha256_hex(&final_bytes);
+        let len = u64::try_from(final_bytes.len()).or_overflow("page bytes")?;
+        (digest.clone(), digest, len)
     } else {
-        bytes
+        (pass1, pass2, bytes)
     };
     guard.commit_as(&final_path)?;
 
@@ -427,28 +515,100 @@ fn extend_group(
     ctx: &PageContext<'_>,
     page_path: &Path,
     literals: &[String],
+    values: &[String],
     already: u64,
 ) -> Result<u64> {
     let sql = ctx.group_sql(literals)?;
-    let query = Query {
-        sql,
-        settings: &EXPORT_SETTINGS,
-        kind: QueryKind::Page,
-    };
-    let mut body = Vec::new();
-    let mut reader = runner.stream(&query)?;
-    std::io::Read::read_to_end(&mut reader, &mut body).map_err(|e| {
-        crate::abort::infra::<()>(format!("group extension read failed: {e}")).unwrap_err()
-    })?;
+
+    // Two passes, diffed -- the same rule the page body obeys. The extension used to read once and
+    // append, so the tail of every extended page shipped with no completeness signal at all, while
+    // the recorded `pass1_sha256`/`pass2_sha256` described only the prefix that had been diffed.
+    let first = read_group(runner, &sql)?;
+    let second = read_group(runner, &sql)?;
+    if first != second {
+        return abort("the key group differs between two reads").map_err(|e: SalvageError| {
+            e.with("first_bytes", first.len())
+                .with("second_bytes", second.len())
+                .with(
+                    "reason",
+                    "the source is not deterministic under the pinned cutoff, or something is \
+                     truncating non-deterministically",
+                )
+        });
+    }
+    let body = first;
 
     let mut lines = body.split(|b| *b == b'\n');
-    let _ = lines.next(); // header
+    // The header is verified, not discarded. A response missing it would silently cost the group
+    // its first row; a response carrying a different one is a different result set.
+    let header = lines
+        .next()
+        .ok_or_else(|| abort::<()>("the group extension returned no header").unwrap_err())?;
+    let got: Vec<String> = tsv::split_row(header)
+        .into_iter()
+        .map(|f| String::from_utf8_lossy(f).into_owned())
+        .collect();
+    if got != ctx.header {
+        return abort("the group extension header does not match the page projection").map_err(
+            |e: SalvageError| {
+                e.with("expected", ctx.header.join("\t"))
+                    .with("got", got.join("\t"))
+            },
+        );
+    }
     let rows: Vec<&[u8]> = lines.filter(|l| !l.is_empty()).collect();
 
     let skip = usize::try_from(already).unwrap_or(usize::MAX);
     if rows.len() < skip {
         return abort("the key group shrank between the page and its extension")
             .map_err(|e: SalvageError| e.with("in_page", already).with("in_group", rows.len()));
+    }
+    // The extension query is bounded by `max_rows_per_page`. Coming back exactly at the bound
+    // means the group may have been clipped, and appending a clipped group would advance the
+    // cursor past rows that were never read.
+    let cap = usize::try_from(ctx.overrides.limits.max_rows_per_page).unwrap_or(usize::MAX);
+    if rows.len() >= cap {
+        return abort("the key group may have been truncated by its own row cap").map_err(
+            |e: SalvageError| {
+                e.with("cap", ctx.overrides.limits.max_rows_per_page)
+                    .with("got", rows.len())
+            },
+        );
+    }
+
+    // Every appended row must actually belong to the group we asked for. Without this the cursor
+    // is recomputed from the whole file afterwards, so a response ending in a larger key would
+    // advance the cursor arbitrarily and skip everything in between with no check firing.
+    let key_at = cursor_positions(ctx)?;
+    for (i, row) in rows.iter().enumerate() {
+        let fields = tsv::split_row(row);
+        if fields.len() != ctx.header.len() {
+            return abort("a group extension row has the wrong field count").map_err(
+                |e: SalvageError| {
+                    e.with("row", i)
+                        .with("expected", ctx.header.len())
+                        .with("got", fields.len())
+                },
+            );
+        }
+        for (pos, expected) in key_at.iter().zip(values) {
+            let raw = fields.get(*pos).copied().unwrap_or(&[]);
+            let decoded = tsv::decode_field(raw)?;
+            let actual = decoded.bytes().ok_or_else(|| {
+                abort::<()>("a group extension row has a NULL cursor value").unwrap_err()
+            })?;
+            if actual != expected.as_bytes() {
+                return abort("a group extension row is not in the requested key group").map_err(
+                    |e: SalvageError| {
+                        e.with("row", i).with(
+                            "reason",
+                            "the server answered an equality predicate with rows that do not \
+                             satisfy it",
+                        )
+                    },
+                );
+            }
+        }
     }
 
     let mut file = std::fs::OpenOptions::new()
@@ -471,6 +631,38 @@ fn extend_group(
         crate::abort::infra::<()>(format!("could not flush the group tail: {e}")).unwrap_err()
     })?;
     Ok(appended)
+}
+
+/// Read one group-extension response fully into memory, under the page byte cap.
+fn read_group(runner: &dyn QueryRunner, sql: &str) -> Result<Vec<u8>> {
+    let query = Query {
+        sql: sql.to_owned(),
+        settings: &EXPORT_SETTINGS,
+        kind: QueryKind::Page,
+    };
+    let mut body = Vec::new();
+    let mut reader = runner.stream(&query)?;
+    std::io::Read::read_to_end(&mut reader, &mut body).map_err(|e| {
+        crate::abort::infra::<()>(format!("group extension read failed: {e}")).unwrap_err()
+    })?;
+    Ok(body)
+}
+
+/// Where each cursor column sits in the projection.
+fn cursor_positions(ctx: &PageContext<'_>) -> Result<Vec<usize>> {
+    ctx.cursor
+        .iter()
+        .map(|key| {
+            ctx.header
+                .iter()
+                .position(|h| h == key.as_str())
+                .ok_or_else(|| {
+                    abort::<()>("a cursor column is absent from the projection")
+                        .unwrap_err()
+                        .with("column", key.as_str())
+                })
+        })
+        .collect()
 }
 
 /// Render a cursor tuple as SQL literals, each screened again on the way out.

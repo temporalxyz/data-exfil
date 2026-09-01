@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use crate::abort::{Result, SalvageError, abort, infra};
+use crate::abort::{Result, SalvageError, abort, infra, usage};
 use crate::clickhouse::settings::IMPORT_FLAGS;
 
 /// How to reach the disposable database.
@@ -36,6 +36,89 @@ pub struct InsertTarget {
     pub host: String,
     pub max_memory_usage: u64,
     pub max_insert_block_size: u64,
+}
+
+/// ClickHouse builds section 3 lists as supported. Never 25.3 -- the compromised cluster's own
+/// end-of-support build, which is what makes it the one version that must not be reused here.
+const REFUSED_BUILD: &str = "25.3";
+
+impl InsertTarget {
+    /// Whether this target launches a container at all.
+    #[must_use]
+    pub fn containerised(&self) -> bool {
+        self.runner == "docker" || self.runner == "podman"
+    }
+
+    /// Refuse an image that is not a real pin.
+    ///
+    /// The field carried a doc comment saying "pinned **by digest**, never by tag" directly above
+    /// a `default_value` that was a tag -- and nothing read the field at all, so neither half was
+    /// ever true. A tag resolves at run time and can be moved; a digest cannot.
+    pub fn check_image(&self) -> Result<()> {
+        if !self.containerised() {
+            return Ok(());
+        }
+        let Some((repo, digest)) = self.image.split_once("@sha256:") else {
+            return usage("the ClickHouse image must be pinned by digest, not by tag").map_err(
+                |e: SalvageError| {
+                    e.with("image", self.image.clone()).with(
+                        "reason",
+                        "section 3: images are independently built and verified; a tag is mutable \
+                         and resolves at run time, so a tag is not a pin",
+                    )
+                },
+            );
+        };
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return usage("the image digest is not a sha256 hex digest")
+                .map_err(|e: SalvageError| e.with("digest", digest.to_owned()));
+        }
+        if repo.contains(REFUSED_BUILD) || self.image.contains(REFUSED_BUILD) {
+            return usage("25.3 is the compromised cluster's own end-of-support build").map_err(
+                |e: SalvageError| {
+                    e.with("image", self.image.clone())
+                        .with("supported", "26.7, 26.6, 26.5, 26.3, 25.8")
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// The `docker`/`podman` prefix that runs one `clickhouse-client` invocation in a throwaway,
+    /// network-isolated, resource-capped container.
+    ///
+    /// Section 7: the loader T is disposable, has no route to clean storage, runs under the OS
+    /// limits of section 6, and is destroyed after the test. `--rm` is the destruction, and it
+    /// fires on the error path too because the runtime owns it rather than our error handling.
+    #[must_use]
+    fn container_prefix(&self) -> Vec<String> {
+        vec![
+            self.runner.clone(),
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "-i".to_owned(),
+            // No route anywhere: not to the clean bucket, not to the compromised cluster.
+            "--network=none".to_owned(),
+            "--read-only".to_owned(),
+            "--cap-drop=ALL".to_owned(),
+            "--security-opt=no-new-privileges".to_owned(),
+            format!("--memory={}", self.max_memory_usage),
+            "--cpus=1".to_owned(),
+            "--pids-limit=256".to_owned(),
+            self.image.clone(),
+        ]
+    }
+
+    /// Wrap a `clickhouse-client` argv so it runs inside the disposable container.
+    #[must_use]
+    fn wrap(&self, argv: Vec<String>) -> Vec<String> {
+        if !self.containerised() {
+            return argv;
+        }
+        let mut out = self.container_prefix();
+        out.extend(argv);
+        out
+    }
 }
 
 /// The exact argv, so `--dry-run` can print what would run where no runtime exists.
@@ -65,17 +148,20 @@ pub fn insert_argv(target: &InsertTarget, staging_table: &str, columns: &[String
         "--max_insert_block_size={}",
         target.max_insert_block_size
     ));
-    argv
+    target.wrap(argv)
 }
 
 /// The `CREATE TABLE` argv for the per-file staging table.
 #[must_use]
 pub fn create_argv(target: &InsertTarget, ddl: &str) -> Vec<String> {
-    vec![
+    target.wrap(vec![
         "clickhouse-client".to_owned(),
         format!("--host={}", target.host),
-        format!("--query={ddl}"),
-    ]
+        // The staging database must exist before the table. Without it the very first CREATE on a
+        // fresh disposable server returns UNKNOWN_DATABASE, which `check` reports as a *finding* --
+        // pointing the operator at the data when the problem is the server.
+        format!("--query=CREATE DATABASE IF NOT EXISTS staging; {ddl}"),
+    ])
 }
 
 /// Drop the whole per-file staging table.
@@ -85,11 +171,21 @@ pub fn create_argv(target: &InsertTarget, ddl: &str) -> Vec<String> {
 /// half-load."*
 #[must_use]
 pub fn drop_argv(target: &InsertTarget, staging_table: &str) -> Vec<String> {
-    vec![
+    target.wrap(vec![
         "clickhouse-client".to_owned(),
         format!("--host={}", target.host),
         format!("--query=DROP TABLE IF EXISTS {staging_table} SYNC"),
-    ]
+    ])
+}
+
+/// Count what actually landed. Section 9's pass criteria are not "the client exited zero".
+#[must_use]
+pub fn count_argv(target: &InsertTarget, staging_table: &str) -> Vec<String> {
+    target.wrap(vec![
+        "clickhouse-client".to_owned(),
+        format!("--host={}", target.host),
+        format!("--query=SELECT count() FROM {staging_table}"),
+    ])
 }
 
 /// Everything one insert test needs.
@@ -99,6 +195,9 @@ pub struct InsertPlan {
     pub quarantine_ddl: String,
     pub columns: Vec<String>,
     pub tsv: std::path::PathBuf,
+    /// How many rows the page held. Section 9 requires the loaded count to be checked against
+    /// this after the insert, not merely that the client exited zero.
+    pub expected_rows: u64,
 }
 
 /// The seam, so the audit pipeline can be exercised without a container runtime.
@@ -128,6 +227,7 @@ impl InsertTester for SubprocessTester {
             &plan.quarantine_ddl,
             &plan.columns,
             &plan.tsv,
+            plan.expected_rows,
             self.dry_run,
         )
     }
@@ -143,15 +243,22 @@ pub fn run_insert_test(
     quarantine_ddl: &str,
     columns: &[String],
     tsv: &Path,
+    expected_rows: u64,
     dry_run: bool,
 ) -> Result<()> {
+    // Refuse a mutable image pin before anything is launched. This is checked here rather than at
+    // parse time because it only applies to the containerised runners.
+    target.check_image()?;
+
     let create = create_argv(target, quarantine_ddl);
     let insert = insert_argv(target, staging_table, columns);
+    let count = count_argv(target, staging_table);
     let drop = drop_argv(target, staging_table);
 
     if dry_run {
         tracing::info!(argv = ?create, "would create the staging table");
         tracing::info!(argv = ?insert, "would insert");
+        tracing::info!(argv = ?count, "would verify the loaded row count");
         tracing::info!(argv = ?drop, "would drop the staging table");
         return Ok(());
     }
@@ -166,17 +273,68 @@ pub fn run_insert_test(
         });
     }
 
-    exec(&create).map_err(|e| e.with("phase", "create staging table"))?;
+    // A leftover table from a crashed run would make the next CREATE fail as TABLE_ALREADY_EXISTS,
+    // which `check` reports as a finding. Drop first so the only failures left are real ones.
+    let _ = exec(&drop);
 
-    let outcome = exec_with_stdin(&insert, tsv);
-    if outcome.is_err() {
-        // Drop first, then report. A staging table left behind after a failed load is exactly the
-        // "partial state to reason about" section 9 rules out.
-        let _ = exec(&drop);
-        return outcome.map_err(|e| e.with("phase", "insert"));
+    if let Err(e) = exec(&create) {
+        // Section 9: on **any** failure, drop the entire per-file staging table. A CREATE that
+        // partially succeeded used to leave its table behind, because the drop only ran on the
+        // insert path.
+        drop_or_warn(&drop, staging_table);
+        return Err(e.with("phase", "create staging table"));
+    }
+
+    if let Err(e) = exec_with_stdin(&insert, tsv) {
+        drop_or_warn(&drop, staging_table);
+        return Err(e.with("phase", "insert"));
+    }
+
+    // Section 9's pass criteria are three, and only the first was implemented: *"every file loads
+    // with zero skipped, malformed or defaulted rows; **row counts match the manifest**; contract
+    // assertions return zero."* Exit status alone would pass a load that silently dropped a row --
+    // and since the frame counted rows *before* regeneration, nothing else in the pipeline could
+    // catch it. This is the only stage where a real parser meets the data before the consumer's
+    // does, so it is the only place the count can be taken.
+    let loaded = match exec_capture(&count) {
+        Ok(text) => text,
+        Err(e) => {
+            drop_or_warn(&drop, staging_table);
+            return Err(e.with("phase", "count loaded rows"));
+        }
+    };
+    let loaded: u64 = loaded.trim().parse().map_err(|_| {
+        drop_or_warn(&drop, staging_table);
+        abort::<()>("the loaded row count did not parse")
+            .unwrap_err()
+            .with("got", loaded.chars().take(80).collect::<String>())
+    })?;
+    if loaded != expected_rows {
+        drop_or_warn(&drop, staging_table);
+        return abort("the loaded row count does not match the page").map_err(|e: SalvageError| {
+            e.with("expected", expected_rows)
+                .with("loaded", loaded)
+                .with("table", staging_table.to_owned())
+        });
     }
 
     exec(&drop).map_err(|e| e.with("phase", "drop staging table"))
+}
+
+/// Drop the staging table, and say so loudly if the drop itself failed.
+///
+/// The failure was previously discarded with `let _`, so a drop that failed -- most likely when
+/// the server was already unhealthy, which is exactly when the insert failed too -- left a
+/// half-loaded table with no record anywhere that it had been left.
+fn drop_or_warn(drop: &[String], staging_table: &str) {
+    if let Err(e) = exec(drop) {
+        tracing::error!(
+            table = staging_table,
+            error = %e,
+            "the per-file staging table could not be dropped; it must be removed by hand before \
+             the disposable instance is destroyed"
+        );
+    }
 }
 
 fn which(binary: &str) -> Option<std::path::PathBuf> {
@@ -210,6 +368,20 @@ fn exec_with_stdin(argv: &[String], stdin_path: &Path) -> Result<()> {
         .output()
         .map_err(|e| infra::<()>(format!("could not run {head}: {e}")).unwrap_err())?;
     check(&output, head)
+}
+
+/// Run and return stdout. Used for the post-load count, which is a value and not just a status.
+fn exec_capture(argv: &[String]) -> Result<String> {
+    let (head, rest) = argv
+        .split_first()
+        .ok_or_else(|| abort::<()>("empty argv").unwrap_err())?;
+    let output = std::process::Command::new(head)
+        .args(rest)
+        .output()
+        .map_err(|e| infra::<()>(format!("could not run {head}: {e}")).unwrap_err())?;
+    check(&output, head)?;
+    String::from_utf8(output.stdout)
+        .map_err(|_| abort::<()>("the query result is not UTF-8").unwrap_err())
 }
 
 fn check(output: &std::process::Output, what: &str) -> Result<()> {
@@ -335,8 +507,112 @@ mod tests {
                 quarantine_ddl: "CREATE TABLE staging.`t__b1__0` (`a` String) ENGINE = MergeTree ORDER BY tuple()".to_owned(),
                 columns: vec!["a".to_owned()],
                 tsv,
+                expected_rows: 1,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn a_containerised_run_isolates_and_destroys_the_disposable_instance() {
+        // `--runner docker` used to differ from `--runner local` in exactly one way: it checked
+        // that a binary named `docker` was on PATH, and then ran `clickhouse-client` from the host
+        // against `--host`. No container, no `--network=none`, no caps, nothing destroyed -- and
+        // the operator who passed a digest believed otherwise.
+        let mut t = target();
+        t.runner = "docker".to_owned();
+        let argv = insert_argv(&t, "staging.`t__b1__0`", &["a".to_owned()]);
+
+        assert_eq!(argv[0], "docker");
+        assert_eq!(argv[1], "run");
+        for required in [
+            "--rm",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--pids-limit=256",
+        ] {
+            assert!(argv.iter().any(|a| a == required), "missing {required}");
+        }
+        assert!(
+            argv.iter()
+                .any(|a| a == &format!("--memory={}", t.max_memory_usage))
+        );
+        // The image sits immediately before the command it runs.
+        let image_at = argv.iter().position(|a| a == &t.image).unwrap();
+        assert_eq!(argv[image_at + 1], "clickhouse-client");
+
+        // `local` stays a bare client, which is what makes it usable where no runtime exists.
+        let bare = insert_argv(&target(), "staging.`t__b1__0`", &["a".to_owned()]);
+        assert_eq!(bare[0], "clickhouse-client");
+    }
+
+    #[test]
+    fn a_tag_is_refused_as_an_image_pin_and_so_is_the_compromised_build() {
+        let mut t = target();
+        t.runner = "docker".to_owned();
+
+        t.image = "clickhouse/clickhouse-server:26.7".to_owned();
+        let err = t
+            .check_image()
+            .err()
+            .unwrap_or_else(|| panic!("a tag must be refused"));
+        assert!(err.to_string().contains("not by tag"), "{err}");
+
+        t.image = "clickhouse/clickhouse-server@sha256:nothex".to_owned();
+        assert!(
+            t.check_image().is_err(),
+            "a malformed digest must be refused"
+        );
+
+        // 25.3 is the compromised cluster's own end-of-support build.
+        t.image = format!(
+            "clickhouse/clickhouse-server-25.3@sha256:{}",
+            "a".repeat(64)
+        );
+        let err = t
+            .check_image()
+            .err()
+            .unwrap_or_else(|| panic!("25.3 must be refused by name"));
+        assert!(err.to_string().contains("25.3"), "{err}");
+
+        // A real digest passes.
+        t.image = format!("clickhouse/clickhouse-server@sha256:{}", "b".repeat(64));
+        t.check_image().unwrap();
+
+        // And `local` needs no image at all, so it is not held to the rule.
+        let mut l = target();
+        l.image = String::new();
+        l.runner = "local".to_owned();
+        l.check_image().unwrap();
+    }
+
+    #[test]
+    fn the_loaded_row_count_is_verified_rather_than_assumed() {
+        // Section 9's pass criteria are three; only "the client exited zero" was implemented. A
+        // regeneration bug that dropped one row per page would ship with a manifest overstating
+        // the count, and this is the only stage that could ever have noticed -- the frame counts
+        // rows *before* regeneration.
+        let t = target();
+        let argv = count_argv(&t, "staging.`t__b1__0`");
+        assert!(
+            argv.iter()
+                .any(|a| a.contains("SELECT count() FROM staging.`t__b1__0`")),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn the_staging_database_is_created_before_the_table() {
+        // Without it the first CREATE on a fresh disposable server returns UNKNOWN_DATABASE, which
+        // is reported as a *finding* -- pointing the operator at the data when the server is the
+        // problem.
+        let argv = create_argv(&target(), "CREATE TABLE staging.`x` (a String)");
+        assert!(
+            argv.iter()
+                .any(|a| a.contains("CREATE DATABASE IF NOT EXISTS staging")),
+            "{argv:?}"
+        );
     }
 
     #[test]
@@ -356,6 +632,7 @@ mod tests {
                 .to_owned(),
             columns: vec!["a".to_owned()],
             tsv,
+            expected_rows: 1,
         })
         .unwrap_err();
 

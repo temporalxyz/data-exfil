@@ -289,11 +289,40 @@ fn audit_refuses_a_batch_whose_ledger_lists_no_pages() {
             "--mode",
             "enforce",
         ])
-        .args(["--bucket", "raw-bucket", "--work"])
+        .args([
+            "--bucket",
+            "raw-bucket",
+            "--clean-bucket",
+            "clean-bucket",
+            "--work",
+        ])
         .arg(work.path())
         .assert()
         .code(1)
         .stderr(predicates::str::contains("no pages"));
+}
+
+#[test]
+fn audit_without_a_clean_bucket_is_a_usage_error_not_a_shared_bucket() {
+    // Section 5 puts clean in a separate account. Defaulting it to the raw bucket would produce a
+    // run that passes every validation and then dies at the create-only push, having read the
+    // whole batch off a compromised cluster for nothing.
+    let work = tempfile::tempdir().unwrap();
+    salvage()
+        .args([
+            "audit",
+            "--table",
+            "typematrix.typematrix",
+            "--batch",
+            "b1",
+            "--mode",
+            "enforce",
+        ])
+        .args(["--bucket", "raw-bucket", "--work"])
+        .arg(work.path())
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("--clean-bucket is required"));
 }
 
 #[test]

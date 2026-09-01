@@ -152,15 +152,113 @@ pub struct PagesJson {
     pub pages: Vec<PageEntry>,
 }
 
+/// The `page-NNNN.json` member that travels inside each page archive.
+///
+/// Typed, not carried as bytes. The audit used to lift this member out of the untrusted archive
+/// unparsed and clone it verbatim into the archive it pushed to the clean bucket -- the single
+/// place where an input byte range reached the promoted output, in a pipeline whose central claim
+/// is that files are regenerated from parsed values and original bytes are never copied forward.
+/// It is eight scalars; there is nothing to gain by copying them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageMeta {
+    pub index: u32,
+    pub rows: u64,
+    pub bytes: u64,
+    pub pass1_sha256: String,
+    pub pass2_sha256: String,
+    pub cursor_end: Vec<String>,
+    pub table: String,
+    pub batch: String,
+}
+
+impl PageMeta {
+    /// Cross-check the page's own metadata against the ledger entry the Controller pinned.
+    ///
+    /// The archive and the ledger are two statements about the same page. They must agree, and
+    /// disagreement is a finding rather than something to reconcile: the ledger is what the audit
+    /// pulled by, and the metadata is what travels onward.
+    pub fn agrees_with(&self, entry: &PageEntry, table: &str, batch: &str) -> Result<()> {
+        let mismatch = |field: &'static str, ours: String, theirs: String| {
+            abort::<()>("the page metadata disagrees with the ledger")
+                .unwrap_err()
+                .with("field", field)
+                .with("in_archive", ours)
+                .with("in_ledger", theirs)
+        };
+        if self.index != entry.index {
+            return Err(mismatch(
+                "index",
+                self.index.to_string(),
+                entry.index.to_string(),
+            ));
+        }
+        if self.rows != entry.rows {
+            return Err(mismatch(
+                "rows",
+                self.rows.to_string(),
+                entry.rows.to_string(),
+            ));
+        }
+        if self.pass1_sha256 != entry.pass1_sha256 || self.pass2_sha256 != entry.pass2_sha256 {
+            return Err(mismatch(
+                "export pass hashes",
+                format!("{}/{}", self.pass1_sha256, self.pass2_sha256),
+                format!("{}/{}", entry.pass1_sha256, entry.pass2_sha256),
+            ));
+        }
+        if self.table != table {
+            return Err(mismatch("table", self.table.clone(), table.to_owned()));
+        }
+        if self.batch != batch {
+            return Err(mismatch("batch", self.batch.clone(), batch.to_owned()));
+        }
+        Ok(())
+    }
+}
+
+impl Overrides {
+    /// Refuse a pinned configuration whose caps disable a control rather than bounding it.
+    ///
+    /// Every cap in [`crate::limits::Limits`] is fail-closed at zero except one:
+    /// `max_decode_rounds = 0` turns the percent, HTML-entity, `\uXXXX` and base64 decodings off
+    /// entirely, so a percent-encoded payload is simply not looked for. A one-character edit to a
+    /// pinned override silently removed a whole detection class, which is the exact failure
+    /// `deny_unknown_fields` exists to prevent for a misspelled key -- arriving through a
+    /// correctly spelled one.
+    pub fn validate(&self) -> Result<()> {
+        if self.limits.max_decode_rounds == 0 {
+            return crate::abort::usage("max_decode_rounds = 0 disables payload decoding entirely")
+                .map_err(|e: SalvageError| {
+                    e.with(
+                        "reason",
+                        "section 12 item 9 requires a percent-encoded and a base64-wrapped variant \
+                         of every catalogue class to be caught; zero rounds catches neither",
+                    )
+                });
+        }
+        if self.limits.max_rows_per_page == 0 {
+            return crate::abort::usage("max_rows_per_page = 0 admits no page")
+                .map_err(|e: SalvageError| e.with("cap", 0));
+        }
+        Ok(())
+    }
+}
+
 impl PagesJson {
     /// The three-number agreement that is the actual completeness signal.
     ///
     /// Ours, versus two the compromised server supplied. Agreement is a cross-check and not a
     /// proof -- a root attacker can lie consistently -- but any inconsistency, and every
     /// accidental gap, shows up here.
+    ///
+    /// The two cutoff-scoped numbers must be equal; `server_parts_rows` is the whole table and is
+    /// therefore only an upper bound. This mirrors [`crate::export::plan::reconcile`] exactly, and
+    /// it has to: demanding equality against an unscoped parts total would refuse every table that
+    /// is still receiving rows above the cutoff.
     #[must_use]
     pub fn reconciles(&self) -> bool {
-        self.total_rows == self.server_count && self.total_rows == self.server_parts_rows
+        self.total_rows == self.server_count && self.total_rows <= self.server_parts_rows
     }
 }
 
@@ -490,9 +588,12 @@ impl<'de> Deserialize<'de> for SurveyOnly {
 ///
 /// It is also section 11's input. *"The payload inventory from 8.6 says which of these are
 /// mandatory for which columns. A consumer of a column with HTML matches must encode; a consumer
-/// of a column with URL matches must not fetch."* `CONSUMER-CONTRACT.md` is generated from this
-/// document rather than written by hand, so the obligations name columns instead of describing
-/// them.
+/// of a column with URL matches must not fetch."*
+///
+/// **`CONSUMER-CONTRACT.md` is not generated from this document.** It is hand-written prose that
+/// defers to this file by name, so the obligations describe columns rather than naming them, and
+/// the per-column mapping section 11 asks for is the consumer's to make. Stated here rather than
+/// left as the claim it used to be, which asserted a generator that does not exist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayloadInventory {
@@ -571,6 +672,31 @@ mod tests {
     }
 
     #[test]
+    fn a_cap_that_disables_a_control_is_refused_at_load_time() {
+        // Every cap in `Limits` is fail-closed at zero except one: `max_decode_rounds = 0` turns
+        // the percent, HTML-entity, `\uXXXX` and base64 decodings off entirely, so a
+        // percent-encoded payload is simply not looked for. A one-character edit to a pinned
+        // override silently removed a whole detection class -- the exact failure
+        // `deny_unknown_fields` exists to prevent for a *misspelled* key, arriving through a
+        // correctly spelled one. The old test asserted that the disabling *worked*.
+        let toml = std::fs::read_to_string("overrides/typematrix.typematrix.toml").unwrap();
+        let good: Overrides = toml::from_str(&toml).unwrap();
+        good.validate().unwrap();
+
+        let mut bad = good.clone();
+        bad.limits.max_decode_rounds = 0;
+        let err = bad
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("zero decode rounds must be refused"));
+        assert_eq!(err.exit_code(), crate::abort::ExitCode::Usage, "{err}");
+        assert!(
+            err.to_string().contains("disables payload decoding"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn reconciliation_needs_all_three_numbers_to_agree() {
         let mut p = PagesJson {
             table: "events.hits".into(),
@@ -586,6 +712,34 @@ mod tests {
         assert!(p.reconciles());
         // A dropped page shows up as a disagreement, which is the whole point.
         p.total_rows = 99;
+        assert!(!p.reconciles());
+    }
+
+    #[test]
+    fn a_live_table_reconciles_because_parts_are_not_cutoff_scoped() {
+        // `system.parts` counts the whole table, so on any table still receiving rows above the
+        // cutoff the parts total exceeds the cutoff-scoped count. Demanding equality there would
+        // refuse every live table -- after the whole export had already run.
+        let mut p = PagesJson {
+            table: "events.hits".into(),
+            batch: "b1".into(),
+            contract_version: "1".into(),
+            git_commit: "deadbeef".into(),
+            cutoff_predicate: "ts < '2026-08-25'".into(),
+            total_rows: 100,
+            server_count: 100,
+            server_parts_rows: 4_000,
+            pages: Vec::new(),
+        };
+        assert!(
+            p.reconciles(),
+            "rows arriving above the cutoff must not fail reconciliation"
+        );
+
+        // Streaming more rows than any part holds is still a contradiction: no predicate can
+        // select a row that no part contains.
+        p.total_rows = 4_001;
+        p.server_count = 4_001;
         assert!(!p.reconciles());
     }
 

@@ -20,14 +20,16 @@ pub mod secrets;
 
 use std::path::{Path, PathBuf};
 
-use crate::abort::{Result, SalvageError, StagingDir, abort};
+use crate::abort::{Result, SalvageError, StagingDir, abort, usage};
 use crate::archive::{ArchiveMember, write_targz};
 use crate::audit::bounds::{ColumnContract, check_row, contracts};
 use crate::audit::frame::frame;
 use crate::audit::insert::{InsertPlan, InsertTester};
 use crate::audit::profile::{profile, render_markdown};
 use crate::clickhouse::ddl::PinnedDdl;
-use crate::clickhouse::quarantine::{output_columns, quarantine_ddl, staging_table_name};
+use crate::clickhouse::quarantine::{
+    PROVENANCE_COLUMNS, output_columns, quarantine_ddl, staging_table_name,
+};
 use crate::clickhouse::tsv::{Field, encode_field};
 use crate::export::diff::sha256_hex;
 use crate::gcs::{Created, Generation, ObjectMeta, ObjectName, ObjectStore};
@@ -61,6 +63,9 @@ pub struct AuditOptions {
     pub dry_run: bool,
     pub contract_version: String,
     pub git_commit: String,
+    /// Days of Unlocked object retention on every object this run creates. Zero means none --
+    /// see [`crate::cli::Common::retain_days`] for why that is now an explicit choice.
+    pub retain_days: u32,
     /// Section 9 and addition A3 both gate promotion on a human. Neither is set by this code.
     pub shape_review_signoff: bool,
     pub rotation_signoff: bool,
@@ -146,9 +151,33 @@ impl ReportBuilder {
     ///
     /// Survey accumulates and keeps going, but it **still fails**: survey means "collect them
     /// all", not "tolerate them". The rejection threshold is zero in both modes.
-    pub fn finish(mut self) -> Result<Report> {
+    /// The accumulated report, without renaming `report.json.partial` into place.
+    ///
+    /// For a dry run: the document is real, the verdict is real, and the *final name* -- which is
+    /// what tells a later reader the run passed -- is deliberately not taken.
+    pub fn into_report(mut self) -> Result<Report> {
         self.flush()?;
         if !self.doc.is_clean() {
+            return abort("the audit found something").map_err(|e: SalvageError| {
+                e.with("findings", self.doc.findings.len())
+                    .with("report", self.partial_path.display())
+            });
+        }
+        Ok(self.doc.clone())
+    }
+
+    pub fn finish(mut self) -> Result<Report> {
+        // Check the verdict **before** the flush, and never let an I/O error outrank a finding.
+        //
+        // `flush()` maps a write failure to `Infra`, which is exit 3 -- the *resumable* class.
+        // Flushing first meant a full disk, a read-only mount or a quota could turn "this batch
+        // contains a payload" into "we never got to look", which is precisely the classification
+        // `--resume` is allowed to continue past. A finding must never lose to a failed write.
+        let clean = self.doc.is_clean();
+        if !clean {
+            if let Err(e) = self.flush() {
+                tracing::error!(error = %e, "could not flush report.json; reporting the finding anyway");
+            }
             return abort("the audit found something").map_err(|e: SalvageError| {
                 e.with("findings", self.doc.findings.len())
                     .with("report", self.partial_path.display())
@@ -159,6 +188,7 @@ impl ReportBuilder {
                     )
             });
         }
+        self.flush()?;
         std::fs::rename(&self.partial_path, &self.final_path).map_err(|e| SalvageError::Infra {
             reason: format!("could not commit report.json: {e}"),
             context: vec![("path", self.final_path.display().to_string())],
@@ -180,11 +210,27 @@ impl ReportBuilder {
 pub fn run_audit(
     ddl: &PinnedDdl,
     overrides: &Overrides,
-    store: &dyn ObjectStore,
+    raw: &dyn ObjectStore,
+    clean: &dyn ObjectStore,
     inserter: &dyn InsertTester,
     ledger: &PagesJson,
     opts: &AuditOptions,
 ) -> Result<Report> {
+    // Raw and clean are two destinations, and the audit is the boundary between them. Pointing
+    // both at the same place is not a degraded configuration -- it is one that cannot work: the
+    // regenerated page is pushed under the same object name it was pulled from, the create-only
+    // precondition refuses it, and the batch dies at the push having done every other check. It
+    // also silently voids the consumer contract's escalation rule, which says to re-run from raw
+    // and never re-derive from clean. Refuse it here, where the message can say so.
+    if raw.location(&opts.raw_prefix) == clean.location(&opts.clean_prefix) {
+        return usage("the raw and clean destinations are the same").map_err(|e: SalvageError| {
+            e.with("location", raw.location(&opts.raw_prefix)).with(
+                "reason",
+                "audit reads from raw and writes to clean; they must be distinct buckets",
+            )
+        });
+    }
+
     std::fs::create_dir_all(&opts.work).map_err(|e| SalvageError::Infra {
         reason: format!("could not create the work dir: {e}"),
         context: Vec::new(),
@@ -228,7 +274,7 @@ pub fn run_audit(
         // not stop new versions or delete markers being layered on top.
         let name = ObjectName::new(entry.object.clone())?;
         let local = page_dir.join("page.tar.gz");
-        store.get_pinned(&name, Generation(entry.generation), &local)?;
+        raw.get_pinned(&name, Generation(entry.generation), &local)?;
 
         let bytes = std::fs::read(&local).map_err(|e| SalvageError::Infra {
             reason: format!("could not read the pulled page: {e}"),
@@ -246,6 +292,11 @@ pub fn run_audit(
         }
 
         let framed = frame(&bytes, &header, &overrides.limits)?;
+        // The archive's own metadata and the ledger are two statements about the same page. They
+        // must agree before either travels onward.
+        framed
+            .metadata
+            .agrees_with(entry, &ddl.qualified(), &opts.batch)?;
         if u64::try_from(framed.rows.len()).unwrap_or(u64::MAX) != entry.rows {
             return abort("page row count disagrees with the ledger").map_err(|e: SalvageError| {
                 e.with("page", entry.index)
@@ -286,7 +337,23 @@ pub fn run_audit(
         // Section 7: files are **regenerated from the values we parsed**. Original bytes never
         // copied forward -- which is what removes format smuggling rather than merely detecting it.
         let stem = format!("page-{:04}", entry.index);
-        let regenerated_tsv = regenerate(&header, &framed.rows);
+        // Literals from our own state: a locally-counted object name, the validated batch id,
+        // and our clock. Nothing here is derived from a row.
+        let provenance = Provenance {
+            source_object: entry.object.clone(),
+            batch: opts.batch.clone(),
+            imported_at: imported_at_utc(),
+        };
+        let regenerated_tsv = regenerate(&header, &framed.rows, &provenance);
+        // The metadata member is regenerated too, from the typed value we parsed and cross-checked
+        // -- not cloned from the archive we pulled. Serialising a `PageMeta` we hold is what makes
+        // "original bytes are never copied forward" true of the whole archive rather than of the
+        // TSV alone.
+        let regenerated_meta =
+            serde_json::to_vec(&framed.metadata).map_err(|e| SalvageError::Infra {
+                reason: format!("could not render the page metadata: {e}"),
+                context: Vec::new(),
+            })?;
         let tsv_path = staging.path().join(format!("{stem}.tsv"));
         std::fs::write(&tsv_path, &regenerated_tsv).map_err(|e| SalvageError::Infra {
             reason: format!("could not write the regenerated page: {e}"),
@@ -303,7 +370,7 @@ pub fn run_audit(
                 },
                 ArchiveMember {
                     name: format!("{stem}.json"),
-                    bytes: framed.metadata.clone(),
+                    bytes: regenerated_meta.clone(),
                 },
             ],
             &overrides.limits,
@@ -325,8 +392,18 @@ pub fn run_audit(
             inserter.test(&InsertPlan {
                 staging_table: staging_table.clone(),
                 quarantine_ddl: quarantine_ddl(ddl, overrides, &staging_table)?,
-                columns: header.clone(),
+                // The regenerated file carries the three provenance columns, so the insert's
+                // column list must too -- with `input_format_skip_unknown_fields=0` a mismatch is
+                // a load failure, which is the loud version of the silence this replaces.
+                columns: {
+                    let mut c = header.clone();
+                    for (name, _) in PROVENANCE_COLUMNS {
+                        c.push((*name).to_owned());
+                    }
+                    c
+                },
                 tsv: tsv_path.clone(),
+                expected_rows: entry.rows,
             })?;
         }
 
@@ -407,7 +484,7 @@ pub fn run_audit(
         let generation = if opts.dry_run {
             Generation(0)
         } else {
-            push(store, &name, path, sha)?
+            push(clean, &name, path, sha, opts.retain_days)?
         };
         entries.push(crate::models::PageEntry {
             index: entries.len().try_into().unwrap_or(u32::MAX),
@@ -457,10 +534,11 @@ pub fn run_audit(
     if !opts.dry_run {
         let name = ObjectName::new(format!("{}/MANIFEST.json", opts.clean_prefix))?;
         push(
-            store,
+            clean,
             &name,
             &manifest_path,
             &sha256_hex(rendered.as_bytes()),
+            opts.retain_days,
         )?;
     }
 
@@ -476,6 +554,28 @@ pub fn run_audit(
         context: Vec::new(),
     })?;
 
+    // A dry run pushes nothing and executes no insert test, so it must not leave a result that
+    // looks like a passing one. Promoting the staging dir and renaming `report.json` produced a
+    // `<batch>-clean/` directory with a manifest, every page tarball and a clean report -- for a
+    // run in which the only real-parser check in the whole topology (deviation D2) never ran. The
+    // module's ordering is built so that the final name means it passed; a dry run must not get
+    // to use that name.
+    if opts.dry_run {
+        report.phase(
+            "push",
+            true,
+            format!(
+                "dry run: {} pages built and validated, none pushed or promoted",
+                regenerated.len()
+            ),
+        )?;
+        tracing::info!(
+            "dry run complete: nothing was pushed, nothing was promoted, and report.json stays \
+             .partial because no insert test ran"
+        );
+        return report.into_report();
+    }
+
     report.phase(
         "push",
         true,
@@ -486,9 +586,20 @@ pub fn run_audit(
 }
 
 /// Regenerate a page from the values we parsed, in canonical form.
-fn regenerate(header: &[String], rows: &[Vec<Field>]) -> Vec<u8> {
-    let mut out = header.join("\t").into_bytes();
+fn regenerate(header: &[String], rows: &[Vec<Field>], provenance: &Provenance) -> Vec<u8> {
+    let mut names: Vec<&str> = header.iter().map(String::as_str).collect();
+    for (name, _) in PROVENANCE_COLUMNS {
+        names.push(name);
+    }
+    let mut out = names.join("\t").into_bytes();
     out.push(b'\n');
+
+    // Section 9: the provenance values are supplied as **literals, never values derived from the
+    // data**. All three come from our own state -- the object name from a local counter, the batch
+    // id from the validated `BatchId` newtype, the timestamp from our clock -- and they are
+    // identical on every row of the page, so they are encoded once.
+    let literals = provenance.encoded();
+
     for row in rows {
         for (i, field) in row.iter().enumerate() {
             if i > 0 {
@@ -496,9 +607,52 @@ fn regenerate(header: &[String], rows: &[Vec<Field>]) -> Vec<u8> {
             }
             out.extend_from_slice(&encode_field(field));
         }
+        for literal in &literals {
+            out.push(b'\t');
+            out.extend_from_slice(literal);
+        }
         out.push(b'\n');
     }
     out
+}
+
+/// Our clock, as `YYYY-MM-DD HH:MM:SS` in UTC.
+///
+/// Ours, not the compromised server's, and not a column: section 9 is explicit that the
+/// provenance values are literals supplied by the importing side.
+fn imported_at_utc() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+/// The three literal values every regenerated row carries.
+///
+/// Section 10 keeps these through promotion into production so a bad batch can be identified and
+/// removed later without redoing the salvage. They were declared in the quarantine DDL and never
+/// populated: the INSERT column list was the data header alone, so every row took ClickHouse's
+/// zero-default and `_batch` arrived empty -- leaving nothing to retract by, in the one mechanism
+/// whose entire purpose is retraction.
+pub struct Provenance {
+    pub source_object: String,
+    pub batch: String,
+    pub imported_at: String,
+}
+
+impl Provenance {
+    fn encoded(&self) -> Vec<Vec<u8>> {
+        [&self.source_object, &self.batch, &self.imported_at]
+            .into_iter()
+            .map(|v| encode_field(&Field::Value(v.clone().into_bytes())))
+            .collect()
+    }
 }
 
 fn record_inventory(
@@ -535,10 +689,16 @@ fn record_inventory(
     }
 }
 
-fn push(store: &dyn ObjectStore, name: &ObjectName, body: &Path, sha: &str) -> Result<Generation> {
+fn push(
+    store: &dyn ObjectStore,
+    name: &ObjectName,
+    body: &Path,
+    sha: &str,
+    retain_days: u32,
+) -> Result<Generation> {
     let meta = ObjectMeta {
         sha256_hex: sha.to_owned(),
-        retain_until: None,
+        retain_until: crate::gcs::retain_until_days(retain_days),
         hold: true,
         content_type: "application/gzip",
     };
@@ -601,6 +761,13 @@ mod tests {
         }
     }
 
+    /// A clean-side store, distinct from the raw one. `run_audit` refuses them being the same,
+    /// which is the point: sharing a destination made `--mode enforce` unable to complete.
+    fn clean_store(dir: &Path) -> LocalStore {
+        std::fs::create_dir_all(dir.join("clean-store")).unwrap();
+        LocalStore::new(dir.join("clean-store"))
+    }
+
     /// Export a batch so the audit has something real to read, then return its ledger.
     fn exported(dir: &Path, bodies: &[&str]) -> (LocalStore, PagesJson) {
         let mut tsv = String::from("ts\tid\tbody\n");
@@ -627,6 +794,7 @@ mod tests {
                 resume: false,
                 contract_version: "test".to_owned(),
                 git_commit: "test".to_owned(),
+                retain_days: 7,
             },
         )
         .unwrap();
@@ -643,6 +811,7 @@ mod tests {
             dry_run: false,
             contract_version: "test".to_owned(),
             git_commit: "test".to_owned(),
+            retain_days: 7,
             shape_review_signoff: signed,
             rotation_signoff: signed,
         }
@@ -656,6 +825,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
@@ -679,6 +849,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
@@ -716,6 +887,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Survey, true),
@@ -750,6 +922,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, false),
@@ -770,6 +943,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
@@ -790,6 +964,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
@@ -808,6 +983,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
@@ -841,10 +1017,35 @@ mod tests {
             .find(|m| m.name.ends_with(".tsv"))
             .unwrap()
             .bytes;
+        // The data values survive regeneration byte-for-byte; the clean file additionally carries
+        // the three provenance literals section 10 keeps through promotion.
+        let raw_text = String::from_utf8(raw_tsv.clone()).unwrap();
+        let clean_text = String::from_utf8(clean_tsv.clone()).unwrap();
+        let raw_lines: Vec<&str> = raw_text.lines().collect();
+        let clean_lines: Vec<&str> = clean_text.lines().collect();
+        assert_eq!(raw_lines.len(), clean_lines.len());
         assert_eq!(
-            raw_tsv, clean_tsv,
-            "the values must survive regeneration exactly"
+            clean_lines[0],
+            format!("{}\t_source_object\t_batch\t_imported_at", raw_lines[0])
         );
+        for (raw_row, clean_row) in raw_lines[1..].iter().zip(&clean_lines[1..]) {
+            let (values, provenance) = clean_row
+                .rsplit_once('\t')
+                .and_then(|(head, at)| head.rsplit_once('\t').map(|(h, b)| (h, (b, at))))
+                .map(|(head, (batch, at))| {
+                    let (values, object) = head.rsplit_once('\t').unwrap();
+                    (values, (object, batch, at))
+                })
+                .unwrap();
+            assert_eq!(
+                *raw_row, values,
+                "the values must survive regeneration exactly"
+            );
+            let (object, batch, at) = provenance;
+            assert!(object.starts_with("db.t/b1/page-"), "object: {object}");
+            assert_eq!(batch, "b1");
+            assert!(!at.is_empty(), "the import timestamp must be recorded");
+        }
     }
 
     #[test]
@@ -855,6 +1056,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
@@ -886,6 +1088,99 @@ mod tests {
     }
 
     #[test]
+    fn the_page_metadata_member_is_regenerated_and_not_copied_forward() {
+        // The `.json` member was lifted out of the untrusted archive unparsed and cloned verbatim
+        // into the archive pushed to the clean bucket -- the one input byte range that reached the
+        // promoted output, in the module whose central claim is that files are regenerated from
+        // parsed values. Smuggling a payload through the TSV was impossible; through this member
+        // it was a memcpy.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, ledger) = exported(dir.path(), &["ordinary"]);
+        let clean = clean_store(dir.path());
+        run_audit(
+            &ddl(),
+            &overrides(),
+            &store,
+            &clean,
+            &RecordingInsertTester::new(),
+            &ledger,
+            &opts(dir.path(), Mode::Enforce, true),
+        )
+        .unwrap_or_else(|e| panic!("a clean batch must promote: {e}"));
+
+        // Whatever the audit emitted parses as a `PageMeta` and agrees with the ledger. The
+        // structural half of the guarantee is in the type: `FramedPage::metadata` is a `PageMeta`,
+        // so there is no `Vec<u8>` left for a passenger to ride in.
+        let entry = &ledger.pages[0];
+        let pulled = std::fs::read(dir.path().join("audit").join("page").join("page.tar.gz"));
+        assert!(
+            pulled.is_err() || pulled.map(|b| b.is_empty()).unwrap_or(true),
+            "the pulled raw page must not survive the run"
+        );
+        assert_eq!(entry.index, 0);
+    }
+
+    #[test]
+    fn a_page_whose_metadata_contradicts_the_ledger_is_refused() {
+        // The archive and the ledger are two statements about one page. Nothing compared them, so
+        // the member could claim any row count, any batch, any table and travel onward saying so.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mut ledger) = exported(dir.path(), &["ordinary"]);
+        ledger.pages[0].pass1_sha256 = "0".repeat(64);
+        ledger.pages[0].pass2_sha256 = "0".repeat(64);
+
+        let err = run_audit(
+            &ddl(),
+            &overrides(),
+            &store,
+            &clean_store(dir.path()),
+            &RecordingInsertTester::new(),
+            &ledger,
+            &opts(dir.path(), Mode::Enforce, true),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a metadata/ledger disagreement must abort"));
+        assert!(
+            err.to_string().contains("disagrees with the ledger"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_shared_raw_and_clean_destination_is_refused_before_any_byte_moves() {
+        // `main.rs` built both prefixes as the same string against a single `--bucket`, so audit
+        // pushed the regenerated page to the object it had just pulled, hit the create-only
+        // precondition, and aborted -- after pulling, framing, bounding and regenerating every
+        // page. Every test hid it by hand-passing distinct prefixes; nothing exercised the wiring.
+        // The refusal is a Usage error because it is a configuration mistake, not a finding, and
+        // Usage is the class that is not resumable.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, ledger) = exported(dir.path(), &["ordinary"]);
+        let err = run_audit(
+            &ddl(),
+            &overrides(),
+            &store,
+            &store,
+            &RecordingInsertTester::new(),
+            &ledger,
+            &AuditOptions {
+                // Exactly what `main.rs` built: one bucket, and the same prefix for both sides.
+                clean_prefix: "db.t/b1".to_owned(),
+                ..opts(dir.path(), Mode::Enforce, true)
+            },
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a shared destination must be refused"));
+
+        assert_eq!(err.exit_code(), crate::abort::ExitCode::Usage, "{err}");
+        assert!(
+            err.to_string()
+                .contains("raw and clean destinations are the same"),
+            "wrong reason: {err}"
+        );
+    }
+
+    #[test]
     fn every_page_is_insert_tested_before_anything_is_pushed() {
         // With no Q3 in this topology (deviation D2), this is the only point where a real
         // ClickHouse parser meets the data before the consumer's does. A pipeline that forgot the
@@ -897,6 +1192,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &inserter,
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
@@ -925,7 +1221,21 @@ mod tests {
             plan.tsv
                 .starts_with(dir.path().join("audit").join(".b1-clean.staging"))
         );
-        assert_eq!(plan.columns, vec!["ts", "id", "body"]);
+        // The data columns plus the three provenance columns. Section 9 supplies these as
+        // literals from our own state; they were declared in the quarantine DDL and never
+        // populated, so every promoted row carried an empty `_batch` and there was nothing to
+        // retract a bad batch by.
+        assert_eq!(
+            plan.columns,
+            vec![
+                "ts",
+                "id",
+                "body",
+                "_source_object",
+                "_batch",
+                "_imported_at"
+            ]
+        );
     }
 
     #[test]
@@ -939,6 +1249,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &RecordingInsertTester::new().failing_on(1),
             &ledger,
             &opts(dir.path(), Mode::Enforce, true),
@@ -961,6 +1272,7 @@ mod tests {
             &ddl(),
             &overrides(),
             &store,
+            &clean_store(dir.path()),
             &inserter,
             &ledger,
             &opts(dir.path(), Mode::Survey, true),

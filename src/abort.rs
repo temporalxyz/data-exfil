@@ -78,6 +78,22 @@ fn render(context: &[Context]) -> String {
 }
 
 impl SalvageError {
+    /// The bare reason, **without** the rendered context.
+    ///
+    /// `Display` renders `reason` plus every `key=value` pair, and the section 8.3 validators
+    /// attach the offending value as context at more than twenty sites. Anything that puts an
+    /// error into an artifact a human or a consumer will read must use this rather than
+    /// `to_string()`, or section 8.0's "a rejected value is never re-emitted forward" is broken by
+    /// the error type rather than by the code that formats it.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Abort { reason, .. }
+            | Self::Usage { reason, .. }
+            | Self::Infra { reason, .. } => reason,
+        }
+    }
+
     #[must_use]
     pub fn exit_code(&self) -> ExitCode {
         match self {
@@ -270,13 +286,37 @@ impl StagingDir {
 
     /// Make the whole batch visible in one step.
     pub fn promote(&mut self) -> Result<()> {
+        // A destination that came into existence between construction and here is the same
+        // operator condition `inside()` refuses, and it must get the same class. Mapping every
+        // rename failure to `Infra` meant two overlapping runs produced different exit codes
+        // depending on timing -- and the first one was the resumable class, for a condition that
+        // is not resumable. `ENOTEMPTY` is the one that matters; `EXDEV` cannot arise because
+        // `inside()` derives a sibling path, and if it ever did it would be a build error rather
+        // than something to retry.
+        if self.dest.exists() {
+            return usage("the batch destination already exists").map_err(|e: SalvageError| {
+                e.with("dest", self.dest.display()).with(
+                    "reason",
+                    "pick a new --batch or run teardown; this is not resumable",
+                )
+            });
+        }
         std::fs::rename(&self.staged, &self.dest).map_err(|e| {
-            SalvageError::Infra {
-                reason: format!("could not promote the staging directory: {e}"),
-                context: Vec::new(),
-            }
-            .with("from", self.staged.display())
-            .with("to", self.dest.display())
+            let already = e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                || e.kind() == std::io::ErrorKind::AlreadyExists;
+            let err = if already {
+                SalvageError::Usage {
+                    reason: "the batch destination already exists".to_owned(),
+                    context: Vec::new(),
+                }
+            } else {
+                SalvageError::Infra {
+                    reason: format!("could not promote the staging directory: {e}"),
+                    context: Vec::new(),
+                }
+            };
+            err.with("from", self.staged.display())
+                .with("to", self.dest.display())
         })?;
         self.committed = true;
         Ok(())

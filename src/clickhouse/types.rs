@@ -620,10 +620,25 @@ pub enum Validator {
     FreeText {
         max_len: Option<u32>,
     },
+    /// An even-length hex string of any length.
+    ///
+    /// The form section 8.2's prefer-hex directive produces for a variable-length `String`:
+    /// *"Prefer hex for arbitrary strings and blobs -- it removes delimiter, control-byte and
+    /// escape ambiguity entirely, and is the default choice wherever a column allows it."*
+    /// `HexExact` cannot express it, because the length is the value's, not the type's.
+    HexAny,
     /// A JSON array whose elements each satisfy the inner validator.
+    ///
+    /// `nullable_elements` records whether the *element type* is `Nullable`. It has to be carried
+    /// here rather than inferred, because inside an array there is no other way to spell a null:
+    /// the whole array is one TSV field, so section 8.2's `\N` is unavailable and `toJSONString`
+    /// emits a JSON `null`. Accepting that unconditionally would erase the null/not-null contract
+    /// for `Array(T)`; refusing it unconditionally makes `Array(Nullable(T))` -- which section 12
+    /// item 1 names explicitly -- unexportable in principle. So the element type decides.
     JsonArray {
         inner: Box<Validator>,
         max_elements: u32,
+        nullable_elements: bool,
     },
 }
 
@@ -668,6 +683,7 @@ impl Validator {
             }
             Self::DecimalPs { p, s: scale } => check_decimal(s, *p, *scale),
             Self::HexExact { nybbles } => check_hex_exact(s, *nybbles),
+            Self::HexAny => check_hex_any(s),
             Self::Bool => {
                 if s == "0" || s == "1" {
                     Ok(())
@@ -688,7 +704,8 @@ impl Validator {
             Self::JsonArray {
                 inner,
                 max_elements,
-            } => check_json_array(s, inner, *max_elements),
+                nullable_elements,
+            } => check_json_array(s, inner, *max_elements, *nullable_elements),
         }
     }
 }
@@ -1005,7 +1022,28 @@ fn check_free_text(raw: &[u8], s: &str, max_len: Option<u32>) -> Result<()> {
     Ok(())
 }
 
-fn check_json_array(s: &str, inner: &Validator, max_elements: u32) -> Result<()> {
+/// Even-length hex, any length. Odd length means a truncated byte.
+fn check_hex_any(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return abort("hex-encoded value contains a non-hex character")
+            .map_err(|e: SalvageError| e.with("len", s.len()));
+    }
+    if !s.len().is_multiple_of(2) {
+        return abort("hex-encoded value has an odd number of nybbles")
+            .map_err(|e: SalvageError| e.with("len", s.len()));
+    }
+    Ok(())
+}
+
+fn check_json_array(
+    s: &str,
+    inner: &Validator,
+    max_elements: u32,
+    nullable_elements: bool,
+) -> Result<()> {
     let parsed: serde_json::Value = serde_json::from_str(s).map_err(|e| {
         SalvageError::Abort {
             reason: "Array does not parse as JSON".to_owned(),
@@ -1032,11 +1070,16 @@ fn check_json_array(s: &str, inner: &Validator, max_elements: u32) -> Result<()>
         let text = match item {
             serde_json::Value::String(t) => t.clone(),
             serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Null if nullable_elements => {
+                // The element type is `Nullable`, and inside a JSON array this is the only
+                // spelling a null has -- `\N` belongs to the TSV field layer, and the whole array
+                // is a single field. It is unambiguous against every other element form: a null
+                // is not a JSON string and not a JSON number.
+                continue;
+            }
             serde_json::Value::Null => {
-                return abort(
-                    "Array element is JSON null; nulls travel as `\\N`, not as JSON null",
-                )
-                .map_err(|e: SalvageError| e.with("index", i));
+                return abort("Array element is JSON null but the element type is not Nullable")
+                    .map_err(|e: SalvageError| e.with("index", i));
             }
             _ => {
                 return abort("Array element is not a scalar")
@@ -1063,8 +1106,14 @@ pub enum ExportExpr {
     Identity,
     /// `hex(c)`. Section 8.2's preferred form for arbitrary strings and blobs.
     HexBytes,
-    /// `hex(reinterpretAsUInt32|64(c))` -- the IEEE-754 bit pattern, so NaN, +-Inf and -0.0 survive
-    /// exactly. Text or JSON would collapse them.
+    /// `leftPad(hex(reinterpretAsUInt32|64(c)), 8|16, '0')` -- the IEEE-754 bit pattern, so NaN,
+    /// +-Inf and -0.0 survive exactly. Text or JSON would collapse them.
+    ///
+    /// The `leftPad` is load-bearing, not cosmetic. ClickHouse's `hex()` on an **integer** starts
+    /// at the most significant non-zero byte and omits leading zero bytes, so `hex(toUInt64(0))`
+    /// is `00`, not sixteen zeroes. The validator is [`Validator::HexExact`], an exact-width
+    /// check, so without the pad every float whose bit pattern has a leading zero byte -- most of
+    /// them, and `0.0` above all -- would be rejected and kill the batch.
     FloatBits(FloatWidth),
     /// `toString(c)`, with `session_timezone = 'UTC'` pinned by the export settings.
     ToStringUtc,
@@ -1106,7 +1155,13 @@ impl ExportExpr {
             Self::Identity => operand.to_owned(),
             Self::HexBytes => format!("hex({operand})"),
             Self::FloatBits(w) => {
-                format!("hex(reinterpretAsUInt{}({operand}))", w.bits())
+                // `hex()` on an integer omits leading zero bytes, so pad back to the exact width
+                // `Validator::HexExact` demands. See the variant's doc comment.
+                format!(
+                    "leftPad(hex(reinterpretAsUInt{}({operand})), {}, '0')",
+                    w.bits(),
+                    w.nybbles()
+                )
             }
             Self::ToStringUtc => format!("toString({operand})"),
             Self::UnixTimestamp => format!("toUnixTimestamp({operand})"),
@@ -1346,7 +1401,7 @@ fn expand(
         }
         ClickHouseType::LowCardinality(inner) => expand(inner, max_elems, nullable),
         ClickHouseType::Array(inner) => {
-            let (mut cols, _, _) = expand(inner, max_elems, false)?;
+            let (mut cols, _, element_nullable) = expand(inner, max_elems, false)?;
             if cols.len() != 1 {
                 return abort("Array of a flattened composite is out of scope")
                     .map_err(|e: SalvageError| e.with("type", t.canonical()));
@@ -1357,12 +1412,13 @@ fn expand(
                 Validator::JsonArray {
                     inner: Box::new(element.validator),
                     max_elements: max_elems,
+                    nullable_elements: element_nullable,
                 },
             )
         }
         ClickHouseType::Map(k, v) => {
-            let (mut kc, _, _) = expand(k, max_elems, false)?;
-            let (mut vc, _, _) = expand(v, max_elems, false)?;
+            let (mut kc, _, key_nullable) = expand(k, max_elems, false)?;
+            let (mut vc, _, val_nullable) = expand(v, max_elems, false)?;
             if kc.len() != 1 || vc.len() != 1 {
                 return abort("Map over a flattened composite is out of scope")
                     .map_err(|e: SalvageError| e.with("type", t.canonical()));
@@ -1377,6 +1433,7 @@ fn expand(
                         validator: Validator::JsonArray {
                             inner: Box::new(key.validator),
                             max_elements: max_elems,
+                            nullable_elements: key_nullable,
                         },
                     },
                     ExportColumn {
@@ -1385,6 +1442,7 @@ fn expand(
                         validator: Validator::JsonArray {
                             inner: Box::new(val.validator),
                             max_elements: max_elems,
+                            nullable_elements: val_nullable,
                         },
                     },
                 ],
@@ -1494,6 +1552,49 @@ const OUT_OF_SCOPE: &[(&str, &str)] = &[
     ("Nothing", "out of scope; no export form is specified"),
 ];
 
+/// Apply section 8.2's per-column prefer-hex directive to a set of rules.
+///
+/// `ColumnOverride.hex` was parsed, documented at length as the knob that selects
+/// [`ExportExpr::HexBytes`] for a `String`, set to `true` on a column in the shipped override
+/// file -- and read by nobody. An operator reviewing `plan.json` saw a control they had pinned,
+/// and the export emitted the column as-is: exactly the delimiter, control-byte and escape
+/// ambiguity section 8.2 says hex exists to remove.
+///
+/// Only textual columns can be hexed. Applying it to a number or a date would change the value's
+/// meaning rather than its encoding, so those are refused rather than silently ignored -- an
+/// override that cannot take effect must not look as though it did.
+pub fn apply_hex_override(ty: &ClickHouseType, rules: &mut TypeRules) -> Result<()> {
+    let textual = match ty {
+        ClickHouseType::String | ClickHouseType::FixedString(_) => true,
+        ClickHouseType::Nullable(inner) => matches!(
+            inner.as_ref(),
+            ClickHouseType::String | ClickHouseType::FixedString(_)
+        ),
+        _ => false,
+    };
+    if !textual {
+        return abort("hex = true is only meaningful for a String or FixedString column").map_err(
+            |e: SalvageError| {
+                e.with("type", ty.canonical()).with(
+                    "reason",
+                    "hex changes the encoding of a textual value; on a typed value it would \
+                     change the value",
+                )
+            },
+        );
+    }
+    for column in &mut rules.columns {
+        // `FixedString` already hexes by type, and its exact-width validator is stronger than the
+        // any-length one, so leave it alone.
+        if column.expr == ExportExpr::HexBytes {
+            continue;
+        }
+        column.expr = ExportExpr::HexBytes;
+        column.validator = Validator::HexAny;
+    }
+    Ok(())
+}
+
 /// Parse a declared ClickHouse type.
 ///
 /// There is no `_ =>` fallback anywhere in this function or in [`rules_for`]. An unmodelled
@@ -1504,9 +1605,23 @@ pub fn parse_type(s: &str) -> Result<ClickHouseType> {
     let s = s.trim();
     let (head, args) = split_head_args(s)?;
 
+    // `Interval*` is a family rather than a single spelling, so it is matched by prefix -- but the
+    // prefix test has to be *outside* the per-entry closure. Inside it, `find` returned true on
+    // the first array element for any `Interval` head, so an interval column was refused with the
+    // **Geo** disposition and the operator was pointed at a per-column-contract escape hatch that
+    // does not apply to it. The whole point of these per-type dispositions is that an operator
+    // seeing one knows what to do next.
+    if head.starts_with("Interval") {
+        return abort("no rule for type").map_err(|e: SalvageError| {
+            e.with("type", s.escape_debug()).with(
+                "reason",
+                "Interval type: out of scope; store the endpoints or the count of units instead",
+            )
+        });
+    }
     if let Some((_, why)) = OUT_OF_SCOPE
         .iter()
-        .find(|(name, _)| head.eq_ignore_ascii_case(name) || head.starts_with("Interval"))
+        .find(|(name, _)| head.eq_ignore_ascii_case(name))
     {
         return abort("no rule for type")
             .map_err(|e: SalvageError| e.with("type", s.escape_debug()).with("reason", *why));
@@ -2275,12 +2390,151 @@ mod tests {
         let col = Ident::new("f").unwrap();
         assert_eq!(
             rules("Float64").columns[0].expr.render(&col),
-            "hex(reinterpretAsUInt64(`f`))"
+            "leftPad(hex(reinterpretAsUInt64(`f`)), 16, '0')"
         );
         assert_eq!(
             rules("Float32").columns[0].expr.render(&col),
-            "hex(reinterpretAsUInt32(`f`))"
+            "leftPad(hex(reinterpretAsUInt32(`f`)), 8, '0')"
         );
+    }
+
+    #[test]
+    fn the_float_export_form_pads_to_exactly_what_the_validator_demands() {
+        // ClickHouse's `hex()` on an integer starts at the most significant non-zero byte, so
+        // `hex(toUInt64(0))` is `00` and not sixteen zeroes. Without the pad, `0.0` -- the most
+        // common float value there is -- fails `HexExact` and kills the batch. This test pins the
+        // pad width to the validator's width so the two cannot drift apart.
+        for (spec, width) in [("Float32", 8u32), ("Float64", 16)] {
+            let r = rules(spec);
+            let col = &r.columns[0];
+            let sql = col.expr.render(&Ident::new("f").unwrap());
+            assert!(
+                sql.contains(&format!(", {width}, '0')")),
+                "{spec} must pad to {width}: {sql}"
+            );
+            match col.validator {
+                Validator::HexExact { nybbles } => assert_eq!(
+                    nybbles, width,
+                    "{spec}: export pad and validator width disagree"
+                ),
+                ref other => panic!("{spec}: expected HexExact, got {other:?}"),
+            }
+            // And the padded output is what the validator accepts, for the value that broke it.
+            let zero = "0".repeat(usize::try_from(width).unwrap());
+            col.validator
+                .check(zero.as_bytes())
+                .unwrap_or_else(|e| panic!("{spec}: zero must validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_nullable_array_element_travels_as_json_null_and_a_non_nullable_one_may_not() {
+        // Section 12 item 1 names `Array(Nullable(T))` explicitly. Inside an array there is no
+        // other spelling for a null: the whole array is one TSV field, so `\N` is unavailable and
+        // `toJSONString` emits a JSON `null`. Refusing it made the type unexportable in principle
+        // -- the plan's own type matrix declared a column that could never ship a row.
+        let nullable = rules("Array(Nullable(UInt8))");
+        nullable.columns[0]
+            .validator
+            .check(b"[1,null,2]")
+            .unwrap_or_else(|e| panic!("Array(Nullable(UInt8)) must accept a null element: {e}"));
+        nullable.columns[0]
+            .validator
+            .check(b"[null]")
+            .unwrap_or_else(|e| panic!("an all-null array is still a valid array: {e}"));
+
+        // The relaxation is scoped to the element type. `Array(UInt8)` has no null in its domain,
+        // so a JSON null there is still a finding -- otherwise the not-null contract would be
+        // erased for every array in the schema.
+        let plain = rules("Array(UInt8)");
+        let err = plain.columns[0]
+            .validator
+            .check(b"[1,null,2]")
+            .err()
+            .unwrap_or_else(|| panic!("Array(UInt8) must refuse a JSON null"));
+        assert!(
+            err.to_string().contains("not Nullable"),
+            "wrong reason: {err}"
+        );
+
+        // And the element bound still runs on the non-null elements either side of the null.
+        assert!(
+            nullable.columns[0]
+                .validator
+                .check(b"[1,null,999]")
+                .is_err(),
+            "a null element must not suppress the bound on its neighbours"
+        );
+    }
+
+    #[test]
+    fn an_interval_type_is_refused_with_its_own_disposition_not_a_geo_one() {
+        // The prefix test sat inside the `find` closure, so `find` returned true on the *first*
+        // array element for any `Interval` head. The operator was told an interval column was a
+        // geo type and pointed at a per-column-contract escape hatch that does not apply -- and
+        // the test that covered this asserted only the shared "no rule for type" string, so it
+        // passed throughout.
+        for spec in ["IntervalDay", "IntervalSecond", "IntervalYear"] {
+            let err = parse_type(spec)
+                .err()
+                .unwrap_or_else(|| panic!("{spec} must be refused"));
+            let text = err.to_string();
+            assert!(text.contains("no rule for type"), "{text}");
+            assert!(text.contains("Interval type"), "wrong disposition: {text}");
+            assert!(
+                !text.contains("Geo"),
+                "routed to the Geo disposition: {text}"
+            );
+        }
+
+        // And a real Geo type still gets the Geo disposition, including its escape hatch.
+        let geo = parse_type("Point")
+            .err()
+            .unwrap_or_else(|| panic!("Point must be refused"));
+        assert!(geo.to_string().contains("Geo"), "{geo}");
+    }
+
+    #[test]
+    fn the_prefer_hex_override_actually_changes_the_export_form() {
+        // `ColumnOverride.hex` was parsed, documented at length as the knob that selects
+        // `ExportExpr::HexBytes` for a String, set on a column in the shipped override file -- and
+        // read by nobody. The operator saw a control in `plan.json`; the export ignored it.
+        let ty = parse_type("String").unwrap();
+        let mut r = rules_for(&ty, 100).unwrap();
+        assert_eq!(r.columns[0].expr, ExportExpr::Identity);
+
+        apply_hex_override(&ty, &mut r).unwrap();
+        assert_eq!(r.columns[0].expr, ExportExpr::HexBytes);
+        assert_eq!(
+            r.columns[0].expr.render(&Ident::new("body").unwrap()),
+            "hex(`body`)"
+        );
+
+        // The validator moves with the export form, which is the whole reason `rules_for`
+        // produces both halves in one place.
+        r.columns[0].validator.check(b"48656c6c6f").unwrap();
+        assert!(
+            r.columns[0].validator.check(b"48656c6c6").is_err(),
+            "odd nybbles"
+        );
+        assert!(r.columns[0].validator.check(b"nothex").is_err());
+
+        // `Nullable(String)` hexes too, and keeps its nullability.
+        let nt = parse_type("Nullable(String)").unwrap();
+        let mut nr = rules_for(&nt, 100).unwrap();
+        apply_hex_override(&nt, &mut nr).unwrap();
+        assert_eq!(nr.columns[0].expr, ExportExpr::HexBytes);
+        assert!(nr.nullable);
+
+        // Hexing a typed value would change the value rather than its encoding, so it is refused
+        // rather than silently ignored: an override that cannot take effect must not look as
+        // though it did.
+        let dt = parse_type("DateTime").unwrap();
+        let mut dr = rules_for(&dt, 100).unwrap();
+        let err = apply_hex_override(&dt, &mut dr)
+            .err()
+            .unwrap_or_else(|| panic!("hex on a DateTime must be refused"));
+        assert!(err.to_string().contains("only meaningful"), "{err}");
     }
 
     #[test]

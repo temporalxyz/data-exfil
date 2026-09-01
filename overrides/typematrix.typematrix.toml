@@ -35,7 +35,7 @@ max_tar_members = 16
 max_tar_member_bytes = 1073741824
 max_tar_name_bytes = 128
 # Section 8.6 bounded decodings, capped so the decoder does not become a bomb by another name.
-max_decode_rounds = 1
+max_decode_rounds = 2
 max_decode_expansion_ratio = 8
 # Enforced by us in the copy loop; nothing in the HTTP stack provides a total budget.
 wall_clock_secs = 3600

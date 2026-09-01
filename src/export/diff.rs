@@ -12,6 +12,11 @@
 //! disk is one page, which is what makes this affordable on a ~100 GB table. Shipping pass 2 rather
 //! than pass 1 is not a choice between them: they are byte-identical or the batch is dead.
 
+#![deny(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::integer_division
+)]
 use sha2::{Digest as _, Sha256};
 
 use crate::abort::{Result, SalvageError, abort};
@@ -31,7 +36,9 @@ impl Hasher {
 
     pub fn update(&mut self, chunk: &[u8]) {
         self.inner.update(chunk);
-        self.bytes = self.bytes.saturating_add(chunk.len() as u64);
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
     }
 
     #[must_use]

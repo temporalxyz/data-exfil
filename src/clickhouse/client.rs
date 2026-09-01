@@ -42,9 +42,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::abort::{PartialOutput, Result, SalvageError, abort, infra};
+use crate::abort::{Result, SalvageError, abort, infra};
 use crate::clickhouse::{Query, QueryRunner};
-use crate::limits::{BUDGET_ERROR_PREFIX, BoundedReader, TransferBudget};
+use crate::limits::{BUDGET_BYTES_MARKER, BUDGET_ERROR_PREFIX, BoundedReader, TransferBudget};
 
 /// Output format for a paged read. Section 9 imports with the matching
 /// `input_format_with_names_use_header=1`, so the header is a checked artifact, not decoration.
@@ -57,13 +57,29 @@ const SCALAR_FORMAT: &str = "TabSeparated";
 const MAX_SCALAR_BYTES: u64 = 64 * 1024;
 
 /// A ClickHouse HTTP endpoint.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Endpoint {
     /// `http://host:8123`, from pinned configuration and never from data.
     pub base_url: String,
     pub database: String,
     pub user: String,
     pub password: Option<String>,
+}
+
+/// Hand-written so the password cannot reach a log, an error message, or a panic.
+///
+/// The derive printed it in plaintext, and the field is `pub`, so the credential was one careless
+/// `?endpoint` -- or one `.expect()` on a value containing it -- away from a captured stderr on a
+/// forensic run.
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("base_url", &self.base_url)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// The real runner.
@@ -139,6 +155,7 @@ impl HttpRunner {
 
     /// Append the exact statement to the local log, before it is sent.
     fn log(&self, statement: &str, kind: crate::clickhouse::QueryKind) -> Result<()> {
+        write_query_log_header(&self.query_log)?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -162,10 +179,27 @@ impl HttpRunner {
         )
     }
 
-    fn send(&self, statement: String) -> Result<reqwest::blocking::Response> {
+    /// Send, under the caller's absolute deadline.
+    ///
+    /// The deadline is computed by the caller **before** this is entered, and the remainder is put
+    /// on the request itself. Without that, the wall-clock budget covered only the body copy and
+    /// the request phase was unbounded -- which is precisely the phase a hostile source can stall
+    /// in, because `wait_end_of_query=1` makes the server buffer the whole result before sending a
+    /// byte and `EXPORT_SETTINGS` pins `max_execution_time = 0`. `connect_timeout` does not help:
+    /// the TCP handshake completes, and then nothing arrives. A stall there produced no exit code
+    /// at all -- no `Drop` ran, because there was no unwind.
+    fn send(&self, statement: String, deadline: Instant) -> Result<reqwest::blocking::Response> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return infra("the query budget was already spent before the request was sent")
+                .map_err(|e: SalvageError| {
+                    e.with("wall_clock_secs", self.budget.wall_clock.as_secs())
+                });
+        }
         let mut req = self
             .client
             .post(self.url())
+            .timeout(remaining)
             .header("X-ClickHouse-User", &self.endpoint.user)
             .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .body(statement);
@@ -218,29 +252,28 @@ impl QueryRunner for HttpRunner {
     fn stream(&self, query: &Query) -> Result<Box<dyn std::io::Read + Send>> {
         let statement = Self::compose(query, PAGE_FORMAT)?;
         self.log(&statement, query.kind)?;
-        let resp = self.send(statement)?;
-        // Bounded at the seam rather than by the caller. Nothing in the HTTP stack provides a
-        // total budget -- `reqwest::blocking` has no `read_timeout`, and `.timeout()` recomputes
-        // per `read()` -- so an unbounded reader here would be an unbounded read from a server the
-        // attacker controls.
-        Ok(Box::new(BoundedReader::new(
-            resp,
-            self.budget,
-            self.deadline(),
-        )))
+        // One absolute deadline covering both phases, taken before the request goes out. Nothing
+        // in the HTTP stack provides a total budget -- `reqwest::blocking` has no `read_timeout`,
+        // and `.timeout()` recomputes per `read()` -- so the body still needs `BoundedReader`.
+        // Taking the instant here rather than after `send` is what stops a stalled request phase
+        // from escaping the budget entirely.
+        let deadline = self.deadline();
+        let resp = self.send(statement, deadline)?;
+        Ok(Box::new(BoundedReader::new(resp, self.budget, deadline)))
     }
 
     fn scalar(&self, query: &Query) -> Result<String> {
         let statement = Self::compose(query, SCALAR_FORMAT)?;
         self.log(&statement, query.kind)?;
-        let resp = self.send(statement)?;
+        let deadline = self.deadline();
+        let resp = self.send(statement, deadline)?;
 
         let budget = TransferBudget {
             wall_clock: self.budget.wall_clock,
             max_bytes: MAX_SCALAR_BYTES,
         };
         let mut out = Vec::new();
-        crate::limits::copy_bounded(resp, &mut out, budget, self.deadline())?;
+        crate::limits::copy_bounded(resp, &mut out, budget, deadline)?;
 
         let text = String::from_utf8(out)
             .map_err(|_| abort::<()>("scalar response is not UTF-8").unwrap_err())?;
@@ -284,21 +317,42 @@ pub fn is_budget_overrun(e: &std::io::Error) -> bool {
     e.to_string().contains(BUDGET_ERROR_PREFIX)
 }
 
-/// Write the query log's header. Called once per run so the file says what it is.
-pub fn open_query_log(path: &Path) -> Result<PartialOutput> {
-    let guard = PartialOutput::new(path.to_path_buf());
+/// Whether the overrun was the **byte cap** rather than the wall clock.
+///
+/// Only the byte cap is a finding: it means the peer sent more than it declared. A wall-clock
+/// overrun is as likely to be a congested link as a hostile server, so it stays infrastructure and
+/// stays resumable -- otherwise a slow network kills a 100 GB table's batch outright and
+/// `--resume` refuses to pick it up.
+#[must_use]
+pub fn is_byte_cap_overrun(e: &std::io::Error) -> bool {
+    let text = e.to_string();
+    text.contains(BUDGET_ERROR_PREFIX) && text.contains(BUDGET_BYTES_MARKER)
+}
+
+/// Write the query log's header, once, if the file is not there yet.
+///
+/// Private, and it does **not** hand back a `PartialOutput`. The previous version was the one API
+/// in the crate that returned a guard rather than binding one, so the natural way to call it --
+/// `open_query_log(&p)?;` as a statement -- created the file and immediately unlinked it under
+/// edition 2024's shortened temporary scopes. It was also never called from anywhere, so the
+/// header it exists to write was never written. Now `log()` calls it, and the header is present in
+/// the file section 4 calls "the record".
+fn write_query_log_header(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            infra::<()>(format!("could not create the query log directory: {e}")).unwrap_err()
+        })?;
+    }
     std::fs::write(
-        guard.path(),
+        path,
         "-- Queries this run sent to the source cluster, written before each was sent.\n\
          -- Section 4: the source's own system.query_log is attacker-controlled and is context,\n\
          -- never evidence. This file is the record.\n\n",
     )
-    .map_err(|e| {
-        infra::<()>(format!("could not create the query log: {e}"))
-            .unwrap_err()
-            .with("path", path.display())
-    })?;
-    Ok(guard)
+    .map_err(|e| infra::<()>(format!("could not create the query log: {e}")).unwrap_err())
 }
 
 #[cfg(test)]

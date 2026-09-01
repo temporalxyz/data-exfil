@@ -219,7 +219,13 @@ pub fn copy_bounded(
         let n64 = u64::try_from(n).or_overflow("read_len->u64")?;
         total = total.checked_add(n64).or_overflow("transfer_bytes")?;
         if total > budget.max_bytes {
-            return infra("transfer exceeded its byte cap")
+            // A **finding**, not infrastructure. `max_compressed_bytes` is a section 8.4 cap, and
+            // every other section 8.4 cap goes through `Limits::check_total`, which aborts. A peer
+            // that overran its declared size is a peer contradicting itself -- reporting that as
+            // exit 3 marked it resumable, which is exactly the classification section 8.0 reserves
+            // for "we never got to look". `BoundedReader` already classified the identical
+            // condition as a finding; the two paths disagreed.
+            return abort("transfer exceeded its byte cap")
                 .map_err(|e: SalvageError| {
                     e.with("cap", budget.max_bytes).with("bytes_so_far", total)
                 })
@@ -251,6 +257,15 @@ pub struct BoundedReader<R> {
 /// Marker on the I/O errors [`BoundedReader`] raises, so a budget overrun is distinguishable from
 /// a dropped connection. One is a finding about a hostile peer; the other is resumable.
 pub const BUDGET_ERROR_PREFIX: &str = "transfer budget exceeded: ";
+
+/// Marker for the *byte cap* specifically.
+///
+/// The two overruns are not the same kind of event and were being collapsed into one. Busting the
+/// byte cap means the peer sent more than it declared -- a peer contradicting itself, which is a
+/// finding. Busting the wall clock can equally well mean a congested link, which is infrastructure
+/// and resumable. Treating both as findings killed a whole table's batch for a slow network;
+/// treating both as infrastructure let a hostile overrun be retried.
+pub const BUDGET_BYTES_MARKER: &str = "[cap] ";
 
 impl<R: std::io::Read> BoundedReader<R> {
     #[must_use]
@@ -286,7 +301,7 @@ impl<R: std::io::Read> std::io::Read for BoundedReader<R> {
         })?;
         if self.total > self.budget.max_bytes {
             return Err(std::io::Error::other(format!(
-                "{BUDGET_ERROR_PREFIX}{} bytes exceeds the cap of {}",
+                "{BUDGET_ERROR_PREFIX}{BUDGET_BYTES_MARKER}{} bytes exceeds the cap of {}",
                 self.total, self.budget.max_bytes
             )));
         }
@@ -386,7 +401,11 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         )
         .unwrap_err();
-        assert_eq!(err.exit_code(), ExitCode::Infra);
+        // A finding, not infrastructure. A peer that sent more than it declared is contradicting
+        // itself; classifying that as Infra marked it resumable, which is the class reserved for
+        // "we never got to look". `BoundedReader` already treated the identical condition as a
+        // finding, so the two enforcement paths disagreed.
+        assert_eq!(err.exit_code(), ExitCode::Abort, "{err}");
         assert!(err.to_string().contains("byte cap"), "{err}");
     }
     #[test]

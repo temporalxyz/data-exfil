@@ -76,6 +76,14 @@ fn store(dir: &Path) -> LocalStore {
     LocalStore::new(dir.join("store"))
 }
 
+/// The clean-side store. Distinct from the raw one by construction: `run_audit` refuses a run
+/// whose raw and clean destinations are the same, because such a run passes every validation and
+/// then dies at the create-only push.
+fn clean(dir: &Path) -> LocalStore {
+    std::fs::create_dir_all(dir.join("clean-store")).unwrap();
+    LocalStore::new(dir.join("clean-store"))
+}
+
 fn page_bytes(bodies: &[&str]) -> Vec<u8> {
     let mut tsv = String::from("ts\tid\tbody\n");
     for (i, body) in bodies.iter().enumerate() {
@@ -101,6 +109,7 @@ fn export(dir: &Path, s: &LocalStore, bodies: &[&str]) -> PagesJson {
             resume: false,
             contract_version: "rehearsal".to_owned(),
             git_commit: "rehearsal".to_owned(),
+            retain_days: 7,
         },
     )
     .unwrap()
@@ -116,6 +125,7 @@ fn audit_opts(dir: &Path, mode: Mode) -> AuditOptions {
         dry_run: false,
         contract_version: "rehearsal".to_owned(),
         git_commit: "rehearsal".to_owned(),
+        retain_days: 7,
         shape_review_signoff: true,
         rotation_signoff: true,
     }
@@ -239,6 +249,7 @@ fn items_8_and_10_a_single_rejected_row_aborts_and_delivers_no_subset() {
         &ddl(),
         &overrides(),
         &s,
+        &clean(dir.path()),
         &RecordingInsertTester::new(),
         &ledger,
         &audit_opts(dir.path(), Mode::Enforce),
@@ -284,6 +295,7 @@ fn item_9_one_value_per_catalogue_class_halts_the_run() {
                 &ddl(),
                 &overrides(),
                 &s,
+                &clean(dir.path()),
                 &RecordingInsertTester::new(),
                 &ledger,
                 &audit_opts(dir.path(), Mode::Enforce)
@@ -308,6 +320,7 @@ fn item_9_one_value_per_catalogue_class_halts_the_run() {
                 &ddl(),
                 &overrides(),
                 &s,
+                &clean(dir.path()),
                 &RecordingInsertTester::new(),
                 &ledger,
                 &audit_opts(dir.path(), Mode::Enforce)
@@ -341,6 +354,7 @@ fn item_12_the_survey_enumerates_every_finding_and_writes_nothing_forward() {
             &ddl(),
             &overrides(),
             &s,
+            &clean(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &audit_opts(dir.path(), Mode::Survey)
@@ -380,6 +394,7 @@ fn a2_two_passes_that_differ_abort_and_identical_ones_proceed() {
             resume: false,
             contract_version: "rehearsal".to_owned(),
             git_commit: "rehearsal".to_owned(),
+            retain_days: 7,
         },
     )
     .unwrap_err();
@@ -430,6 +445,7 @@ fn a7b_a_key_that_fails_its_bound_never_becomes_a_cursor() {
             resume: false,
             contract_version: "rehearsal".to_owned(),
             git_commit: "rehearsal".to_owned(),
+            retain_days: 7,
         },
     )
     .unwrap_err();
@@ -465,10 +481,45 @@ fn a7f_reconciliation_catches_a_server_claiming_more_than_it_streamed() {
             resume: false,
             contract_version: "rehearsal".to_owned(),
             git_commit: "rehearsal".to_owned(),
+            retain_days: 7,
         },
     )
     .unwrap_err();
-    assert!(err.to_string().contains("do not agree"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("does not match the server's count()"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a7f2_a_table_still_taking_writes_above_the_cutoff_still_reconciles() {
+    // `system.parts` is not cutoff-scoped, so on a live table the parts total always exceeds the
+    // cutoff-scoped `count()`. Demanding equality made a clean run impossible on any real table --
+    // and it failed *after* every page had been exported, hashed and pushed.
+    let dir = tempfile::tempdir().unwrap();
+    let runner = FakeRunner::new().on("SELECT", page_bytes(&["a", "b"]));
+    let mut live = facts(2);
+    live.parts_rows = 500_000;
+    run_export(
+        &ddl(),
+        &overrides(),
+        &runner,
+        &store(dir.path()),
+        &live,
+        1000,
+        &ExportOptions {
+            batch: "b1".to_owned(),
+            work: dir.path().join("export"),
+            bucket_prefix: "db.t/b1".to_owned(),
+            dry_run: false,
+            resume: false,
+            contract_version: "rehearsal".to_owned(),
+            git_commit: "rehearsal".to_owned(),
+            retain_days: 7,
+        },
+    )
+    .unwrap_or_else(|e| panic!("a live table must reconcile: {e}"));
 }
 
 #[test]
@@ -486,6 +537,7 @@ fn a7h_promotion_is_all_or_nothing_across_the_table_s_pages() {
             &ddl(),
             &overrides(),
             &s,
+            &clean(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &audit_opts(dir.path(), Mode::Enforce)
@@ -508,6 +560,7 @@ fn item_6_a_pinned_generation_that_does_not_exist_is_refused() {
             &ddl(),
             &overrides(),
             &s,
+            &clean(dir.path()),
             &RecordingInsertTester::new(),
             &ledger,
             &audit_opts(dir.path(), Mode::Enforce)
@@ -530,6 +583,7 @@ fn the_clean_path_runs_end_to_end_with_no_network_and_no_clickhouse() {
         &ddl(),
         &overrides(),
         &s,
+        &clean(dir.path()),
         &RecordingInsertTester::new(),
         &ledger,
         &audit_opts(dir.path(), Mode::Enforce),
@@ -552,6 +606,7 @@ fn the_clean_path_runs_end_to_end_with_no_network_and_no_clickhouse() {
             accepted: true,
             rotation_complete: true,
             dry_run: false,
+            recorded_at: "2026-09-01".to_owned(),
         },
         &s,
     )

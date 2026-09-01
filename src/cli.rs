@@ -1,0 +1,362 @@
+//! The command line surface. The doc comments here *are* the `--help`.
+//!
+//! Each subcommand carries the source plan's section 2 framing -- PROVES / DOES NOT PROVE /
+//! ABORTS ON -- so that what a control does and does not establish lives in the binary rather than
+//! only in a document that can go stale.
+//!
+//! Two deliberate choices:
+//!
+//! - `--table` and `--batch` are **non-optional fields on the subcommands that need them**, rather
+//!   than optional globals. clap then enforces required-ness itself, and the five runtime
+//!   `is_none()` checks that would otherwise be needed disappear.
+//! - [`TableRef`] and [`BatchId`] are newtypes that validate in `FromStr`. Both reach object names
+//!   and staging table names, so this is the same discipline section 4 demands for far-side names:
+//!   validate once at the boundary, and let every downstream function take the parsed type. It is
+//!   a security boundary, not ergonomics.
+
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_verbosity_flag::Verbosity;
+
+/// A validated `db.table` reference.
+///
+/// Splitting `db.table` in one reviewed place is also how `staging.<tbl>__<batch>__<seq>` stays
+/// constructible without string surgery at the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRef {
+    database: String,
+    table: String,
+}
+
+impl TableRef {
+    #[must_use]
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    #[must_use]
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// `db.table`, the form used in SQL and in object prefixes.
+    #[must_use]
+    pub fn qualified(&self) -> String {
+        format!("{}.{}", self.database, self.table)
+    }
+}
+
+fn valid_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+impl FromStr for TableRef {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.splitn(2, '.');
+        let (Some(database), Some(table)) = (parts.next(), parts.next()) else {
+            return Err(format!("expected `db.table`, got `{s}`"));
+        };
+        if !valid_identifier(database) || !valid_identifier(table) {
+            return Err(format!(
+                "`{s}` is not `db.table` with both parts matching ^[A-Za-z0-9_-]{{1,64}}$"
+            ));
+        }
+        Ok(Self {
+            database: database.to_owned(),
+            table: table.to_owned(),
+        })
+    }
+}
+
+/// A validated batch id: `^[A-Za-z0-9-]{1,32}$`.
+///
+/// Validated, not trusted. It reaches object names and staging table names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchId(String);
+
+impl BatchId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for BatchId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() || s.len() > 32 {
+            return Err(format!("batch id must be 1-32 characters, got {}", s.len()));
+        }
+        if !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(format!("batch id `{s}` must match ^[A-Za-z0-9-]{{1,32}}$"));
+        }
+        Ok(Self(s.to_owned()))
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "salvage", version, propagate_version = true)]
+#[command(about = "Fail-closed ClickHouse salvage from a compromised cluster")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+
+    #[command(flatten)]
+    pub common: Common,
+}
+
+/// Options that genuinely apply to every subcommand.
+#[derive(Debug, Args)]
+pub struct Common {
+    /// Work dir holding the batch's files and report.json
+    #[arg(long, global = true, default_value = "./work")]
+    pub work: PathBuf,
+
+    /// Machine-readable result on stdout; the human log always goes to stderr
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Print what would run and touch nothing.
+    ///
+    /// A dry run still builds every SQL string and every object name, and runs every validator;
+    /// only the effectful leaf is stubbed. A dry run that skipped the code path would prove
+    /// nothing.
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub verbosity: Verbosity,
+}
+
+/// The table argument, flattened into the four subcommands that operate on one.
+#[derive(Debug, Args)]
+pub struct TableArg {
+    /// Table to operate on, `db.table`. One table per invocation.
+    #[arg(long)]
+    pub table: TableRef,
+}
+
+/// The batch argument, flattened into the three subcommands that address a batch.
+#[derive(Debug, Args)]
+pub struct BatchArg {
+    /// Batch id. Validated, not trusted: ^[A-Za-z0-9-]{1,32}$
+    #[arg(long)]
+    pub batch: BatchId,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Choose this table's pagination cursor and page size. Reads no table data.
+    ///
+    /// PROVES: the cursor is a NOT NULL prefix of the ORDER BY key, so the seek is a range scan
+    /// and no page boundary can drop a row to a NULL comparison.
+    /// DOES NOT PROVE: that the page size is right first time. It is seeded from the compromised
+    /// server's estimate and then corrected from our own measured output.
+    /// ABORTS ON: no NOT NULL key prefix available, or a cursor that is not a key prefix.
+    Plan(PlanArgs),
+
+    /// Freeze the source, pull each page twice, diff, tar, push to the raw bucket.
+    ///
+    /// PROVES: the export errored rather than truncating, and both passes of every page agree
+    /// byte for byte.
+    /// DOES NOT PROVE: that the rows are true, or that they are all of what existed.
+    /// ABORTS ON: a pinned setting the server does not know, a settings constraint, a row-count
+    /// disagreement, a page-count mismatch, or any difference between two passes.
+    Export(ExportArgs),
+
+    /// Stream the batch down, audit it, insert-test it against a dummy DB, re-tar, push to clean.
+    ///
+    /// PROVES: every delivered byte framed, escaped, typed and bounded as declared, and loaded
+    /// under a real ClickHouse parser with zero skipped, malformed or defaulted rows.
+    /// DOES NOT PROVE: that any value is true, or that free text is benign.
+    /// ABORTS ON: any framing error, any non-canonical escape, any out-of-bound value, any
+    /// payload-catalogue match, or any insert that does not load cleanly.
+    Audit(AuditArgs),
+
+    /// Inventory which columns can hold a credential. Run at incident time; touches no data.
+    ///
+    /// PROVES: nothing about the data. It is an inventory, not a check.
+    /// DOES NOT PROVE: that the listed secrets are all of them.
+    /// ABORTS ON: pinned DDL that cannot be parsed.
+    Secrets,
+
+    /// Release holds, destroy the estate, record the source disposition.
+    ///
+    /// PROVES: the estate is gone and the source's fate is written down rather than defaulted.
+    /// DOES NOT PROVE: that no copy was taken while the batch existed.
+    /// ABORTS ON: acceptance or rotation not signed off.
+    Teardown(TeardownArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PlanArgs {
+    #[command(flatten)]
+    pub table: TableArg,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    #[command(flatten)]
+    pub table: TableArg,
+    #[command(flatten)]
+    pub batch: BatchArg,
+
+    /// Re-run a single page by index. For recovering from an infrastructure error only.
+    #[arg(long)]
+    pub page: Option<u32>,
+
+    /// Resume an interrupted run. Honoured only after exit 3; refuses to continue past a finding.
+    ///
+    /// The refusal is enforced, not documented: a resume that could skip past a finding would
+    /// silently deliver the subset section 8.0 forbids.
+    #[arg(long)]
+    pub resume: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AuditArgs {
+    #[command(flatten)]
+    pub table: TableArg,
+    #[command(flatten)]
+    pub batch: BatchArg,
+
+    /// Re-run a single page by index.
+    #[arg(long)]
+    pub page: Option<u32>,
+
+    /// survey enumerates every finding and writes nothing forward;
+    /// enforce is the production run and is expected to find nothing.
+    #[arg(long, value_enum)]
+    pub mode: Mode,
+
+    /// Container runtime for the dummy ClickHouse used by the insert test.
+    #[arg(long, value_enum, default_value_t = Runner::Docker)]
+    pub runner: Runner,
+}
+
+#[derive(Debug, Args)]
+pub struct TeardownArgs {
+    #[command(flatten)]
+    pub table: TableArg,
+    #[command(flatten)]
+    pub batch: BatchArg,
+}
+
+/// Survey means "collect every finding", never "tolerate them" -- a survey with findings still
+/// fails, it just fails after enumerating all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Mode {
+    Survey,
+    Enforce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Runner {
+    Docker,
+    Podman,
+    Local,
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_cli_definition_is_internally_consistent() {
+        // clap's own assertions catch conflicting flags, duplicate names and bad defaults.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_table_ref_splits_into_database_and_table() {
+        let t: TableRef = "events.hits".parse().unwrap();
+        assert_eq!(t.database(), "events");
+        assert_eq!(t.table(), "hits");
+        assert_eq!(t.qualified(), "events.hits");
+    }
+
+    #[test]
+    fn a_table_ref_rejects_quoting_and_injection_metacharacters() {
+        // These reach SQL and object names; rejecting at the boundary is the control.
+        for bad in [
+            "events",
+            "events.",
+            ".hits",
+            "events.hits; DROP TABLE x",
+            "events.`hits`",
+            "events.hits'",
+            "ev ents.hits",
+            "events..hits",
+        ] {
+            assert!(bad.parse::<TableRef>().is_err(), "`{bad}` must reject");
+        }
+    }
+
+    #[test]
+    fn a_table_ref_rejects_an_over_long_identifier() {
+        let long = "a".repeat(65);
+        assert!(format!("db.{long}").parse::<TableRef>().is_err());
+    }
+
+    #[test]
+    fn a_batch_id_accepts_only_its_charset() {
+        assert!("b-2026-08-31".parse::<BatchId>().is_ok());
+        for bad in ["", "has space", "has_underscore", "slash/es", "quote'"] {
+            assert!(bad.parse::<BatchId>().is_err(), "`{bad}` must reject");
+        }
+        assert!("a".repeat(33).parse::<BatchId>().is_err());
+    }
+
+    #[test]
+    fn an_invalid_mode_is_a_parse_error_not_a_default() {
+        // There is no "unrecognised mode, assuming enforce" path.
+        let parsed = Cli::try_parse_from([
+            "salvage",
+            "audit",
+            "--table",
+            "events.hits",
+            "--batch",
+            "b1",
+            "--mode",
+            "whatever",
+        ]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn export_requires_both_table_and_batch() {
+        assert!(Cli::try_parse_from(["salvage", "export"]).is_err());
+        assert!(Cli::try_parse_from(["salvage", "export", "--table", "events.hits"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "salvage",
+                "export",
+                "--table",
+                "events.hits",
+                "--batch",
+                "b1"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn secrets_needs_no_table_because_it_reads_pinned_ddl_only() {
+        assert!(Cli::try_parse_from(["salvage", "secrets"]).is_ok());
+    }
+}

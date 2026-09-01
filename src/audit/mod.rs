@@ -11,6 +11,8 @@
 //! The submodules named in the plan (`frame`, `bounds`, `payloads`, `secrets`, `insert`,
 //! `profile`) are split out as their build step lands; see the plan's step 10.
 
+pub mod secrets;
+
 use crate::abort::{Result, infra};
 use crate::cli::AuditArgs;
 use crate::gcs::ObjectStore;

@@ -16,6 +16,8 @@
 //! that the far side is hostile and nothing may parse its output before we have validated it --
 //! so the seam must not pre-parse, and no dependency may deserialize on our behalf.
 
+pub mod ddl;
+pub mod quarantine;
 pub mod settings;
 pub mod tsv;
 pub mod types;

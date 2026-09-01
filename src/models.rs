@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::abort::{Result, SalvageError, abort};
 use crate::clickhouse::types::TypeRules;
 use crate::limits::Limits;
 
@@ -70,6 +71,13 @@ pub struct ColumnOverride {
     /// per column, in source control, before the run.
     #[serde(default)]
     pub hex: bool,
+    /// Who rotates this column's secret, if it holds one (addition A3).
+    ///
+    /// Optional because `salvage secrets` runs at incident time, potentially before anyone has
+    /// written an override file. Absent renders as **UNASSIGNED** in `SECRETS-ROTATION.md`, which
+    /// is a gap to close rather than a default to accept.
+    #[serde(default)]
+    pub rotation_owner: Option<String>,
 }
 
 /// `overrides/<db>.<table>.toml` -- the pinned, per-table decisions.
@@ -111,6 +119,16 @@ pub struct PageEntry {
     pub pass2_sha256: String,
     /// The cursor key tuple this page ended on, rendered from our own parsed values.
     pub cursor_end: Vec<String>,
+
+    /// Section 4 requires these recorded per file: *"Record per file: SHA-256, rows, bytes, table,
+    /// shard, replica, partition, generated name."*
+    ///
+    /// They come from the compromised server, so each passes [`far_side_name`] on the way in.
+    /// Recorded, never interpolated -- object names and filenames still come from a local counter,
+    /// which is the other half of section 4's rule.
+    pub shard: String,
+    pub replica: String,
+    pub partition: String,
 }
 
 /// `PAGES.json` -- written LAST, after every page has landed.
@@ -372,6 +390,127 @@ pub struct ManifestEnvelope {
     pub dropped_columns: Vec<String>,
 }
 
+/// Validate a name that came back from the compromised server.
+///
+/// Section 4, verbatim: *"Validate any far-side name against `^[A-Za-z0-9_-]{1,64}$` before use"* --
+/// and the reason it matters here is the sentence just before it: *"Never interpolate database
+/// values into SQL, shell, filenames or paths… includes anything that looks like metadata:
+/// partition IDs, table and column names returned by the server are attacker-influenced."*
+///
+/// Both rules hold at once, and the distinction is easy to get backwards. A partition id is
+/// **recorded** in the ledger, because section 4 also requires it recorded per file. It is
+/// **never interpolated** into anything. This function is the gate on the recording path; the
+/// no-interpolation rule is upheld by callers generating filenames from a local counter.
+pub fn far_side_name(what: &'static str, value: &str) -> Result<String> {
+    let ok = !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if ok {
+        return Ok(value.to_owned());
+    }
+    // An Abort rather than a Usage: this value came from the far side, so a malformed one is a
+    // finding about the data, not a mistake in our invocation.
+    abort("far-side name failed its charset check")
+        .map_err(|e: SalvageError| e.with("field", what).with("value", value.escape_debug()))
+}
+
+/// Section 8.6's payload inventory for one column.
+///
+/// Distinct from [`Finding`] and from the rejection counts on [`ManifestEnvelope`]: those record
+/// *what killed a run*, this records *what a survey saw*. Section 8.6 names the fields --
+/// *"Records per table and column: which pattern classes matched, how many rows, hex-encoded
+/// samples."*
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColumnInventory {
+    pub column: String,
+    /// The column's declared class. A match in Closed or Constrained is the escalating case --
+    /// the value already failed its allowlist, so either the schema is wrong or something put a
+    /// payload where one cannot legitimately be.
+    pub class: FreedomClass,
+    /// Catalogue class names that matched, e.g. `sql`, `shell`, `jndi`, `unicode`.
+    pub classes_matched: Vec<String>,
+    pub rows_matched: u64,
+    /// Hex, and only hex. Same structural reason as [`Finding::sample_hex`]: section 8.0 forbids
+    /// re-emitting a rejected value forward, so no field here can carry the original bytes.
+    pub samples_hex: Vec<String>,
+}
+
+/// A mode field that is always `"survey"` and refuses to deserialize as anything else.
+///
+/// Section 8.6: *"The payload inventory comes from the survey pass (8.0.1), not a production run
+/// -- a production run that got far enough to build an inventory has already failed."* An
+/// inventory stamped `enforce` is therefore not a document with a wrong field; it is a
+/// contradiction, and it fails to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SurveyOnly;
+
+impl Serialize for SurveyOnly {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str("survey")
+    }
+}
+
+impl<'de> Deserialize<'de> for SurveyOnly {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        if raw == "survey" {
+            Ok(Self)
+        } else {
+            Err(serde::de::Error::custom(
+                "a payload inventory can only come from a survey pass; \
+                 an enforce run that built one had already failed",
+            ))
+        }
+    }
+}
+
+/// `PAYLOAD-INVENTORY.json` -- the survey pass's output, and the input to the next run's scope
+/// decision.
+///
+/// Section 8.6 is specific about what this is for, and it is not a log: *"Scope decisions are made
+/// from it between runs: drop the column, reclassify it, or remove the table. Zero survey matches
+/// → column proceeds. Matches → column is changed before the production run, not argued about
+/// during it."* So it has to read as a worklist.
+///
+/// It is also section 11's input. *"The payload inventory from 8.6 says which of these are
+/// mandatory for which columns. A consumer of a column with HTML matches must encode; a consumer
+/// of a column with URL matches must not fetch."* `CONSUMER-CONTRACT.md` is generated from this
+/// document rather than written by hand, so the obligations name columns instead of describing
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadInventory {
+    pub table: String,
+    pub batch: String,
+    pub contract_version: String,
+    pub git_commit: String,
+    /// Fixed at `"survey"`; see [`SurveyOnly`].
+    #[serde(default)]
+    pub mode: SurveyOnly,
+    /// One entry per column that matched anything. A column absent from this list saw zero
+    /// matches and proceeds.
+    pub columns: Vec<ColumnInventory>,
+}
+
+impl PayloadInventory {
+    /// Columns that must be dealt with before a production run: dropped, reclassified, or the
+    /// table removed from scope.
+    #[must_use]
+    pub fn worklist(&self) -> Vec<&ColumnInventory> {
+        self.columns.iter().filter(|c| c.rows_matched > 0).collect()
+    }
+
+    /// Whether every column came back clean, which is the only state in which a production run
+    /// should be attempted.
+    #[must_use]
+    pub fn is_clear(&self) -> bool {
+        self.worklist().is_empty()
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -435,5 +574,149 @@ mod tests {
         // A dropped page shows up as a disagreement, which is the whole point.
         p.total_rows = 99;
         assert!(!p.reconciles());
+    }
+
+    #[test]
+    fn a_far_side_name_that_could_reach_sql_is_refused() {
+        // Section 4: partition ids and table names returned by the server are attacker-influenced.
+        // These are recorded, so they must be screened; nothing here is ever interpolated.
+        assert_eq!(far_side_name("partition", "202608").unwrap(), "202608");
+        assert_eq!(
+            far_side_name("replica", "replica-02_a").unwrap(),
+            "replica-02_a"
+        );
+
+        for hostile in [
+            "2026'; DROP TABLE users;--",
+            "../../etc/passwd",
+            "a b",
+            "a\nb",
+            "",
+            &"x".repeat(65),
+        ] {
+            let err = far_side_name("partition", hostile).unwrap_err();
+            assert_eq!(
+                err.exit_code(),
+                crate::abort::ExitCode::Abort,
+                "a malformed far-side name is a finding about the data, not a usage error"
+            );
+        }
+    }
+
+    fn a_page_entry() -> PageEntry {
+        PageEntry {
+            index: 0,
+            object: "events.hits/b1/page-0000.tar.gz".into(),
+            generation: 1_700_000_000_000_001,
+            sha256: "aa".repeat(32),
+            rows: 1000,
+            bytes: 4096,
+            pass1_sha256: "bb".repeat(32),
+            pass2_sha256: "bb".repeat(32),
+            cursor_end: vec!["2026-08-24 23:59:59".into(), "42".into()],
+            shard: "shard-01".into(),
+            replica: "replica-02".into(),
+            partition: "202608".into(),
+        }
+    }
+
+    #[test]
+    fn a_page_entry_records_everything_section_4_names() {
+        let json = serde_json::to_value(a_page_entry()).unwrap();
+        // Section 4's per-file record, in full. `table` lives on the enclosing PagesJson and the
+        // generated name is `object`.
+        for field in [
+            "sha256",
+            "rows",
+            "bytes",
+            "shard",
+            "replica",
+            "partition",
+            "object",
+        ] {
+            assert!(json.get(field).is_some(), "section 4 requires `{field}`");
+        }
+        assert_eq!(
+            serde_json::from_value::<PageEntry>(json).unwrap(),
+            a_page_entry()
+        );
+    }
+
+    fn an_inventory() -> PayloadInventory {
+        PayloadInventory {
+            table: "events.hits".into(),
+            batch: "b1".into(),
+            contract_version: "1".into(),
+            git_commit: "deadbeef".into(),
+            mode: SurveyOnly,
+            columns: vec![ColumnInventory {
+                column: "body".into(),
+                class: FreedomClass::Open,
+                classes_matched: vec!["html".into(), "url".into()],
+                rows_matched: 17,
+                samples_hex: vec!["3c7363726970743e".into()],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_payload_inventory_round_trips() {
+        let json = serde_json::to_string(&an_inventory()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PayloadInventory>(&json).unwrap(),
+            an_inventory()
+        );
+        assert!(json.contains("\"mode\":\"survey\""), "{json}");
+    }
+
+    #[test]
+    fn an_inventory_stamped_enforce_is_a_parse_error_not_a_wrong_field() {
+        // Section 8.6: the inventory comes from the survey pass, never a production run -- "a
+        // production run that got far enough to build an inventory has already failed". So this
+        // document cannot exist, and it does not parse.
+        let mut json = serde_json::to_value(an_inventory()).unwrap();
+        json["mode"] = serde_json::Value::String("enforce".into());
+        let err = serde_json::from_value::<PayloadInventory>(json).unwrap_err();
+        assert!(err.to_string().contains("survey"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_key_in_an_inventory_is_a_hard_error() {
+        let mut json = serde_json::to_value(an_inventory()).unwrap();
+        json["extra"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<PayloadInventory>(json).is_err());
+    }
+
+    #[test]
+    fn the_worklist_is_what_scope_gets_fixed_from() {
+        let inv = an_inventory();
+        assert!(!inv.is_clear());
+        assert_eq!(inv.worklist().len(), 1);
+        assert_eq!(inv.worklist()[0].column, "body");
+
+        // Zero matches means the column proceeds -- section 8.6's own rule.
+        let clear = PayloadInventory {
+            columns: Vec::new(),
+            ..an_inventory()
+        };
+        assert!(clear.is_clear());
+    }
+
+    #[test]
+    fn a_match_in_a_closed_column_is_the_escalating_case() {
+        // Not a property of the inventory itself, but the reason the class travels with it: a
+        // payload in a column whose allowlist forbids payload characters means the schema is wrong
+        // or something put it there deliberately.
+        let inv = PayloadInventory {
+            columns: vec![ColumnInventory {
+                column: "ident".into(),
+                class: FreedomClass::Closed,
+                classes_matched: vec!["sql".into()],
+                rows_matched: 1,
+                samples_hex: vec!["27".into()],
+            }],
+            ..an_inventory()
+        };
+        assert!(inv.columns[0].class.escalates_on_match());
     }
 }

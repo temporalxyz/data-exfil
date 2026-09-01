@@ -2346,7 +2346,9 @@ mod tests {
         // A non-contiguous enum with a negative id, which is what catches an implementation that
         // assumes ids are a dense 0..n range.
         assert!(
-            declared.iter().any(|t| t.starts_with("Enum8(") && t.contains("-3")),
+            declared
+                .iter()
+                .any(|t| t.starts_with("Enum8(") && t.contains("-3")),
             "the fixture needs a non-contiguous enum with a negative id"
         );
     }

@@ -102,6 +102,49 @@ impl FromStr for BatchId {
     }
 }
 
+/// A validated GCS bucket name.
+///
+/// Pinned configuration, never derived from data -- but it reaches a URL, so it is validated at
+/// the boundary like every other name that does. GCS's own rules are narrower than this; what
+/// matters here is that nothing outside `[a-z0-9._-]` can reach a request path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketName(String);
+
+impl BucketName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for BucketName {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() < 3 || s.len() > 63 {
+            return Err(format!(
+                "bucket name must be 3-63 characters, got {}",
+                s.len()
+            ));
+        }
+        if !s.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        }) {
+            return Err(format!(
+                "bucket name `{s}` must match ^[a-z0-9._-]{{3,63}}$"
+            ));
+        }
+        if !s.starts_with(|c: char| c.is_ascii_alphanumeric())
+            || !s.ends_with(|c: char| c.is_ascii_alphanumeric())
+        {
+            return Err(format!(
+                "bucket name `{s}` must start and end with a letter or digit"
+            ));
+        }
+        Ok(Self(s.to_owned()))
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "salvage", version, propagate_version = true)]
 #[command(about = "Fail-closed ClickHouse salvage from a compromised cluster")]
@@ -119,6 +162,27 @@ pub struct Common {
     /// Work dir holding the batch's files and report.json
     #[arg(long, global = true, default_value = "./work")]
     pub work: PathBuf,
+
+    /// Directory of pinned `CREATE TABLE` statements. This, not the server, is the authority for
+    /// what a table is (section 4).
+    #[arg(long, global = true, default_value = "./ddl")]
+    pub ddl_dir: PathBuf,
+
+    /// Directory of pinned per-table override files.
+    #[arg(long, global = true, default_value = "./overrides")]
+    pub overrides_dir: PathBuf,
+
+    /// Bucket this invocation reads from or writes to.
+    ///
+    /// Required by `export` and `audit`; `plan`, `secrets` and `teardown` touch no bucket, so it
+    /// is optional here and checked in the dispatcher rather than by clap.
+    #[arg(long, global = true)]
+    pub bucket: Option<BucketName>,
+
+    /// Directory holding resumable-upload sessions, so an interrupted multi-GB page push resumes
+    /// rather than restarting. Defaults to a subdirectory of `--work`.
+    #[arg(long, global = true)]
+    pub session_dir: Option<PathBuf>,
 
     /// Machine-readable result on stdout; the human log always goes to stderr
     #[arg(long, global = true)]

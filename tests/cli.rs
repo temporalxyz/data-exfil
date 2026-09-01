@@ -21,6 +21,12 @@ fn salvage() -> Command {
     Command::cargo_bin("salvage").expect("the `salvage` binary should build")
 }
 
+/// A scratch work dir, so a test that reaches store construction does not create `./work` in the
+/// repo. The `TempDir` must outlive the assertion, hence returning it.
+fn scratch() -> tempfile::TempDir {
+    tempfile::tempdir().expect("tempdir")
+}
+
 #[test]
 fn help_succeeds() {
     salvage().arg("--help").assert().code(0);
@@ -117,15 +123,44 @@ fn plan_is_not_implemented_and_says_so() {
 
 #[test]
 fn export_is_not_implemented_and_says_so() {
+    let work = scratch();
     salvage()
         .args(["export", "--table", "events.hits", "--batch", "b1"])
+        .args(["--bucket", "raw-bucket", "--work"])
+        .arg(work.path())
         .assert()
         .code(3)
         .stderr(predicates::str::contains("not implemented"));
 }
 
 #[test]
+fn a_missing_bucket_is_a_usage_error_not_a_default() {
+    // There is no safe default destination for data pulled off a compromised cluster, so the
+    // absence of `--bucket` is exit 2 rather than a guess. Exit 3 would be wrong too: that class
+    // is resumable, and this is not something a retry fixes.
+    for args in [
+        vec!["export", "--table", "events.hits", "--batch", "b1"],
+        vec![
+            "audit",
+            "--table",
+            "events.hits",
+            "--batch",
+            "b1",
+            "--mode",
+            "enforce",
+        ],
+    ] {
+        salvage()
+            .args(&args)
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains("--bucket"));
+    }
+}
+
+#[test]
 fn audit_is_not_implemented_and_says_so() {
+    let work = scratch();
     salvage()
         .args([
             "audit",
@@ -136,18 +171,71 @@ fn audit_is_not_implemented_and_says_so() {
             "--mode",
             "enforce",
         ])
+        .args(["--bucket", "raw-bucket", "--work"])
+        .arg(work.path())
         .assert()
         .code(3)
         .stderr(predicates::str::contains("not implemented"));
 }
 
 #[test]
-fn secrets_is_not_implemented_and_says_so() {
+fn secrets_writes_a_rotation_inventory_from_pinned_ddl_alone() {
+    // The first subcommand off exit 3. It reads `ddl/` and `overrides/` and touches no cluster,
+    // no bucket and no data, which is what lets it run first at incident time.
+    let work = scratch();
     salvage()
         .arg("secrets")
+        .arg("--work")
+        .arg(work.path())
         .assert()
-        .code(3)
-        .stderr(predicates::str::contains("not implemented"));
+        .code(0);
+
+    let report = work.path().join("SECRETS-ROTATION.md");
+    let text = std::fs::read_to_string(&report).expect("SECRETS-ROTATION.md should exist");
+
+    // Addition A3's scoping rule, which is the part that is easy to get wrong: the attacker had
+    // root, so dropped columns are in scope too.
+    assert!(text.contains("could* hold"), "{text}");
+    assert!(
+        text.contains("source_url"),
+        "a dropped column must still be listed"
+    );
+    // Section A3 names Q1's own read-only user, which is in nobody's schema.
+    assert!(text.contains("read-only user"), "{text}");
+    assert!(text.contains("ROTATION_SIGNOFF"), "{text}");
+}
+
+#[test]
+fn secrets_refuses_rather_than_reporting_nothing_when_the_ddl_dir_is_missing() {
+    // An empty inventory and an unreadable one look identical downstream, and only one of them
+    // means "no secrets". This is exit 2: no retry fixes a path that is not there.
+    let work = scratch();
+    salvage()
+        .arg("secrets")
+        .args(["--ddl-dir", "/nonexistent/pinned"])
+        .arg("--work")
+        .arg(work.path())
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn secrets_emits_machine_readable_counts_under_json() {
+    let work = scratch();
+    let out = salvage()
+        .args(["secrets", "--json", "--work"])
+        .arg(work.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert!(doc["summary"]["tables"].as_u64().unwrap() >= 1);
+    assert!(
+        doc["report"]
+            .as_str()
+            .unwrap()
+            .ends_with("SECRETS-ROTATION.md")
+    );
 }
 
 #[test]
@@ -163,7 +251,10 @@ fn teardown_is_not_implemented_and_says_so() {
 fn no_subcommand_ever_exits_zero_for_work_it_did_not_do() {
     // The invariant behind all of the above, asserted directly so it survives the individual
     // assertions being flipped one at a time.
-    let cases: [&[&str]; 5] = [
+    // `secrets` left this list at step 4: it now does its work and exits 0 for it. That is the
+    // progress metric -- the list shrinks as phases become real, and never because an assertion
+    // was relaxed.
+    let cases: [&[&str]; 4] = [
         &["plan", "--table", "events.hits"],
         &["export", "--table", "events.hits", "--batch", "b1"],
         &[
@@ -175,7 +266,6 @@ fn no_subcommand_ever_exits_zero_for_work_it_did_not_do() {
             "--mode",
             "enforce",
         ],
-        &["secrets"],
         &["teardown", "--table", "events.hits", "--batch", "b1"],
     ];
     for args in cases {

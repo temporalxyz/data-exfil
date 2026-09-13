@@ -113,8 +113,8 @@ incident indicators still apply. Malformed encoding, wrong length, non-string sc
 conflicting semantic override stop the run. Original encoded values are preserved.
 
 General SQL/shell and other text payload patterns are not applied to these opaque signature
-bytes or to speculative decodings of their encoded text. Other text columns retain the full scanner,
-except for the explicitly typed public keys below.
+bytes or to speculative decodings of their encoded text. The general recognition rule below
+also applies to other native string fields.
 This checks signature representation, not cryptographic validity or transaction authenticity.
 Use `SolanaSignature` in optional `types` rules for signature fields with other names.
 
@@ -132,3 +132,23 @@ a valid base58 address may also parse as base64 and produce unrelated punctuatio
 The reported `GRp3fBQ9DAt4J34Cduqrb4eWuUQfN7UutoMNxYai4RYg` is covered by a regression test.
 This validates representation only; it does not establish ownership or require an on-curve
 address. Use `SolanaPublicKey` in optional `types` rules for other public-key column names.
+
+## Recognition independent of column name
+
+By operator instruction, each native string value, including nested string leaves, is checked
+for canonical base58 encoding of exactly 32 bytes (Solana address), or canonical base58 or
+standard/URL-safe base64 encoding of exactly 64 bytes (Solana signature). Matching values are
+assumed to be opaque Solana data and skip generic payload scanning regardless of column name.
+This includes `pool_id`; names do not need to be added individually. The original value is
+preserved. FIELD-AUDIT.json identifies eligible string fields with `recognizes_solana_encodings`.
+
+All declared validators, nullability, field caps, explicit patterns and semantic refinements
+still apply. Incident indicators are checked against both the original and decoded bytes.
+Nonmatching values keep the full scanner; malformed values in explicitly typed Solana columns
+still stop. Binary fields and the legacy TSV audit do not use this heuristic.
+
+This is an accepted representation assumption, not proof of authenticity or absence of a
+payload: an attacker could encode a payload with a matching decoded length. Length alone does
+not establish safety, and short base64 payloads can contain SQL or shell syntax. Tests cover
+reported addresses, opaque signature representations, explicit constraints/indicators and
+short encoded injections that remain findings.

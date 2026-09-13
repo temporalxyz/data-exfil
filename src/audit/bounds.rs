@@ -172,9 +172,9 @@ pub fn check_value_precompiled(
     check_value_impl(contract, field, limits, page, row, pattern, true)
 }
 
-/// Validate a native scalar's generated representation without treating it as source text.
-/// Callers must ensure the underlying value is not a string or binary field.
-pub(crate) fn check_native_scalar_precompiled(
+/// Validate type and explicit field constraints without the generic text payload scanner.
+/// Callers must establish a native scalar or an explicitly allowed opaque representation.
+pub(crate) fn check_constraints_precompiled(
     contract: &ColumnContract,
     field: &Field,
     limits: &Limits,

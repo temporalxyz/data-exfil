@@ -29,6 +29,7 @@ struct Node {
     iocs: Option<Arc<regex::bytes::RegexSet>>,
     binary: bool,
     encoded: Option<EncodedField>,
+    recognize_solana: bool,
 }
 
 fn inner(ty: &Ch) -> (&Ch, bool) {
@@ -215,6 +216,7 @@ fn configure_native(
     iocs: &Option<Arc<regex::bytes::RegexSet>>,
 ) -> Result<()> {
     node.iocs = iocs.clone();
+    node.recognize_solana = !node.binary && node.scalar.is_some();
     if let Some(scalar) = &mut node.scalar {
         if node.binary && matches!(node.ty, Ch::String) {
             scalar.validator = Validator::HexAny;
@@ -526,6 +528,7 @@ impl Node {
             children,
             iocs: None,
             encoded: None,
+            recognize_solana: false,
             binary: matches!(
                 dt,
                 DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
@@ -612,10 +615,21 @@ impl Node {
                     | DataType::LargeBinary
                     | DataType::FixedSizeBinary(_)
             );
-            let check = if source_text {
+            // Operator-approved representation heuristic for string leaves, including nested
+            // fields. Still run the complete declared validator and explicit constraints.
+            let opaque_solana = if self.recognize_solana
+                && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+            {
+                decode_solana_public_key(&raw)
+                    .map(|b| b.to_vec())
+                    .or_else(|| decode_solana_signature(&raw).map(|b| b.to_vec()))
+            } else {
+                None
+            };
+            let check = if source_text && opaque_solana.is_none() {
                 bounds::check_value_precompiled
             } else {
-                bounds::check_native_scalar_precompiled
+                bounds::check_constraints_precompiled
             };
             if let Some(finding) = check(
                 contract,
@@ -628,7 +642,9 @@ impl Node {
                 emit(finding)?;
             }
             if let Some(iocs) = &self.iocs {
-                let matched = if source_text {
+                let matched = if let Some(decoded) = &opaque_solana {
+                    iocs.is_match(&raw) || iocs.is_match(decoded)
+                } else if source_text {
                     payloads::scan_with_iocs(&raw, limits, Some(iocs))?
                         .classes
                         .contains(&"ioc_canary")
@@ -641,7 +657,7 @@ impl Node {
             }
             // Hex is only a validator representation. Scan actual blob bytes too: encoding a
             // payload into hex must never conceal it from the shared injection catalogue.
-            if is_hex {
+            if is_hex && opaque_solana.is_none() {
                 let scan = payloads::scan(&raw, limits)?;
                 if !scan.is_clean() {
                     emit(self.finding(
@@ -738,6 +754,8 @@ pub struct FieldAudit {
     pub pattern: Option<String>,
     pub max_len: Option<u32>,
     pub opaque_binary: bool,
+    #[serde(default)]
+    pub recognizes_solana_encodings: bool,
     pub enum_ids: Option<Vec<i16>>,
 }
 
@@ -754,6 +772,8 @@ impl Contract {
                     pattern: scalar.pattern.clone(),
                     max_len: scalar.max_len,
                     opaque_binary: node.binary,
+                    recognizes_solana_encodings: node.recognize_solana
+                        && matches!(node.ty, Ch::String | Ch::FixedString(_)),
                     enum_ids: match &scalar.validator {
                         Validator::EnumId { ids } => Some(ids.clone()),
                         _ => None,

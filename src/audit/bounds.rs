@@ -147,6 +147,28 @@ pub fn check_value(
     page: u32,
     row: u64,
 ) -> Result<Option<Finding>> {
+    let pattern = contract
+        .pattern
+        .as_deref()
+        .map(column_pattern)
+        .transpose()?;
+    check_value_precompiled(contract, field, limits, page, row, pattern)
+}
+
+/// Compile a pinned pattern before entering a parallel value loop.
+pub fn prepare_pattern(contract: &ColumnContract) -> Result<Option<&'static Regex>> {
+    contract.pattern.as_deref().map(column_pattern).transpose()
+}
+
+/// The same checks as `check_value`, with no pattern-cache lock in the value loop.
+pub fn check_value_precompiled(
+    contract: &ColumnContract,
+    field: &Field,
+    limits: &Limits,
+    page: u32,
+    row: u64,
+    pattern: Option<&Regex>,
+) -> Result<Option<Finding>> {
     let finding = |reason: &str, escalate: bool, sample: &[u8]| Finding {
         phase: "bounds".to_owned(),
         column: Some(contract.name.clone()),
@@ -205,8 +227,8 @@ pub fn check_value(
         }
     }
 
-    if let Some(pattern) = &contract.pattern
-        && !column_pattern(pattern)?.is_match(bytes)
+    if let Some(pattern) = pattern
+        && !pattern.is_match(bytes)
     {
         return Ok(Some(finding(
             "value does not match its per-column pattern",

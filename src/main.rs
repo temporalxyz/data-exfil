@@ -78,6 +78,8 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Command::Plan(args) => cmd_plan(cli, args),
         Command::Export(args) => cmd_export(cli, args),
         Command::Audit(args) => cmd_audit(cli, args),
+        Command::AuditParquet(args) => salvage::parquet_audit::command(&cli.common, args),
+        Command::ParquetWorker { job } => salvage::parquet_audit::worker_command(job),
         Command::Secrets => cmd_secrets(cli),
         Command::Teardown(args) => cmd_teardown(cli, args),
     }

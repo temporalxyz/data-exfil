@@ -86,6 +86,19 @@ fn check_resumable(opts: &ExportOptions) -> Result<()> {
     Ok(())
 }
 
+/// Stamp the batch unresumable *before* the work begins.
+///
+/// `record_outcome` runs only on a normal return, so a panic in `run_export_inner` -- which `main`
+/// catches and maps to exit 1, a finding -- would unwind straight past it and leave the outcome
+/// file absent or stale. A later `--resume` would then pass `check_resumable` and continue, and
+/// because the source is live and the cutoff is a `WHERE` rather than a freeze, the input that
+/// panicked need not come back -- delivering exactly the subset section 8.0 forbids. Writing
+/// "abort" up front makes the resumable state fail-closed: only a clean return can lift it.
+fn record_pending(opts: &ExportOptions) {
+    let _ = std::fs::create_dir_all(&opts.work);
+    let _ = std::fs::write(outcome_path(opts), "abort");
+}
+
 /// Record how this run ended, so a later `--resume` can refuse to continue past a finding.
 fn record_outcome(opts: &ExportOptions, result: &Result<PagesJson>) {
     let verdict = match result {
@@ -121,6 +134,9 @@ pub fn run_export(
     opts: &ExportOptions,
 ) -> Result<PagesJson> {
     check_resumable(opts)?;
+    // Fail-closed before any work: a panic below never returns through `record_outcome`, so the
+    // batch is marked unresumable up front and only a clean return relaxes it.
+    record_pending(opts);
     let result = run_export_inner(ddl, overrides, runner, store, facts, rows_per_page, opts);
     record_outcome(opts, &result);
     result
@@ -642,6 +658,42 @@ mod tests {
             },
         )
         .unwrap_or_else(|e| panic!("an infra outcome must stay resumable: {e}"));
+    }
+
+    #[test]
+    fn a_run_that_panics_leaves_an_unresumable_batch() {
+        // `record_outcome` runs only on a normal return, so a panic in `run_export_inner` -- which
+        // `main` maps to exit 1, a finding -- would unwind past it and leave no "abort" recorded,
+        // silently permitting a resume that skips the input that panicked. `record_pending` stamps
+        // the batch unresumable before the work starts; this reproduces that state directly, since
+        // an in-process panic would poison the test harness.
+        let dir = tempfile::tempdir().unwrap();
+        let base = opts(dir.path());
+
+        // What run_export writes before it calls the inner pipeline. If the inner had panicked,
+        // this is the state left behind: no clean return ever overwrote it.
+        record_pending(&base);
+        assert_eq!(
+            std::fs::read_to_string(outcome_path(&base)).unwrap().trim(),
+            "abort"
+        );
+
+        let resumed = ExportOptions {
+            resume: true,
+            ..opts(dir.path())
+        };
+        let refused = check_resumable(&resumed)
+            .err()
+            .unwrap_or_else(|| panic!("a resume after a panic must be refused"));
+        assert_eq!(
+            refused.exit_code(),
+            crate::abort::ExitCode::Usage,
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("cannot be resumed"),
+            "{refused}"
+        );
     }
 
     #[test]

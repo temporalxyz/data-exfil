@@ -34,7 +34,14 @@ fn help_succeeds() {
 
 #[test]
 fn every_subcommand_has_help() {
-    for sub in ["plan", "export", "audit", "secrets", "teardown"] {
+    for sub in [
+        "plan",
+        "export",
+        "audit",
+        "audit-parquet",
+        "secrets",
+        "teardown",
+    ] {
         salvage().args([sub, "--help"]).assert().code(0);
     }
 }

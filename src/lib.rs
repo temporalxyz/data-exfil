@@ -20,6 +20,7 @@ pub mod gcs;
 pub mod limits;
 pub mod models;
 pub mod pages;
+pub mod parquet_audit;
 pub mod teardown;
 
 /// Test doubles: fake and hostile query sources, a local object store, and a byte-level tar

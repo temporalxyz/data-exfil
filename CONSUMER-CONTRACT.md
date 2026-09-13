@@ -1,5 +1,9 @@
 # Consumer contract
 
+This document describes the existing TSV quarantine output. Native output from `audit-parquet`
+uses the separate [Parquet contract](PARQUET.md), including native types, day manifests, and no
+ClickHouse insert preflight. Independent revalidation and preservation of provenance still apply.
+
 **Read this before loading a salvaged table.**
 
 This data came out of a cluster on which an attacker had root. It has been structurally validated,

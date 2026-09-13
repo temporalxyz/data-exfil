@@ -2,6 +2,11 @@
 
 Fail-closed extraction of critical tables from a compromised ClickHouse cluster.
 
+For already-exported **S3 Parquet partitioned by day**, use
+[`salvage audit-parquet`](PARQUET.md). It audits native values with the existing bounds and
+injection/payload checks, regenerates Parquet, and overlaps independent days' downloads,
+checks, and uploads on one Linux server. It does not use TSV or run a ClickHouse insert test.
+
 Implements the **Selective ClickHouse Data Salvage Plan (v-final, 25 Aug 2026)** for a two-host
 topology. Read `DEVIATIONS.md` before trusting anything here to match the source document, and
 `CONSUMER-CONTRACT.md` before loading the output.

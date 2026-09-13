@@ -138,6 +138,7 @@ pub fn encode_field(field: &Field) -> Vec<u8> {
             0x0A => out.extend_from_slice(b"\\n"),
             0x09 => out.extend_from_slice(b"\\t"),
             0x00 => out.extend_from_slice(b"\\0"),
+            b'\'' => out.extend_from_slice(b"\\'"),
             b'\\' => out.extend_from_slice(b"\\\\"),
             other => out.push(other),
         }
@@ -267,6 +268,7 @@ mod tests {
             &[0x00, 0x08, 0x09, 0x0A, 0x0C, 0x0D][..],
             &b"tab\there"[..],
             &b"back\\slash"[..],
+            &b"it's a quote"[..],
         ] {
             let field = Field::Value(original.to_vec());
             let encoded = encode_field(&field);
@@ -285,6 +287,19 @@ mod tests {
         let literal = Field::Value(b"\\N".to_vec());
         assert_eq!(encode_field(&literal), b"\\\\N".to_vec());
         assert_ne!(encode_field(&literal), encode_field(&Field::Null));
+    }
+
+    #[test]
+    fn a_single_quote_encodes_canonically_and_matches_the_decoder() {
+        // ClickHouse's TabSeparated output escapes `'` to `\'` (writeEscapedString), and the
+        // decoder accepts `\'`. The encoder must produce the same canonical form, or the
+        // regenerated file carries a bare `'` that no ClickHouse export would emit and the value
+        // `'` ends up with two accepted wire encodings.
+        assert_eq!(encode_field(&Field::Value(b"'".to_vec())), b"\\'".to_vec());
+        assert_eq!(
+            decode_field(&encode_field(&Field::Value(b"a'b".to_vec()))).unwrap(),
+            Field::Value(b"a'b".to_vec())
+        );
     }
 
     #[test]

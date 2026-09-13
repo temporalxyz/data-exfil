@@ -313,6 +313,14 @@ pub enum Command {
     /// payload-catalogue match, or any insert that does not load cleanly.
     Audit(AuditArgs),
 
+    /// Audit native Parquet from S3, processing independent days concurrently.
+    /// Applies pinned schema, field bounds and injection/payload checks. Regenerates Parquet;
+    /// does not perform a ClickHouse insert test. A finding rejects the entire day.
+    AuditParquet(Box<ParquetArgs>),
+
+    #[command(hide = true)]
+    ParquetWorker { job: PathBuf },
+
     /// Inventory which columns can hold a credential. Run at incident time; touches no data.
     ///
     /// PROVES: nothing about the data. It is an inventory, not a check.
@@ -383,6 +391,65 @@ pub struct AuditArgs {
     /// Container runtime for the dummy ClickHouse used by the insert test.
     #[arg(long, value_enum, default_value_t = Runner::Docker)]
     pub runner: Runner,
+}
+
+#[derive(Debug, Args)]
+pub struct ParquetArgs {
+    #[command(flatten)]
+    pub table: TableArg,
+    #[command(flatten)]
+    pub batch: BatchArg,
+    /// Root before YYYY/MM/DD/table/. Must be s3://bucket/prefix.
+    #[arg(long)]
+    pub source: String,
+    /// Clean root. Batch/YYYY/MM/DD/table/ is appended. A separate bucket is required.
+    #[arg(long)]
+    pub destination: String,
+    /// Inclusive YYYY-MM-DD.
+    #[arg(long)]
+    pub from: String,
+    /// Inclusive YYYY-MM-DD.
+    #[arg(long)]
+    pub through: String,
+    #[arg(long, value_enum)]
+    pub mode: Mode,
+    #[arg(long, default_value_t = 4)]
+    pub day_concurrency: usize,
+    #[arg(long, default_value_t = 8)]
+    pub download_concurrency: usize,
+    /// Defaults to the number of available CPU cores.
+    #[arg(long)]
+    pub check_concurrency: Option<usize>,
+    #[arg(long, default_value_t = 4)]
+    pub upload_concurrency: usize,
+    /// Total pipeline memory budget, in bytes; includes transfer and check reservations.
+    #[arg(long)]
+    pub memory_bytes: u64,
+    /// Address-space ceiling per isolated validation worker (Linux).
+    #[arg(long, default_value_t = 1073741824)]
+    pub worker_memory_bytes: u64,
+    /// Total scratch reservation, in bytes.
+    #[arg(long)]
+    pub scratch_bytes: u64,
+    /// Maximum scratch used by one admitted day, including raw and regenerated data.
+    #[arg(long)]
+    pub max_day_scratch_bytes: u64,
+    #[arg(long, default_value_t = 8192)]
+    pub batch_rows: usize,
+    #[arg(long, default_value_t = 67108864)]
+    pub row_group_bytes: u64,
+    #[arg(long, default_value_t = 536870912)]
+    pub output_chunk_bytes: u64,
+    #[arg(long)]
+    pub source_profile: Option<String>,
+    #[arg(long)]
+    pub destination_profile: Option<String>,
+    #[arg(long)]
+    pub resume: bool,
+    #[arg(long)]
+    pub shape_review_signoff: bool,
+    #[arg(long)]
+    pub rotation_signoff: bool,
 }
 
 #[derive(Debug, Args)]

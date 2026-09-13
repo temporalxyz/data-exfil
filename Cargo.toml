@@ -29,6 +29,15 @@ tar                   = "0.4"
 base64                = "0.22"
 percent-encoding      = "2"
 unicode-normalization = "0.1"
+arrow-array           = "56.2"
+arrow-cast            = "56.2"
+arrow-schema          = { version = "56.2", features = ["serde"] }
+parquet               = { version = "56.2", default-features = false, features = ["arrow", "snap", "flate2-zlib-rs", "lz4", "zstd"] }
+aws-config            = "1"
+aws-sdk-s3            = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "default-https-client"] }
+tokio                 = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util", "time", "process"] }
+futures               = "0.3"
+rlimit                = "0.10"
 # Automatic decompression is deliberately NOT enabled: the raw bytes are what we hash, and the
 # "exactly one gzip member, no trailing bytes" check is impossible if the transport already
 # decompressed. rustls rather than native-tls so there is no OpenSSL coupling on either host.
@@ -38,6 +47,9 @@ reqwest               = { version = "0.12", default-features = false, features =
 assert_cmd = "2"
 predicates = "3"
 tempfile   = "3"
+aws-smithy-http-client = { version = "1.1.9", features = ["test-util"] }
+aws-smithy-types = "1.4.3"
+http = "1"
 
 [profile.release]
 overflow-checks = true      # wrapping arithmetic in a bounds validator is a silent wrong answer

@@ -26,6 +26,13 @@ type authority, as requested; no SQL DDL is read by the Parquet CLI.
 | 8.7 no value repair | No stripping, coercion, row dropping or deduplication. Only explicit column drops; original typed values are used to regenerate output. |
 | Rejection accounting | Hex-only samples and first finding's column/row/reason; successful partition field rules and profile, and run RESULT.json/report.json. A stopped run is not a complete payload inventory. |
 
+Payload catalogue scanning and decoded variants apply to source text and binary fields,
+subject to the explicit Solana contracts below. Native numeric, Boolean and temporal scalars
+retain type/range, nullability, byte caps and explicit pattern/length checks, but their generated
+validator representations are not speculatively decoded as text. Explicit incident indicators
+are still checked against those representations. In particular, a Float64's generated hex bits
+must not be interpreted as base64 payload text; output preserves the original float bits.
+
 Native type assurance is **not original ClickHouse semantic assurance**. Parquet Int16 does not
 supply an enum allowlist, UTF-8 does not declare “UUID” or “identifier”, and fixed binary does not
 unambiguously mean UInt128/UUID/serialized state. Dictionary encoding is compression, not an

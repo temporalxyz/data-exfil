@@ -169,6 +169,31 @@ pub fn check_value_precompiled(
     row: u64,
     pattern: Option<&Regex>,
 ) -> Result<Option<Finding>> {
+    check_value_impl(contract, field, limits, page, row, pattern, true)
+}
+
+/// Validate a native scalar's generated representation without treating it as source text.
+/// Callers must ensure the underlying value is not a string or binary field.
+pub(crate) fn check_native_scalar_precompiled(
+    contract: &ColumnContract,
+    field: &Field,
+    limits: &Limits,
+    page: u32,
+    row: u64,
+    pattern: Option<&Regex>,
+) -> Result<Option<Finding>> {
+    check_value_impl(contract, field, limits, page, row, pattern, false)
+}
+
+fn check_value_impl(
+    contract: &ColumnContract,
+    field: &Field,
+    limits: &Limits,
+    page: u32,
+    row: u64,
+    pattern: Option<&Regex>,
+    scan_payloads: bool,
+) -> Result<Option<Finding>> {
     let finding = |reason: &str, escalate: bool, sample: &[u8]| Finding {
         phase: "bounds".to_owned(),
         column: Some(contract.name.clone()),
@@ -235,6 +260,10 @@ pub fn check_value_precompiled(
             contract.class.escalates_on_match(),
             bytes,
         )));
+    }
+
+    if !scan_payloads {
+        return Ok(None);
     }
 
     // Section 8.6, after decoding and after normalisation, on both forms.

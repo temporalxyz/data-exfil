@@ -2038,3 +2038,60 @@ fn token_contract_retains_nullability_incident_checks_and_explicit_constraints()
     );
     assert!(file::check(&native_job(dir.path(), &b)).is_err());
 }
+
+#[test]
+fn native_float_bits_are_not_speculatively_decoded_as_text() {
+    let bits = 0x4040269a554773c9;
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("markout_0s_bps", DataType::Float64, false)],
+        vec![Arc::new(Float64Array::from(vec![f64::from_bits(bits)]))],
+    );
+    let mut j = native_job(dir.path(), &b);
+    let checked = file::check(&j).unwrap();
+    let output = ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+    )
+    .unwrap()
+    .build()
+    .unwrap()
+    .next()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        output
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+            .to_bits(),
+        bits
+    );
+
+    // Explicit incident rules still apply to the validated scalar representation.
+    j.native_policy
+        .as_mut()
+        .unwrap()
+        .iocs
+        .push("4040269a554773c9".into());
+    assert!(file::check(&j).is_err());
+    j.native_policy.as_mut().unwrap().iocs.clear();
+    j.overrides.columns.insert(
+        "markout_0s_bps".into(),
+        crate::models::ColumnOverride {
+            class: crate::models::FreedomClass::Closed,
+            rotation_owner: None,
+            pattern: None,
+            max_len: Some(3),
+            enum_ids: None,
+            hex: false,
+            drop: false,
+        },
+    );
+    assert!(file::check(&j).is_err());
+
+    // Identical bytes supplied as text must still reach the full payload scanner.
+    let dir = tempfile::tempdir().unwrap();
+    assert!(file::check(&native_job(dir.path(), &text_batch(&["4040269a554773c9"]))).is_err());
+}

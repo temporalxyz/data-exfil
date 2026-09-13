@@ -95,3 +95,17 @@ enum, pattern and length checks; decimal/date/physical-integer bounds; nested/bi
 schema drift across days and fresh controllers; global panic/finding stop and resume refusal;
 and verification against a clean-store implementation that rejects every operation. Linux
 integration tests execute the actual isolated worker, including memory-limit failures.
+
+## Solana signature columns
+
+By operator instruction, every top-level column named exactly `signature` uses the
+`SolanaSignature` contract in every native Parquet table, without a policy file. The field must
+be a string containing canonical base58 or standard/URL-safe base64 (padded or unpadded), decoding
+to exactly 64 bytes. Native nullability, field caps, optional patterns/length limits and explicit
+incident indicators still apply. Malformed encoding, wrong length, non-string schemas or a
+conflicting semantic override stop the run. Original encoded values are preserved.
+
+General SQL/shell and other text payload patterns are not applied to these opaque signature
+bytes or to speculative decodings of their encoded text. Other columns retain the full scanner.
+This checks signature representation, not cryptographic validity or transaction authenticity.
+Use `SolanaSignature` in optional `types` rules for signature fields with other names.

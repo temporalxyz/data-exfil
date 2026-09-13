@@ -28,6 +28,7 @@ struct Node {
     children: Vec<Node>,
     iocs: Option<Arc<regex::bytes::RegexSet>>,
     binary: bool,
+    solana_signature: bool,
 }
 
 fn inner(ty: &Ch) -> (&Ch, bool) {
@@ -133,7 +134,24 @@ pub fn build_native(
         }
         crate::clickhouse::types::Ident::new(name)?;
         let inferred = native_type(field, &overrides.limits, 1)?;
-        let ty = if let Some(semantic) = policy.types.get(name) {
+        // Operator-selected contract for every column with this exact name, across tables.
+        let signature = name == "signature"
+            || policy
+                .types
+                .get(name)
+                .is_some_and(|t| t == "SolanaSignature");
+        if name == "signature"
+            && policy
+                .types
+                .get(name)
+                .is_some_and(|t| t != "SolanaSignature")
+        {
+            return usage("signature columns require the SolanaSignature contract");
+        }
+        if signature && !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+            return usage("SolanaSignature requires a native string field");
+        }
+        let ty = if let Some(semantic) = policy.types.get(name).filter(|_| !signature) {
             let ty = crate::clickhouse::types::parse_type(semantic)?;
             if field.is_nullable() {
                 Ch::Nullable(Box::new(ty))
@@ -151,7 +169,14 @@ pub fn build_native(
             over,
             &overrides.limits,
         )?;
+        if signature && over.is_some_and(|o| o.hex || o.enum_ids.is_some()) {
+            return usage("SolanaSignature cannot use hex or enum overrides");
+        }
+        node.solana_signature = signature;
         configure_native(&mut node, over, &iocs)?;
+        if signature {
+            node.scalar.as_mut().unwrap().class = FreedomClass::Closed;
+        }
         if over.is_some_and(|o| o.drop) {
             continue;
         }
@@ -197,7 +222,8 @@ fn configure_native(
             if matches!(
                 scalar.class,
                 FreedomClass::Closed | FreedomClass::Constrained
-            ) && scalar.pattern.is_none()
+            ) && !node.solana_signature
+                && scalar.pattern.is_none()
                 && !over.is_some_and(|o| o.drop || o.hex)
             {
                 return usage(
@@ -495,6 +521,7 @@ impl Node {
             pattern,
             children,
             iocs: None,
+            solana_signature: false,
             binary: matches!(
                 dt,
                 DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
@@ -528,6 +555,36 @@ impl Node {
                 return emit(self.finding(file, row, "value exceeds pinned field byte cap", &raw));
             }
             *remaining -= raw.len() as u64;
+            if self.solana_signature {
+                let Some(decoded) = decode_solana_signature(&raw) else {
+                    return emit(self.finding(file, row, "Solana signature must be canonical base58 or base64 encoding of exactly 64 bytes", &raw));
+                };
+                if contract.max_len.is_some_and(|cap| raw.len() > cap as usize)
+                    || self.pattern.is_some_and(|p| !p.is_match(&raw))
+                {
+                    return emit(self.finding(
+                        file,
+                        row,
+                        "Solana signature violates its explicit field constraints",
+                        &raw,
+                    ));
+                }
+                // Signature bytes are opaque, not text to run through speculative decoders.
+                // Keep explicitly supplied incident indicators on both exact representations.
+                if self
+                    .iocs
+                    .as_ref()
+                    .is_some_and(|i| i.is_match(&raw) || i.is_match(&decoded))
+                {
+                    return emit(self.finding(
+                        file,
+                        row,
+                        "payload catalogue match: ioc_canary in Solana signature",
+                        &raw,
+                    ));
+                }
+                return Ok(());
+            }
             let is_hex = matches!(
                 contract.validator,
                 Validator::HexAny | Validator::HexExact { .. }
@@ -661,7 +718,11 @@ impl Contract {
             if let Some(scalar) = &node.scalar {
                 result.push(FieldAudit {
                     column: node.name.clone(),
-                    validated_type: node.ty.canonical(),
+                    validated_type: if node.solana_signature {
+                        "SolanaSignature(base58|base64,64 bytes)".into()
+                    } else {
+                        node.ty.canonical()
+                    },
                     class: scalar.class,
                     pattern: scalar.pattern.clone(),
                     max_len: scalar.max_len,
@@ -878,4 +939,32 @@ fn decimal(raw: String, scale: i8) -> Result<String> {
         &padded[..split],
         &padded[split..]
     ))
+}
+
+/// A structural signature contract, not cryptographic transaction verification.
+fn decode_solana_signature(raw: &[u8]) -> Option<[u8; 64]> {
+    use base64::Engine as _;
+    if !(64..=88).contains(&raw.len()) {
+        return None;
+    }
+    let mut bytes = [0u8; 64];
+    if bs58::decode(raw).onto(&mut bytes).ok() == Some(64)
+        && bs58::encode(bytes).into_string().as_bytes() == raw
+    {
+        return Some(bytes);
+    }
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        if let Ok(decoded) = engine.decode(raw)
+            && decoded.len() == 64
+            && engine.encode(&decoded).as_bytes() == raw
+        {
+            return decoded.try_into().ok();
+        }
+    }
+    None
 }

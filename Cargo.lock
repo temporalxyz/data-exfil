@@ -2546,6 +2546,7 @@ dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-types",
  "base64",
+ "bs58",
  "clap",
  "clap-verbosity-flag",
  "crc32c",

@@ -1803,3 +1803,146 @@ fn global_stop_cancels_an_active_transfer_not_only_queued_work() {
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(dir.path().join("STOP.json").exists());
 }
+
+#[test]
+fn solana_signatures_accept_base58_and_base64_without_scanning_binary_as_text() {
+    use base64::Engine as _;
+    let mut bytes = [0xabu8; 64];
+    bytes[..12].copy_from_slice(b"';$(hello)--");
+    let mut values = vec![
+        bs58::encode(bytes).into_string(),
+        bs58::encode([0u8; 64]).into_string(),
+    ];
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        values.push(engine.encode(bytes));
+    }
+    for value in &values {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("signature", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value.as_str()]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.native_policy
+            .as_mut()
+            .unwrap()
+            .types
+            .insert("signature".into(), "SolanaSignature".into());
+        let checked = file::check(&j).unwrap();
+        assert_eq!(
+            checked.field_audits[0].class,
+            crate::models::FreedomClass::Closed
+        );
+        assert!(
+            checked.field_audits[0]
+                .validated_type
+                .starts_with("SolanaSignature")
+        );
+        let output = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            output
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            value
+        );
+    }
+    // The same base64 remains a finding in a text field.
+    let dir = tempfile::tempdir().unwrap();
+    let text = base64::engine::general_purpose::STANDARD.encode(bytes);
+    assert!(file::check(&native_job(dir.path(), &text_batch(&[&text]))).is_err());
+}
+
+#[test]
+fn malformed_signatures_and_explicit_incident_indicators_still_stop() {
+    use base64::Engine as _;
+    let valid = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+    let invalid = vec![
+        String::new(),
+        "<script>".into(),
+        "a".repeat(128),
+        "0".repeat(88),
+        format!(" {valid}"),
+        format!("{valid}\n"),
+        bs58::encode([1u8; 63]).into_string(),
+        bs58::encode([1u8; 65]).into_string(),
+        base64::engine::general_purpose::STANDARD.encode([1u8; 63]),
+        base64::engine::general_purpose::STANDARD.encode([1u8; 65]),
+    ];
+    for value in invalid {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("signature", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.native_policy
+            .as_mut()
+            .unwrap()
+            .types
+            .insert("signature".into(), "SolanaSignature".into());
+        assert!(file::check(&j).is_err());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("signature", DataType::Utf8, false)],
+        vec![Arc::new(StringArray::from(vec![valid.clone()]))],
+    );
+    let mut j = native_job(dir.path(), &b);
+    j.native_policy
+        .as_mut()
+        .unwrap()
+        .types
+        .insert("signature".into(), "SolanaSignature".into());
+    j.native_policy.as_mut().unwrap().iocs.push(valid);
+    assert!(file::check(&j).is_err());
+}
+
+#[test]
+fn every_signature_column_uses_the_contract_without_table_policy() {
+    for value in [
+        bs58::encode([42u8; 64]).into_string(),
+        "notasignature".into(),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("signature", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value.as_str()]))],
+        );
+        let j = native_job(dir.path(), &b);
+        assert_eq!(file::check(&j).is_ok(), value != "notasignature");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("signature", DataType::UInt64, false)],
+        vec![Arc::new(UInt64Array::from(vec![1]))],
+    );
+    assert!(file::check(&native_job(dir.path(), &b)).is_err());
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("signature", DataType::Utf8, false)],
+        vec![Arc::new(StringArray::from(vec!["arbitrary text"]))],
+    );
+    let mut j = native_job(dir.path(), &b);
+    j.native_policy
+        .as_mut()
+        .unwrap()
+        .types
+        .insert("signature".into(), "String".into());
+    assert!(file::check(&j).is_err());
+}

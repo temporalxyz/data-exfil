@@ -120,7 +120,7 @@ Use `SolanaSignature` in optional `types` rules for signature fields with other 
 
 ## Solana token public keys
 
-Every top-level `token_a` and `token_b` column uses `SolanaPublicKey` across native Parquet
+Every top-level `token_a`, `token_b` and `fee_payer` column uses `SolanaPublicKey` across native Parquet
 tables. These must be native strings containing canonical base58 that decodes to exactly
 32 bytes. Base64-only values, malformed encodings, wrong lengths and conflicting semantic
 overrides stop the run. Native nullability, byte caps, explicit patterns/length limits and

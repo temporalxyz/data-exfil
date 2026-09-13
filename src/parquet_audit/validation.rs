@@ -137,7 +137,7 @@ pub fn build_native(
         // Operator-selected contracts, scoped to these exact top-level column names.
         let default_type = match name.as_str() {
             "signature" => Some("SolanaSignature"),
-            "token_a" | "token_b" => Some("SolanaPublicKey"),
+            "token_a" | "token_b" | "fee_payer" => Some("SolanaPublicKey"),
             _ => None,
         };
         let explicit = policy.types.get(name).map(String::as_str);

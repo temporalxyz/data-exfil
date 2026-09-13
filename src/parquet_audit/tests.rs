@@ -1950,7 +1950,11 @@ fn every_signature_column_uses_the_contract_without_table_policy() {
 #[test]
 fn solana_token_columns_accept_the_reported_address_without_speculative_base64() {
     let address = "GRp3fBQ9DAt4J34Cduqrb4eWuUQfN7UutoMNxYai4RYg";
-    for name in ["token_a", "token_b"] {
+    for (name, address) in [
+        ("token_a", address),
+        ("token_b", address),
+        ("fee_payer", "4L5zPGkon8deynjyxuHj7ZRUnFB8vkg4KS3PABsLy8GH"),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let b = batch(
             vec![Field::new(name, DataType::Utf8, false)],
@@ -2001,11 +2005,13 @@ fn token_columns_reject_malformed_wrong_length_and_base64_only_values() {
         format!(" {}", bs58::encode([2u8; 32]).into_string()),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let b = batch(
-            vec![Field::new("token_b", DataType::Utf8, false)],
-            vec![Arc::new(StringArray::from(vec![value]))],
-        );
-        assert!(file::check(&native_job(dir.path(), &b)).is_err());
+        for name in ["token_b", "fee_payer"] {
+            let b = batch(
+                vec![Field::new(name, DataType::Utf8, false)],
+                vec![Arc::new(StringArray::from(vec![value.as_str()]))],
+            );
+            assert!(file::check(&native_job(dir.path(), &b)).is_err());
+        }
     }
 }
 

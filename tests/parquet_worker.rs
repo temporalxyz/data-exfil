@@ -31,6 +31,8 @@ fn fixture(value: &str) -> (tempfile::TempDir, Job) {
         input,
         work: dir.path().into(),
         ddl: "CREATE TABLE db.events (body String) ENGINE = MergeTree ORDER BY tuple()".into(),
+        native_policy: Some(Default::default()),
+        stop_path: None,
         overrides,
         source_object: "s3://raw/2026/09/01/events/part.parquet".into(),
         batch: "linux-test".into(),
@@ -98,4 +100,15 @@ fn linux_worker_respects_existing_worker_lock() {
     lock.lock().unwrap();
     command(&job).assert().code(3);
     assert!(!job.work.join("checked.json").exists());
+}
+
+#[test]
+fn linux_worker_obeys_global_stop_before_reading_data() {
+    let (_dir, mut job) = fixture("safe");
+    let stop = job.work.join("STOP.json");
+    std::fs::write(&stop, b"stopped").unwrap();
+    job.stop_path = Some(stop);
+    command(&job).assert().code(1);
+    assert!(!job.work.join("checked.json").exists());
+    assert!(!job.work.join("part-000000.parquet").exists());
 }

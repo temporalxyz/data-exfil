@@ -1,8 +1,68 @@
 # Auditing S3 Parquet for ClickHouse
 
-`salvage audit-parquet` processes one table per invocation, with several days in flight.
+`salvage audit-parquet` processes a table or discovers a whole database, with several table/day
+partitions in flight under shared resource limits.
+
+## Whole database
+
+For the source layout `analytics/table/YYYY/MM/DD/*.parquet`, use `--database analytics`
+and point `--source` at the database prefix. Tables and existing dates are discovered from S3;
+gaps in dates are allowed. Optional `--from` / `--through` restrict the inclusive date range.
+For publication, the destination is the clean bucket/root, **without** appending `analytics`
+yourself. Start with this verification run, which does not need a destination:
+
+```sh
+./target/release/salvage audit-parquet \
+  --database analytics --verify \
+  --source s3://br-ch-exfil/analytics/ --source-profile source \
+  --batch analytics-verify-001 \
+  --day-concurrency 16 --download-concurrency 16 \
+  --check-concurrency 16 --upload-concurrency 16 \
+  --memory-bytes 137438953472 --worker-memory-bytes 6442450944 \
+  --scratch-bytes 1099511627776 --max-day-scratch-bytes 68719476736 \
+  --work ./work -v
+```
+
+For the 48-core / 185 GB RAM / 1.5 TB disk server, this sets a 128 GiB pipeline memory
+budget and 1 TiB scratch budget (64 GiB per active partition), with 6 GiB per worker. Workers stream files; a multi-GiB input need not fit in memory.
+All tables share day admission, download, validation, upload and multipart limits.
+
+**No DDL or mandatory per-table files are required.** Parquet supplies the native type schema.
+The first completed file's complete schema is pinned per table in `SOURCE-SCHEMA.json` and all
+other files/days must agree, including dropped columns. Optional `--audit-policy audit.toml`
+adds semantic constraints and incident indicators; see [field-audit coverage](PARQUET-AUDIT-COVERAGE.md).
+Defaults admit files up to 32 GiB compressed / 256 GiB uncompressed, with a 100:1 ratio cap.
+
+Use **`--verify`** for the full local download/audit/regeneration path with S3 writes disabled.
+It requires neither `--destination` nor destination credentials. `--mode` defaults to `enforce`.
+`--mode survey` also writes nothing forward, but does not regenerate output chunks.
+**Both stop at the first finding**, as do worker panics, unsupported types, schema drift, resource
+failures and other uncertainty. Other active work is cancelled and no new partitions start.
+`STOP.json` records the cause; a stopped run cannot be resumed. Resolve the cause and use a new
+batch. This supersedes the original plan's survey exception that continued to inventory findings.
+Already committed partitions are not deleted; requests already accepted by S3 may complete during
+cancellation. Consumers must use completed manifests, and never treat a stopped run as successful.
+
+After verification, scope review and rotation, use a new batch without `--verify`, with `--destination s3://CLEAN_BUCKET --destination-profile destination` and
+`--mode enforce --shape-review-signoff --rotation-signoff` to publish.
+The clean paths are `s3://CLEAN/analytics/TABLE/YYYY/MM/DD/BATCH-file-N-part-N.parquet`.
+The database/table/date layout and native Parquet representation are retained. File names and
+chunk boundaries change; dropped columns and provenance follow the audit contract below.
+Each successful partition gets `MANIFEST.json` last. Consumers must read the manifest's files,
+not glob every Parquet object; an interrupted attempt can leave unpublished chunks.
+Writes are create-only: existing committed partitions are not overwritten. To publish a new
+version, choose a new destination root. Resume an interrupted run with the identical arguments
+and `--resume`; discovery stays pinned and newly arrived source files require a new batch.
+Database reports and inventory live in `WORK/parquet-database/DATABASE/BATCH/`.
+
+## Single table
+
 Inputs live under `s3://RAW/PREFIX/YYYY/MM/DD/table/*.parquet`. The terminal directory is the
-unqualified table name; `--table db.table` identifies its pinned DDL and overrides.
+unqualified table name; `--table db.table` selects the table and any optional semantic rules.
+For `PREFIX/table/YYYY/MM/DD/*.parquet`, pass `--source-layout table-date` with
+`--source s3://RAW/PREFIX`. For example, `--source s3://br-ch-exfil/analytics`
+and `--table analytics.banshee_markouts` select the table under that database prefix.
+The default is `--source-layout date-table`. The layout is pinned for resume.
 Outputs live under `s3://CLEAN/PREFIX/BATCH/YYYY/MM/DD/table/` in a **different bucket**.
 
 ## Checks and output contract
@@ -11,10 +71,10 @@ Every retained value goes through the existing column bounds, anchored patterns,
 and injection/payload catalogue checks. Encoded payloads and Unicode normalization are checked by
 the same scanner used by the TSV audit. Arrays, tuples, maps and Nested values are checked
 recursively; generated container punctuation is not scanned as if it were a field value. Blob
-bytes are scanned even when the pinned validator uses a hex representation. One finding rejects
-the entire day. No row is silently repaired, defaulted, dropped or deduplicated.
+bytes are scanned even when the pinned validator uses a hex representation. One finding stops
+the entire run. No row is silently repaired, defaulted, dropped or deduplicated.
 
-Parquet schemas must match pinned ClickHouse DDL, including excluded columns. Columns marked
+Parquet schemas must match the observed per-table schema, including excluded columns. Columns marked
 `drop = true` are omitted from decoding and output after schema validation. All other columns
 retain their native values/types and nulls; the audit adds `_source_object`, `_batch` and
 `_imported_at` as String columns. Source key-value metadata is discarded. Output is newly encoded
@@ -22,9 +82,11 @@ Parquet with Zstandard level 1, not a copy of the original bytes. No TSV files a
 
 Supported mappings include signed/unsigned integers through 64 bits, Float32/64, Bool,
 Decimal128/256 with matching precision/scale, strings/binary, FixedString, Date/Date32,
-UTC or timezone-free timestamps, UUID, IPv4/IPv6, enums, lists, structs and maps.
-Native `Nested` uses a list of structs. Integer128/256 encodings and flattened Nested layouts
-are refused rather than guessed; add an explicitly tested mapping for those inputs before a run.
+UTC or timezone-free timestamps, lists, structs and maps. UUID, IPv4/IPv6 and enum membership
+checks require optional semantic rules when that meaning is not encoded in the native type.
+Native `Nested` uses a list of structs. Parquet has no native integer128/256 type: a binary or decimal encoding is validated as the
+type the file declares, never guessed to be the original ClickHouse wide integer. Similarly,
+flattened arrays are not guessed to form a ClickHouse Nested group.
 Timestamp values must fit the pinned precision exactly. An unsupported mapping is a finding,
 not permission to coerce the data. Parquet storage types such as UTF-8 offset width are determined
 by the Parquet reader; native values and logical types are preserved.
@@ -42,7 +104,7 @@ Build on Linux with the pinned Rust toolchain and lockfile:
 SALVAGE_GIT_COMMIT=$(git rev-parse HEAD) cargo build --release --locked
 ```
 
-Fill in `ddl/db.table.sql` and `overrides/db.table.toml` first. Input object limits use the existing
+Input object limits use the existing
 `max_compressed_bytes`, `max_uncompressed_bytes`, `max_rows_per_page`, field, nesting, expansion,
 and time limits. Set these for actual **Parquet files**, not for an entire day.
 
@@ -60,8 +122,10 @@ This example reserves 16 GiB for the pipeline, 512 GiB of scratch, and at most 1
   --work /scratch/salvage -v
 ```
 
-Survey records exact finding totals and bounded hex diagnostic samples but uploads nothing.
-Read the per-day `SHAPE-REVIEW.json`, `PAYLOAD-INVENTORY.json`, and per-file `findings.jsonl`.
+Read `RESULT.json` and `report.json` at the run root. On failure read `STOP.json`, per-file
+`findings.jsonl` and `worker-error.json`. Successful partitions retain `FIELD-AUDIT.json`,
+`SHAPE-REVIEW.json`, and `PAYLOAD-INVENTORY.json`. Counts stop at the first finding; they are
+not an exhaustive inventory of the remaining source.
 Samples are limited to 1 MiB per file; aggregate counts still include all findings. Structural
 damage that prevents further decoding stops that day. Shape statistics use bounded KMV-256
 distinct/duplicate estimates and SpaceSaving-16 frequent-value estimates, explicitly labeled;
@@ -123,18 +187,19 @@ persisted before processing and reused on resume. Source days must already be cl
 after inventory are intentionally outside the run. Missing dates are reported as errors.
 Only safe ASCII object names are accepted for provenance; source names never become local paths.
 
-Use the same command and `--resume` after an infrastructure interruption. Source/destination,
+A run with STOP.json or an incomplete attempted partition cannot resume. Otherwise source/destination,
 table, dates, schema/override fingerprint, mode, batch, and output settings must match. Resource
 budgets may be increased. Regenerated bytes are hashed before upload, existing clean objects are
 rehash-verified before reuse, and multipart part checkpoints avoid repeating completed transfers.
-Scratch reclaimed after an interruption is regenerated from the pinned raw inventory. A recorded
-finding makes that day non-resumable; fix the reviewed scope and use a new batch id.
+Scratch reclaimed after an interruption is not proof of a completed audit. A stopped or incomplete
+native partition requires investigation and a new batch. `--resume` is only for runs with no stop
+marker and no incomplete previously attempted partitions; completed partitions remain pinned.
 
 Consumers must read **only files listed in a completed day `MANIFEST.json`**, pin the listed
 version/ETag, verify SHA-256, and independently validate. Never load an S3 wildcard: an interrupted
 upload can leave objects without a manifest. Preserve provenance through subsequent ClickHouse
 loading/promotion. This is a separate native-Parquet contract; the TSV quarantine DDL is not its
-import schema. Use the manifest schema and pinned ClickHouse DDL, and validate conversion before
+import schema. Use the manifest schema and independently reviewed destination definitions, and validate conversion before
 loading production. No importer or production promotion is performed here.
 
 ## Tests and performance rehearsal

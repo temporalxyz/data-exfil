@@ -89,6 +89,7 @@ pub trait Store: Send + Sync {
     ) -> BoxFuture<'a, Result<Receipt>>;
 }
 
+#[derive(Clone)]
 pub struct S3Store {
     client: aws_sdk_s3::Client,
     bucket: String,
@@ -99,6 +100,13 @@ pub struct S3Store {
 }
 
 impl S3Store {
+    pub(super) fn with_timeout(&self, seconds: u64) -> Self {
+        Self {
+            timeout: Duration::from_secs(seconds),
+            ..self.clone()
+        }
+    }
+
     pub async fn new(
         bucket: String,
         profile: Option<&str>,
@@ -600,6 +608,26 @@ impl Store for S3Store {
                 .await
                 .map_err(infrastructure)?
         })
+    }
+}
+
+/// Verification/survey cannot accidentally publish, even if a caller reaches a write path.
+pub struct NoUploadStore;
+impl Store for NoUploadStore {
+    fn list<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Vec<Source>>> {
+        Box::pin(async { abort("clean S3 is disabled for this run") })
+    }
+    fn download<'a>(&'a self, _: &'a Source, _: &'a Path) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async { abort("clean S3 is disabled for this run") })
+    }
+    fn upload<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a Path,
+        _: &'a str,
+        _: &'a Path,
+    ) -> BoxFuture<'a, Result<Receipt>> {
+        Box::pin(async { abort("clean S3 writes are disabled for this run") })
     }
 }
 

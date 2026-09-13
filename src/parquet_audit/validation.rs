@@ -26,6 +26,8 @@ struct Node {
     scalar: Option<bounds::ColumnContract>,
     pattern: Option<&'static Regex>,
     children: Vec<Node>,
+    iocs: Option<Arc<regex::bytes::RegexSet>>,
+    binary: bool,
 }
 
 fn inner(ty: &Ch) -> (&Ch, bool) {
@@ -93,6 +95,209 @@ pub fn build(ddl: &PinnedDdl, overrides: &Overrides, schema: &Schema) -> Result<
         nodes,
         schema: Arc::new(Schema::new(fields)),
     })
+}
+
+/// Build contracts directly from native Parquet fields. No SQL text is loaded or generated.
+pub fn build_native(
+    policy: &super::policy::TablePolicy,
+    overrides: &Overrides,
+    schema: &Schema,
+) -> Result<Contract> {
+    if schema.fields().is_empty()
+        || schema.fields().len() > overrides.limits.max_fields_per_row as usize
+    {
+        return abort("native schema has no fields or exceeds field cap");
+    }
+    let iocs = if policy.iocs.is_empty() {
+        None
+    } else {
+        Some(Arc::new(
+            regex::bytes::RegexSetBuilder::new(policy.iocs.iter().map(|s| regex::escape(s)))
+                .size_limit(4 * 1024 * 1024)
+                .build()
+                .map_err(|_| usage::<()>("incident indicators exceed regex budget").unwrap_err())?,
+        ))
+    };
+    let mut names = std::collections::BTreeSet::new();
+    let mut kept = Vec::new();
+    let mut nodes = Vec::new();
+    let mut fields = Vec::new();
+    for (index, field) in schema.fields().iter().enumerate() {
+        let name = field.name();
+        if !names.insert(name.clone())
+            || crate::clickhouse::quarantine::PROVENANCE_COLUMNS
+                .iter()
+                .any(|(n, _)| n == name)
+        {
+            return abort("duplicate field or source/audit provenance collision");
+        }
+        crate::clickhouse::types::Ident::new(name)?;
+        let inferred = native_type(field, &overrides.limits, 1)?;
+        let ty = if let Some(semantic) = policy.types.get(name) {
+            let ty = crate::clickhouse::types::parse_type(semantic)?;
+            if field.is_nullable() {
+                Ch::Nullable(Box::new(ty))
+            } else {
+                ty
+            }
+        } else {
+            inferred
+        };
+        let over = overrides.columns.get(name);
+        let mut node = Node::build(
+            name.clone(),
+            &ty,
+            field.data_type(),
+            over,
+            &overrides.limits,
+        )?;
+        configure_native(&mut node, over, &iocs)?;
+        if over.is_some_and(|o| o.drop) {
+            continue;
+        }
+        kept.push(index);
+        nodes.push(node);
+        fields.push(clean_field(field));
+    }
+    if policy
+        .columns
+        .keys()
+        .chain(policy.types.keys())
+        .any(|name| !names.contains(name))
+    {
+        return usage("field policy names a column absent from Parquet schema");
+    }
+    if kept.is_empty() {
+        return usage("every native column is dropped");
+    }
+    for (name, _) in crate::clickhouse::quarantine::PROVENANCE_COLUMNS {
+        fields.push(ArrowField::new(*name, DataType::Utf8, false));
+    }
+    Ok(Contract {
+        kept,
+        nodes,
+        schema: Arc::new(Schema::new(fields)),
+    })
+}
+
+fn configure_native(
+    node: &mut Node,
+    over: Option<&ColumnOverride>,
+    iocs: &Option<Arc<regex::bytes::RegexSet>>,
+) -> Result<()> {
+    node.iocs = iocs.clone();
+    if let Some(scalar) = &mut node.scalar {
+        if node.binary && matches!(node.ty, Ch::String) {
+            scalar.validator = Validator::HexAny;
+        }
+        if matches!(node.ty, Ch::String | Ch::FixedString(_)) {
+            if over.is_none() {
+                scalar.class = FreedomClass::Open;
+            }
+            if matches!(
+                scalar.class,
+                FreedomClass::Closed | FreedomClass::Constrained
+            ) && scalar.pattern.is_none()
+                && !over.is_some_and(|o| o.drop || o.hex)
+            {
+                return usage(
+                    "closed/constrained native strings require an explicit anchored pattern",
+                );
+            }
+        }
+        if let Some(ids) = over.and_then(|o| o.enum_ids.as_ref()) {
+            if !matches!(
+                node.ty,
+                Ch::Int(_) | Ch::UInt(_) | Ch::Enum8(_) | Ch::Enum16(_)
+            ) {
+                return usage("enum_ids requires a native integer or explicit enum type");
+            }
+            scalar.validator = Validator::EnumId { ids: ids.clone() };
+        }
+    }
+    for child in &mut node.children {
+        configure_native(child, over, iocs)?;
+    }
+    Ok(())
+}
+
+fn native_type(field: &ArrowField, limits: &Limits, depth: u32) -> Result<Ch> {
+    use crate::clickhouse::types::IntWidth as W;
+    if depth > limits.max_nesting_depth {
+        return abort("native type exceeds nesting cap");
+    }
+    let child = |f: &ArrowField| native_type(f, limits, depth + 1);
+    let ty = match field.data_type() {
+        DataType::Int8 => Ch::Int(W::W8),
+        DataType::Int16 => Ch::Int(W::W16),
+        DataType::Int32 => Ch::Int(W::W32),
+        DataType::Int64 => Ch::Int(W::W64),
+        DataType::UInt8 => Ch::UInt(W::W8),
+        DataType::UInt16 => Ch::UInt(W::W16),
+        DataType::UInt32 => Ch::UInt(W::W32),
+        DataType::UInt64 => Ch::UInt(W::W64),
+        DataType::Boolean => Ch::Bool,
+        DataType::Float32 => Ch::Float(FloatWidth::F32),
+        DataType::Float64 => Ch::Float(FloatWidth::F64),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+            Ch::String
+        }
+        DataType::FixedSizeBinary(n) if *n > 0 => Ch::FixedString(*n as u32),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) if *s >= 0 && *s as u8 <= *p => {
+            Ch::Decimal {
+                p: u32::from(*p),
+                s: *s as u32,
+            }
+        }
+        DataType::Date32 => Ch::Date32,
+        DataType::Timestamp(unit, _) => Ch::DateTime64 {
+            scale: match unit {
+                TimeUnit::Second => 0,
+                TimeUnit::Millisecond => 3,
+                TimeUnit::Microsecond => 6,
+                TimeUnit::Nanosecond => 9,
+            },
+        },
+        DataType::List(f) | DataType::LargeList(f) => Ch::Array(Box::new(child(f)?)),
+        DataType::Struct(fs) => {
+            if fs.is_empty() || fs.len() > limits.max_fields_per_row as usize {
+                return abort("native struct field count exceeds bounds");
+            }
+            let mut names = std::collections::BTreeSet::new();
+            for f in fs {
+                crate::clickhouse::types::Ident::new(f.name())?;
+                if !names.insert(f.name()) {
+                    return abort("duplicate native struct field");
+                }
+            }
+            Ch::Tuple(fs.iter().map(|f| child(f)).collect::<Result<Vec<_>>>()?)
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fs) = entries.data_type() else {
+                return abort("invalid native map structure");
+            };
+            if fs.len() != 2 || entries.is_nullable() || fs[0].is_nullable() {
+                return abort("native map requires non-null entries and keys");
+            }
+            Ch::Map(Box::new(child(&fs[0])?), Box::new(child(&fs[1])?))
+        }
+        _ => return abort("unsupported Parquet logical type; no implicit conversion permitted"),
+    };
+    Ok(if field.is_nullable() {
+        Ch::Nullable(Box::new(ty))
+    } else {
+        ty
+    })
+}
+
+pub fn clean_schema(schema: &Schema) -> Schema {
+    Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| clean_field(f))
+            .collect::<Vec<_>>(),
+    )
 }
 
 // Source Arrow/key-value metadata is never inherited by the regenerated file, including on
@@ -289,6 +494,11 @@ impl Node {
             scalar,
             pattern,
             children,
+            iocs: None,
+            binary: matches!(
+                dt,
+                DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+            ),
         })
     }
 
@@ -336,6 +546,12 @@ impl Node {
                 self.pattern,
             )? {
                 emit(finding)?;
+            }
+            if let Some(iocs) = &self.iocs {
+                let scan = payloads::scan_with_iocs(&raw, limits, Some(iocs))?;
+                if scan.classes.contains(&"ioc_canary") {
+                    emit(self.finding(file, row, "payload catalogue match: ioc_canary", &raw))?;
+                }
             }
             // Hex is only a validator representation. Scan actual blob bytes too: encoding a
             // payload into hex must never conceal it from the shared injection catalogue.
@@ -428,7 +644,44 @@ impl Node {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FieldAudit {
+    pub column: String,
+    pub validated_type: String,
+    pub class: FreedomClass,
+    pub pattern: Option<String>,
+    pub max_len: Option<u32>,
+    pub opaque_binary: bool,
+    pub enum_ids: Option<Vec<i16>>,
+}
+
 impl Contract {
+    pub fn field_audits(&self) -> Vec<FieldAudit> {
+        fn visit(node: &Node, result: &mut Vec<FieldAudit>) {
+            if let Some(scalar) = &node.scalar {
+                result.push(FieldAudit {
+                    column: node.name.clone(),
+                    validated_type: node.ty.canonical(),
+                    class: scalar.class,
+                    pattern: scalar.pattern.clone(),
+                    max_len: scalar.max_len,
+                    opaque_binary: node.binary,
+                    enum_ids: match &scalar.validator {
+                        Validator::EnumId { ids } => Some(ids.clone()),
+                        _ => None,
+                    },
+                });
+            }
+            for child in &node.children {
+                visit(child, result);
+            }
+        }
+        let mut result = Vec::new();
+        for node in &self.nodes {
+            visit(node, &mut result);
+        }
+        result
+    }
     pub fn check_row(
         &self,
         batch: &RecordBatch,

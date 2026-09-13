@@ -362,7 +362,23 @@ impl ScanResult {
 
 /// Scan a value across its raw form, its NFC form, and its bounded decodings.
 pub fn scan(value: &[u8], limits: &Limits) -> Result<ScanResult> {
+    scan_with_iocs(value, limits, None)
+}
+
+/// Add bounded, locally configured incident indicators to every scanned representation.
+pub fn scan_with_iocs(
+    value: &[u8],
+    limits: &Limits,
+    iocs: Option<&RegexSet>,
+) -> Result<ScanResult> {
     let cat = catalogue()?;
+    let matches = |bytes: &[u8]| {
+        let mut hits = cat.matches(bytes);
+        if iocs.is_some_and(|set| set.is_match(bytes)) {
+            hits.push("ioc_canary");
+        }
+        hits
+    };
     let mut out = ScanResult::default();
 
     let record = |via: &'static str, hits: Vec<&'static str>, out: &mut ScanResult| {
@@ -379,7 +395,7 @@ pub fn scan(value: &[u8], limits: &Limits) -> Result<ScanResult> {
         }
     };
 
-    record("raw", cat.matches(value), &mut out);
+    record("raw", matches(value), &mut out);
 
     // NFC, applied to both forms as the document requires. Only valid UTF-8 can be normalised; a
     // value that is not UTF-8 is already a finding at the bounds layer.
@@ -387,7 +403,7 @@ pub fn scan(value: &[u8], limits: &Limits) -> Result<ScanResult> {
         let nfc: String = text.nfc().collect();
         if nfc.as_bytes() != value {
             out.normalises_differently = true;
-            record("nfc", cat.matches(nfc.as_bytes()), &mut out);
+            record("nfc", matches(nfc.as_bytes()), &mut out);
         }
 
         // NFKC as well, which the document does not ask for.
@@ -402,12 +418,12 @@ pub fn scan(value: &[u8], limits: &Limits) -> Result<ScanResult> {
         // section 8.6 defines: a value whose **NFC** form differs from its raw form.
         let nfkc: String = text.nfkc().collect();
         if nfkc.as_bytes() != value {
-            record("nfkc", cat.matches(nfkc.as_bytes()), &mut out);
+            record("nfkc", matches(nfkc.as_bytes()), &mut out);
         }
     }
 
     for (via, decoded) in decodings(value, limits)? {
-        record(via, cat.matches(&decoded), &mut out);
+        record(via, matches(&decoded), &mut out);
 
         // Decoding and normalisation **compose**. Scanning `raw`, `NFC(raw)`, `NFKC(raw)` and
         // `decode(raw)` covers four forms and misses the one that matters most: the fullwidth
@@ -419,11 +435,12 @@ pub fn scan(value: &[u8], limits: &Limits) -> Result<ScanResult> {
         if let Ok(text) = std::str::from_utf8(&decoded) {
             let nfkc: String = text.nfkc().collect();
             if nfkc.as_bytes() != decoded.as_slice() {
-                record("nfkc", cat.matches(nfkc.as_bytes()), &mut out);
+                record("nfkc", matches(nfkc.as_bytes()), &mut out);
             }
             let nfc: String = text.nfc().collect();
             if nfc.as_bytes() != decoded.as_slice() {
-                record("nfc", cat.matches(nfc.as_bytes()), &mut out);
+                out.normalises_differently = true;
+                record("nfc", matches(nfc.as_bytes()), &mut out);
             }
         }
     }
@@ -459,22 +476,28 @@ pub fn decodings(value: &[u8], limits: &Limits) -> Result<Vec<(&'static str, Vec
     // on the same bytes -- cannot make the loop spin or the output repeat.
     let mut seen: Vec<Vec<u8>> = vec![value.to_vec()];
     let mut frontier: Vec<Vec<u8>> = vec![value.to_vec()];
+    let mut decoded_bytes = 0usize;
 
     for _ in 0..limits.max_decode_rounds {
         let mut next: Vec<Vec<u8>> = Vec::new();
         for current in &frontier {
-            let candidates = [
+            let mut candidates = vec![
                 ("percent", percent_decode(current)),
                 ("html_entity", html_entity_decode(current)),
                 ("unicode_escape", unicode_escape_decode(current)),
-                (
-                    "base64",
-                    base64_decode_if_plausible(current, budget).unwrap_or_default(),
-                ),
             ];
+            candidates.extend(
+                base64_decode_if_plausible(current, budget)?
+                    .into_iter()
+                    .map(|b| ("base64", b)),
+            );
             for (via, bytes) in candidates {
                 if bytes.is_empty() || bytes.len() > budget || seen.contains(&bytes) {
                     continue;
+                }
+                decoded_bytes = decoded_bytes.saturating_add(bytes.len());
+                if decoded_bytes > budget || seen.len() >= 1024 {
+                    return abort("payload decoding exceeds total expansion/candidate budget");
                 }
                 seen.push(bytes.clone());
                 out.push((via, bytes.clone()));
@@ -494,8 +517,7 @@ fn percent_decode(value: &[u8]) -> Vec<u8> {
 }
 
 fn html_entity_decode(value: &[u8]) -> Vec<u8> {
-    // Only the five that matter for the classes above, plus numeric forms. A full entity table
-    // would be a dependency and a much larger surface for no additional detection.
+    // Decode numeric entities and named punctuation relevant to the catalogue.
     let Ok(text) = std::str::from_utf8(value) else {
         return Vec::new();
     };
@@ -516,13 +538,36 @@ fn html_entity_decode(value: &[u8]) -> Vec<u8> {
             "amp" => Some('&'),
             "quot" => Some('"'),
             "apos" | "#39" => Some('\''),
+            "colon" => Some(':'),
+            "semi" => Some(';'),
+            "sol" => Some('/'),
+            "bsol" => Some('\\'),
+            "equals" => Some('='),
+            "lpar" => Some('('),
+            "rpar" => Some(')'),
+            "lcub" => Some('{'),
+            "rcub" => Some('}'),
+            "lsqb" => Some('['),
+            "rsqb" => Some(']'),
+            "commat" => Some('@'),
+            "dollar" => Some('$'),
+            "num" => Some('#'),
+            "percnt" => Some('%'),
+            "period" => Some('.'),
+            "lowbar" => Some('_'),
+            "grave" => Some('`'),
+            "vert" => Some('|'),
+            "Tab" => Some('\t'),
+            "NewLine" => Some('\n'),
             other => other
                 .strip_prefix('#')
                 .and_then(|n| {
-                    n.strip_prefix('x').map_or_else(
-                        || n.parse::<u32>().ok(),
-                        |hex| u32::from_str_radix(hex, 16).ok(),
-                    )
+                    n.strip_prefix('x')
+                        .or_else(|| n.strip_prefix('X'))
+                        .map_or_else(
+                            || n.parse::<u32>().ok(),
+                            |hex| u32::from_str_radix(hex, 16).ok(),
+                        )
                 })
                 .and_then(char::from_u32),
         };
@@ -551,10 +596,26 @@ fn unicode_escape_decode(value: &[u8]) -> Vec<u8> {
             .get(i.saturating_add(2)..i.saturating_add(6))
             .unwrap_or("");
         let is_u = text.get(i.saturating_add(1)..i.saturating_add(2)) == Some("u");
-        match (
-            is_u,
-            u32::from_str_radix(hex, 16).ok().and_then(char::from_u32),
-        ) {
+        let unit = u32::from_str_radix(hex, 16).ok();
+        if is_u && unit.is_some_and(|u| (0xd800..=0xdbff).contains(&u)) {
+            let low = text
+                .get(i.saturating_add(6)..i.saturating_add(12))
+                .and_then(|s| s.strip_prefix("\\u"))
+                .and_then(|s| u32::from_str_radix(s, 16).ok());
+            if let Some(low) = low.filter(|u| (0xdc00..=0xdfff).contains(u)) {
+                let scalar = 0x10000u32
+                    .saturating_add(unit.unwrap().saturating_sub(0xd800).saturating_mul(1024))
+                    .saturating_add(low.saturating_sub(0xdc00));
+                if let Some(decoded) = char::from_u32(scalar) {
+                    out.push(decoded);
+                    for _ in 0..11 {
+                        let _ = chars.next();
+                    }
+                    continue;
+                }
+            }
+        }
+        match (is_u, unit.and_then(char::from_u32)) {
             (true, Some(decoded)) => {
                 out.push(decoded);
                 for _ in 0..5 {
@@ -567,25 +628,11 @@ fn unicode_escape_decode(value: &[u8]) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// Decode the longest plausible base64 **run** inside `value`, not just a whole-value blob.
-///
-/// The old rule was `value.iter().all(is_base64_char)`, so base64 only decoded when the entire
-/// field was base64 and nothing else. That is not how a credential arrives: it arrives inside a
-/// JSON blob, a connection string, a log line. `{"backup":"LS0tLS1CRUdJTiBSU0Eg..."}` failed the
-/// `all` on its very first byte, so the secret classes -- which the module documents as running
-/// "on every bounded decoding, because a base64-wrapped key is still a key" -- never saw it.
-///
-/// Scanning runs keeps the same protection against decoding ordinary words into noise: a run must
-/// still be long enough to carry something, and must still actually decode.
-fn base64_decode_if_plausible(value: &[u8], budget: usize) -> Option<Vec<u8>> {
-    const MIN_RUN: usize = 16;
-    if value.len() > budget.saturating_mul(4) {
-        return None;
-    }
+/// Decode every plausible base64 run, with count and aggregate byte budgets.
+fn base64_decode_if_plausible(value: &[u8], budget: usize) -> Result<Vec<Vec<u8>>> {
     let is_b64 =
         |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_');
-
-    let mut best: Option<Vec<u8>> = None;
+    let mut decoded_values = Vec::new();
     let mut start = 0usize;
     while start < value.len() {
         if !is_b64(&value[start]) {
@@ -597,21 +644,20 @@ fn base64_decode_if_plausible(value: &[u8], budget: usize) -> Option<Vec<u8>> {
             end = end.saturating_add(1);
         }
         let run = &value[start..end];
-        if run.len() >= MIN_RUN
+        // Even a two-byte unpadded encoding can carry a catalogue token. Scan every run,
+        // not just the longest: a harmless long value must not hide a shorter payload.
+        if run.len() >= 2
             && run.len() <= budget
             && let Some(decoded) = decode_run(run)
         {
-            {
-                // Longest wins: a wrapper's own alphanumerics can form short runs either side of
-                // the payload, and the payload is the long one.
-                if best.as_ref().is_none_or(|b| decoded.len() > b.len()) {
-                    best = Some(decoded);
-                }
+            if decoded_values.len() >= 256 {
+                return abort("too many base64 candidates in field");
             }
+            decoded_values.push(decoded);
         }
         start = end;
     }
-    best
+    Ok(decoded_values)
 }
 
 fn decode_run(run: &[u8]) -> Option<Vec<u8>> {

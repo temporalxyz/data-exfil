@@ -313,9 +313,9 @@ pub enum Command {
     /// payload-catalogue match, or any insert that does not load cleanly.
     Audit(AuditArgs),
 
-    /// Audit native Parquet from S3, processing independent days concurrently.
-    /// Applies pinned schema, field bounds and injection/payload checks. Regenerates Parquet;
-    /// does not perform a ClickHouse insert test. A finding rejects the entire day.
+    /// Audit native Parquet from S3, for one table or an automatically discovered database.
+    /// Uses Parquet schemas, field bounds and injection/payload checks. Regenerates Parquet;
+    /// does not perform a ClickHouse insert test. Any finding or uncertainty stops the run.
     AuditParquet(Box<ParquetArgs>),
 
     #[command(hide = true)]
@@ -393,25 +393,52 @@ pub struct AuditArgs {
     pub runner: Runner,
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum ParquetSourceLayout {
+    #[default]
+    DateTable,
+    TableDate,
+}
+
 #[derive(Debug, Args)]
 pub struct ParquetArgs {
-    #[command(flatten)]
-    pub table: TableArg,
+    /// One table, or use --database to discover every table under --source.
+    #[arg(
+        long,
+        required_unless_present = "database",
+        conflicts_with = "database"
+    )]
+    pub table: Option<TableRef>,
+    /// Database name. Source is its S3 prefix; destination is the clean bucket/root.
+    #[arg(long, conflicts_with = "table")]
+    pub database: Option<String>,
+    /// Optional TOML field rules and limits; Parquet supplies schemas without DDL files.
+    #[arg(long)]
+    pub audit_policy: Option<PathBuf>,
     #[command(flatten)]
     pub batch: BatchArg,
-    /// Root before YYYY/MM/DD/table/. Must be s3://bucket/prefix.
+    /// Root before YYYY/MM/DD/table/ or table/YYYY/MM/DD/. Must be s3://bucket/prefix.
     #[arg(long)]
     pub source: String,
-    /// Clean root. Batch/YYYY/MM/DD/table/ is appended. A separate bucket is required.
+    /// Single-table source partition order. Database mode always uses table/YYYY/MM/DD/.
+    #[arg(long, value_enum, default_value_t = ParquetSourceLayout::DateTable)]
+    pub source_layout: ParquetSourceLayout,
+    /// Clean root in a separate bucket. Database mode appends database/table/YYYY/MM/DD/;
+    /// single-table mode appends Batch/YYYY/MM/DD/table/.
+    #[arg(long, required_unless_present = "verify")]
+    pub destination: Option<String>,
+    /// Download, audit and regenerate locally, report results, and never write to S3.
     #[arg(long)]
-    pub destination: String,
-    /// Inclusive YYYY-MM-DD.
+    pub verify: bool,
+    /// Inclusive YYYY-MM-DD. Optional lower bound in database mode.
     #[arg(long)]
-    pub from: String,
-    /// Inclusive YYYY-MM-DD.
+    pub from: Option<String>,
+    /// Inclusive YYYY-MM-DD. Optional upper bound in database mode.
     #[arg(long)]
-    pub through: String,
-    #[arg(long, value_enum)]
+    pub through: Option<String>,
+    #[arg(long, value_enum, default_value_t = Mode::Enforce)]
     pub mode: Mode,
     #[arg(long, default_value_t = 4)]
     pub day_concurrency: usize,

@@ -6,6 +6,10 @@ For already-exported **S3 Parquet partitioned by day**, use
 [`salvage audit-parquet`](PARQUET.md). It audits native values with the existing bounds and
 injection/payload checks, regenerates Parquet, and overlaps independent days' downloads,
 checks, and uploads on one Linux server. It does not use TSV or run a ClickHouse insert test.
+Use `--database analytics` to discover tables/dates and `--verify` to run the full local checks
+without clean-bucket access. Parquet supplies the schema; no DDL files are required. Any finding
+or uncertainty stops the entire native run. See [field-audit coverage](PARQUET-AUDIT-COVERAGE.md)
+for the plan comparison and optional semantic rules.
 
 Implements the **Selective ClickHouse Data Salvage Plan (v-final, 25 Aug 2026)** for a two-host
 topology. Read `DEVIATIONS.md` before trusting anything here to match the source document, and

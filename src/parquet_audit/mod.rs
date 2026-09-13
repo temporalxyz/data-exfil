@@ -1,6 +1,9 @@
 //! One table, independent day transactions, globally bounded download/check/upload pools.
+mod database;
 pub mod file;
+pub mod policy;
 pub mod profile;
+mod stop;
 pub mod store;
 pub mod validation;
 
@@ -12,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::{StreamExt, future::BoxFuture};
+use futures::{FutureExt, StreamExt, future::BoxFuture};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
@@ -22,7 +25,7 @@ use crate::models::Overrides;
 use store::{Location, Receipt, Source, Store};
 
 const MIB: u64 = 1024 * 1024;
-const FORMAT: &str = "salvage-parquet-v1";
+const FORMAT: &str = "salvage-parquet-v2";
 
 pub fn infrastructure(e: impl std::fmt::Display) -> SalvageError {
     infra::<()>(format!("Parquet pipeline infrastructure error: {e}")).unwrap_err()
@@ -160,6 +163,10 @@ pub struct Identity {
     pub table: String,
     pub batch: String,
     pub source: String,
+    #[serde(default)]
+    pub source_layout: crate::cli::ParquetSourceLayout,
+    #[serde(default)]
+    pub preserve_paths: bool,
     pub destination: String,
     pub from: String,
     pub through: String,
@@ -214,6 +221,12 @@ pub struct Manifest {
     pub rows: u64,
     pub objects: Vec<ManifestObject>,
     pub dropped_columns: Vec<String>,
+    pub schema_source: String,
+    pub source_schema_sha256: String,
+    pub audit_limits: crate::limits::Limits,
+    pub independent_revalidation: bool,
+    pub field_audits: Vec<validation::FieldAudit>,
+    pub incident_indicator_count: usize,
     pub clickhouse_insert_tested: bool,
     pub consumer_must_revalidate: bool,
     pub shape_review_signoff: bool,
@@ -248,6 +261,7 @@ impl Worker for ProcessWorker {
                     break status;
                 }
                 if cancel.exists()
+                    || job.stop_path.as_ref().is_some_and(|p| p.exists())
                     || started.elapsed().as_secs() >= job.overrides.limits.wall_clock_secs
                 {
                     child.kill().await.map_err(infrastructure)?;
@@ -299,8 +313,12 @@ pub fn worker_command(path: &Path) -> Result<()> {
             job.overrides.limits.wall_clock_secs,
         )
         .map_err(infrastructure)?;
-        let result = file::check(&job);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| file::check(&job)))
+            .unwrap_or_else(|_| abort("validation worker panicked; entire run stopped"));
         if let Err(error) = &result {
+            if let Some(path) = &job.stop_path {
+                stop::persist(path, error.reason())?;
+            }
             atomic_json(
                 &job.work.join("worker-error.json"),
                 &Status {
@@ -318,6 +336,9 @@ pub struct Pipeline {
     pub work: PathBuf,
     pub destination: Location,
     pub ddl: String,
+    pub native_policy: Option<policy::TablePolicy>,
+    schema_lock: std::sync::Mutex<()>,
+    stop: Arc<stop::Stop>,
     pub overrides: Overrides,
     pub tuning: Tuning,
     pub imported_at: String,
@@ -325,9 +346,9 @@ pub struct Pipeline {
     pub raw: Arc<dyn Store>,
     pub clean: Arc<dyn Store>,
     pub worker: Arc<dyn Worker>,
-    downloads: Semaphore,
-    checks: Semaphore,
-    uploads: Semaphore,
+    downloads: Arc<Semaphore>,
+    checks: Arc<Semaphore>,
+    uploads: Arc<Semaphore>,
 }
 
 impl Pipeline {
@@ -345,14 +366,26 @@ impl Pipeline {
         clean: Arc<dyn Store>,
         worker: Arc<dyn Worker>,
     ) -> Self {
+        let stop = Arc::new(stop::Stop::new(&work));
+        let raw = Arc::new(stop::StoreWithStop {
+            inner: raw,
+            stop: stop.clone(),
+        });
+        let clean = Arc::new(stop::StoreWithStop {
+            inner: clean,
+            stop: stop.clone(),
+        });
         Self {
-            downloads: Semaphore::new(tuning.downloads),
-            checks: Semaphore::new(tuning.checks),
-            uploads: Semaphore::new(tuning.uploads),
+            stop,
+            downloads: Arc::new(Semaphore::new(tuning.downloads)),
+            checks: Arc::new(Semaphore::new(tuning.checks)),
+            uploads: Arc::new(Semaphore::new(tuning.uploads)),
             identity,
             work,
             destination,
             ddl,
+            native_policy: None,
+            schema_lock: std::sync::Mutex::new(()),
             overrides,
             tuning,
             imported_at,
@@ -363,20 +396,52 @@ impl Pipeline {
         }
     }
 
+    fn output_key(&self, day: &Day, name: &str) -> String {
+        if self.identity.preserve_paths {
+            self.destination.key(&format!("{}/{name}", day.prefix))
+        } else {
+            self.destination
+                .key(&format!("{}/{}/{name}", self.identity.batch, day.prefix))
+        }
+    }
+
+    async fn run_day(&self, day: &Day) -> Result<u64> {
+        if self.stop.stopped() {
+            return abort("run stopped; partition not started");
+        }
+        let result = std::panic::AssertUnwindSafe(self.day(day))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| abort("partition panicked; entire run stopped"));
+        if let Err(error) = &result {
+            self.stop.trip(error);
+        }
+        result
+    }
+
     pub async fn run(&self, days: &[Day]) -> Result<()> {
+        if self.native_policy.is_some() {
+            self.stop.enable()?;
+        }
         let started = Instant::now();
         let mut reports = BTreeMap::new();
         let mut failed = false;
         let mut infrastructure_failed = false;
-        let mut work = futures::stream::iter(days)
+        let mut completed = 0usize;
+        let mut total_rows = 0u64;
+        let mut work = futures::stream::iter(days.iter().take_while(|_| !self.stop.stopped()))
             .map(|day| async move {
-                let result = self.day(day).await;
+                let result = self.run_day(day).await;
                 (day.date.clone(), result)
             })
             .buffer_unordered(self.tuning.days);
         while let Some((date, result)) = work.next().await {
             let (state, reason) = match result {
-                Ok(rows) => ("complete", format!("{rows} rows")),
+                Ok(rows) => {
+                    completed += 1;
+                    total_rows = total_rows.saturating_add(rows);
+                    ("complete", format!("{rows} rows"))
+                }
                 Err(e) => {
                     if e.exit_code() == ExitCode::Abort {
                         failed = true;
@@ -407,8 +472,20 @@ impl Pipeline {
                     reason,
                 },
             );
-            atomic_json(&self.work.join("report.json"), &reports)?;
+            if let Err(error) = atomic_json(&self.work.join("report.json"), &reports) {
+                self.stop.trip(&error);
+                infrastructure_failed = true;
+            }
         }
+        finish_report(
+            &self.work,
+            self.identity.dry_run,
+            self.identity.survey,
+            failed || infrastructure_failed,
+            completed,
+            days.len(),
+            total_rows,
+        )?;
         if failed {
             abort("one or more days failed audit; those days were not published")
         } else if infrastructure_failed {
@@ -429,6 +506,11 @@ impl Pipeline {
                 );
             }
             let status: Status = read_json(&status_path)?;
+            if self.native_policy.is_some() && status.state != "complete" {
+                return abort(
+                    "previous partition attempt is incomplete or failed; inspect diagnostics and use a new batch",
+                );
+            }
             if status.state == "failed" {
                 return abort("cannot resume a failed audit day; use a new batch id");
             }
@@ -471,10 +553,7 @@ impl Pipeline {
                 if !self.identity.survey && !self.identity.dry_run {
                     let path = work.join("MANIFEST.json");
                     let sha = file::hash_file(&path)?;
-                    let key = self.destination.key(&format!(
-                        "{}/{}/MANIFEST.json",
-                        self.identity.batch, day.prefix
-                    ));
+                    let key = self.output_key(day, "MANIFEST.json");
                     let _permit = self.uploads.acquire().await.map_err(infrastructure)?;
                     self.clean
                         .upload(&key, &path, &sha, &work.join("manifest-session.json"))
@@ -541,6 +620,9 @@ impl Pipeline {
     async fn day_inner(&self, day: &Day, work: &Path, raw_bytes: u64) -> Result<u64> {
         let started = Instant::now();
         let cancel = work.join("CANCEL");
+        if self.stop.stopped() {
+            return abort("run stopped");
+        }
         if cancel.exists() {
             std::fs::remove_file(&cancel).map_err(infrastructure)?;
         }
@@ -560,7 +642,7 @@ impl Pipeline {
             .map(|(index, source)| {
                 let cancel = &cancel;
                 async move {
-                    if cancel.exists() {
+                    if cancel.exists() || self.stop.stopped() {
                         return infra("day cancelled");
                     }
                     let file_work = work.join(format!("file-{index:06}"));
@@ -578,7 +660,7 @@ impl Pipeline {
                         let input = file_work.join("raw.parquet");
                         let download_wait = Instant::now();
                         let permit = self.downloads.acquire().await.map_err(infrastructure)?;
-                        if cancel.exists() {
+                        if cancel.exists() || self.stop.stopped() {
                             return infra("day cancelled");
                         }
                         let download_started = Instant::now();
@@ -594,20 +676,20 @@ impl Pipeline {
                         );
                         drop(permit);
                         let _permit = self.checks.acquire().await.map_err(infrastructure)?;
-                        if cancel.exists() {
+                        if cancel.exists() || self.stop.stopped() {
                             return infra("day cancelled");
                         }
                         let output_budget = ((u128::from(output_pool) * u128::from(source.size))
                             / u128::from(raw_bytes))
                             as u64;
-                        let checked = self
-                            .worker
-                            .check(file::Job {
-                                input: input.clone(),
-                                work: file_work.clone(),
-                                ddl: self.ddl.clone(),
-                                overrides: self.overrides.clone(),
-                                source_object: format!(
+                        let checked = std::panic::AssertUnwindSafe(self.worker.check(file::Job {
+                            input: input.clone(),
+                            work: file_work.clone(),
+                            ddl: self.ddl.clone(),
+                            native_policy: self.native_policy.clone(),
+                            stop_path: self.native_policy.as_ref().map(|_| self.stop.path.clone()),
+                            overrides: self.overrides.clone(),
+                            source_object: format!(
                                     "{}/{}",
                                     self.identity
                                         .source
@@ -618,17 +700,25 @@ impl Pipeline {
                                         .join("/"),
                                     source.key
                                 ),
-                                batch: self.identity.batch.clone(),
-                                imported_at: self.imported_at.clone(),
-                                file_index: index as u32,
-                                survey: self.identity.survey,
-                                batch_rows: self.tuning.batch_rows,
-                                row_group_bytes: self.tuning.row_group_bytes,
-                                chunk_bytes: self.tuning.chunk_bytes,
-                                memory_bytes: self.tuning.worker_memory_bytes,
-                                output_budget,
-                            })
-                            .await?;
+                            batch: self.identity.batch.clone(),
+                            imported_at: self.imported_at.clone(),
+                            file_index: index as u32,
+                            survey: self.identity.survey,
+                            batch_rows: self.tuning.batch_rows,
+                            row_group_bytes: self.tuning.row_group_bytes,
+                            chunk_bytes: self.tuning.chunk_bytes,
+                            memory_bytes: self.tuning.worker_memory_bytes,
+                            output_budget,
+                        }))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            abort("validation worker panicked; entire run stopped")
+                        });
+                        if let Err(error) = &checked {
+                            self.stop.trip(error);
+                        }
+                        let checked = checked?;
                         if sha != checked.input_sha256 {
                             return abort("downloaded source changed before/during audit");
                         }
@@ -676,6 +766,26 @@ impl Pipeline {
         if checked.values().any(|c| &c.schema != first_schema) {
             return abort("native Parquet schema differs between files in a day");
         }
+        // Pin the complete source schema, including dropped columns, across this table's days.
+        // Publication is per partition; a later drift rejects that partition, never mutates the baseline.
+        if self.native_policy.is_some() {
+            let _lock = self.schema_lock.lock().map_err(infrastructure)?;
+            let path = self.work.join("SOURCE-SCHEMA.json");
+            let baseline = if path.exists() {
+                read_json::<arrow_schema::Schema>(&path)?
+            } else {
+                let baseline = checked.values().next().unwrap().input_schema.clone();
+                atomic_json(&path, &baseline)?;
+                baseline
+            };
+            if checked.values().any(|c| c.input_schema != baseline) {
+                return abort("native source schema drift across files/days of the table");
+            }
+        }
+        atomic_json(
+            &work.join("FIELD-AUDIT.json"),
+            &checked.values().next().unwrap().field_audits,
+        )?;
         let rows = checked.values().try_fold(0u64, |sum, c| {
             sum.checked_add(c.rows)
                 .ok_or_else(|| abort::<()>("day row count overflow").unwrap_err())
@@ -691,7 +801,7 @@ impl Pipeline {
             &work.join("PAYLOAD-INVENTORY.json"),
             &checked
                 .iter()
-                .map(|(i, c)| (i, &c.findings_by_reason))
+                .map(|(i, c)| (i, &c.finding_rows_by_column))
                 .collect::<BTreeMap<_, _>>(),
         )?;
         if checked.values().any(|c| c.findings > 0) {
@@ -700,6 +810,9 @@ impl Pipeline {
         if self.identity.survey || self.identity.dry_run {
             atomic_json(&work.join("rows.json"), &rows)?;
             return Ok(rows);
+        }
+        if self.stop.stopped() {
+            return abort("run stopped before publication");
         }
         // The day barrier is here: no clean-store operation is reachable before every file has
         // passed schema, field and payload checks and schema reconciliation.
@@ -717,10 +830,12 @@ impl Pipeline {
         let mut uploads = futures::stream::iter(jobs)
             .map(|(index, checked, output)| async move {
                 let _permit = self.uploads.acquire().await.map_err(infrastructure)?;
-                let key = self.destination.key(&format!(
-                    "{}/{}/file-{index:06}-{}",
-                    self.identity.batch, day.prefix, output.name
-                ));
+                let name = if self.identity.preserve_paths {
+                    format!("{}-file-{index:06}-{}", self.identity.batch, output.name)
+                } else {
+                    format!("file-{index:06}-{}", output.name)
+                };
+                let key = self.output_key(day, &name);
                 let dir = work.join(format!("file-{index:06}"));
                 let receipt = self
                     .clean
@@ -764,19 +879,35 @@ impl Pipeline {
                 .filter(|(_, c)| c.drop)
                 .map(|(name, _)| name.clone())
                 .collect(),
+            source_schema_sha256: crate::export::diff::sha256_hex(
+                &serde_json::to_vec(&checked.values().next().unwrap().input_schema)
+                    .map_err(infrastructure)?,
+            ),
+            audit_limits: self.overrides.limits.clone(),
+            schema_source: if self.native_policy.is_some() {
+                "parquet"
+            } else {
+                "pinned-ddl"
+            }
+            .into(),
+            independent_revalidation: false,
+            field_audits: checked.values().next().unwrap().field_audits.clone(),
+            incident_indicator_count: self.native_policy.as_ref().map_or(0, |p| p.iocs.len()),
             clickhouse_insert_tested: false,
             consumer_must_revalidate: true,
             shape_review_signoff: true,
             rotation_signoff: true,
         };
-        for name in ["SHAPE-REVIEW.json", "PAYLOAD-INVENTORY.json"] {
+        for name in [
+            "SHAPE-REVIEW.json",
+            "PAYLOAD-INVENTORY.json",
+            "FIELD-AUDIT.json",
+        ] {
             let _permit = self.uploads.acquire().await.map_err(infrastructure)?;
             let path = work.join(name);
             self.clean
                 .upload(
-                    &self
-                        .destination
-                        .key(&format!("{}/{}/{name}", self.identity.batch, day.prefix)),
+                    &self.output_key(day, name),
                     &path,
                     &file::hash_file(&path)?,
                     &work.join(format!("{name}.session.json")),
@@ -788,10 +919,7 @@ impl Pipeline {
         let _permit = self.uploads.acquire().await.map_err(infrastructure)?;
         self.clean
             .upload(
-                &self.destination.key(&format!(
-                    "{}/{}/MANIFEST.json",
-                    self.identity.batch, day.prefix
-                )),
+                &self.output_key(day, "MANIFEST.json"),
                 &path,
                 &file::hash_file(&path)?,
                 &work.join("manifest-session.json"),
@@ -828,6 +956,23 @@ impl Pipeline {
     }
 }
 
+fn source_day_prefix(
+    layout: crate::cli::ParquetSourceLayout,
+    date: time::Date,
+    table: &str,
+) -> String {
+    let day = format!(
+        "{:04}/{:02}/{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    );
+    match layout {
+        crate::cli::ParquetSourceLayout::DateTable => format!("{day}/{table}/"),
+        crate::cli::ParquetSourceLayout::TableDate => format!("{table}/{day}/"),
+    }
+}
+
 fn dates(from: &str, through: &str) -> Result<Vec<time::Date>> {
     let format = time::macros::format_description!("[year]-[month]-[day]");
     let start = time::Date::parse(from, &format)
@@ -853,38 +998,102 @@ fn dates(from: &str, through: &str) -> Result<Vec<time::Date>> {
     }
 }
 
+fn finish_report(
+    work: &Path,
+    verify: bool,
+    survey: bool,
+    stopped: bool,
+    completed: usize,
+    partitions: usize,
+    rows: u64,
+) -> Result<()> {
+    let status = if stopped {
+        "stopped"
+    } else if verify {
+        "verified"
+    } else if survey {
+        "surveyed"
+    } else {
+        "published"
+    };
+    atomic_json(
+        &work.join("RESULT.json"),
+        &serde_json::json!({
+            "status": status, "completed_partitions": completed, "selected_partitions": partitions,
+            "rows_in_completed_partitions": rows, "s3_writes_disabled": verify || survey,
+            "clickhouse_insert_tested": false, "independent_revalidation": false,
+        }),
+    )?;
+    eprintln!(
+        "Parquet run {status}: {completed}/{partitions} partitions, {rows} rows in completed partitions; report {}",
+        work.join("RESULT.json").display()
+    );
+    Ok(())
+}
+
+fn destination_uri(args: &ParquetArgs) -> &str {
+    args.destination
+        .as_deref()
+        .unwrap_or("s3://salvage-verify-unused")
+}
+
 pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
+    if args.database.is_some() {
+        return database::command(common, args);
+    }
+    let table_ref = args
+        .table
+        .as_ref()
+        .ok_or_else(|| usage::<()>("--table or --database is required").unwrap_err())?;
     let source = Location::parse(&args.source)?;
-    let destination = Location::parse(&args.destination)?;
+    let destination = Location::parse(destination_uri(args))?;
     if source.bucket == destination.bucket {
         return usage("raw and clean Parquet data require separate S3 buckets");
     }
-    let dates = dates(&args.from, &args.through)?;
+    let from = args
+        .from
+        .as_deref()
+        .ok_or_else(|| usage::<()>("--from is required for single-table mode").unwrap_err())?;
+    let through = args
+        .through
+        .as_deref()
+        .ok_or_else(|| usage::<()>("--through is required for single-table mode").unwrap_err())?;
+    let dates = dates(from, through)?;
     let tuning = Tuning::resolve(args)?;
-    let survey = matches!(args.mode, crate::cli::Mode::Survey);
-    if !survey && !common.dry_run && (!args.shape_review_signoff || !args.rotation_signoff) {
+    let survey = matches!(args.mode, crate::cli::Mode::Survey) && !args.verify;
+    if !(survey
+        || common.dry_run
+        || args.verify
+        || args.shape_review_signoff && args.rotation_signoff)
+    {
         return usage(
             "Parquet enforce publication requires --shape-review-signoff and --rotation-signoff",
         );
     }
-    let table = args.table.table.qualified();
-    let (_, overrides) =
-        crate::clickhouse::ddl::load_one(&common.ddl_dir, &common.overrides_dir, &table)?;
-    let ddl = std::fs::read_to_string(common.ddl_dir.join(format!("{table}.sql")))
-        .map_err(infrastructure)?;
-    let contract = serde_json::to_vec(&(FORMAT, crate::export::plan::GIT_COMMIT, &ddl, &overrides))
-        .map_err(infrastructure)?;
+    let table = table_ref.qualified();
+    let (overrides, native_policy) = policy::load_table(args, &table)?;
+    let ddl = String::new();
+    let contract = serde_json::to_vec(&(
+        FORMAT,
+        crate::export::plan::GIT_COMMIT,
+        "parquet-schema",
+        &native_policy,
+        &overrides,
+    ))
+    .map_err(infrastructure)?;
     let identity = Identity {
         format: FORMAT.into(),
         table: table.clone(),
         batch: args.batch.batch.as_str().into(),
         source: args.source.trim_end_matches('/').into(),
-        destination: args.destination.trim_end_matches('/').into(),
-        from: args.from.clone(),
-        through: args.through.clone(),
+        source_layout: args.source_layout,
+        preserve_paths: false,
+        destination: destination_uri(args).trim_end_matches('/').into(),
+        from: from.into(),
+        through: through.into(),
         contract_sha256: crate::export::diff::sha256_hex(&contract),
         survey,
-        dry_run: common.dry_run,
+        dry_run: common.dry_run || args.verify,
         retain_days: common.retain_days,
         batch_rows: tuning.batch_rows,
         row_group_bytes: tuning.row_group_bytes,
@@ -896,6 +1105,11 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
         .join(&table)
         .join(&identity.batch);
     std::fs::create_dir_all(&work).map_err(infrastructure)?;
+    if work.join("STOP.json").exists() {
+        return abort(
+            "run was stopped; inspect STOP.json and use a new batch after resolving the cause",
+        );
+    }
     let run_lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -931,16 +1145,20 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
             )
             .await?,
         );
-        let clean: Arc<dyn Store> = Arc::new(
-            store::S3Store::new(
-                destination.bucket.clone(),
-                args.destination_profile.as_deref(),
-                overrides.limits.wall_clock_secs,
-                common.retain_days,
-                tuning.uploads,
+        let clean: Arc<dyn Store> = if common.dry_run || args.verify || survey {
+            Arc::new(store::NoUploadStore)
+        } else {
+            Arc::new(
+                store::S3Store::new(
+                    destination.bucket.clone(),
+                    args.destination_profile.as_deref(),
+                    overrides.limits.wall_clock_secs,
+                    common.retain_days,
+                    tuning.uploads,
+                )
+                .await?,
             )
-            .await?,
-        );
+        };
         let inventory_path = work.join("INVENTORY.json");
         let inventory = if inventory_path.exists() {
             if !args.resume {
@@ -963,9 +1181,10 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
                     date.year(),
                     u8::from(date.month()),
                     date.day(),
-                    args.table.table.table()
+                    table_ref.table()
                 );
-                let sources = raw.list(&source.key(&format!("{prefix}/"))).await?;
+                let input_prefix = source_day_prefix(args.source_layout, date, table_ref.table());
+                let sources = raw.list(&source.key(&input_prefix)).await?;
                 inventory_bytes = inventory_bytes
                     .checked_add(serde_json::to_vec(&sources).map_err(infrastructure)?.len())
                     .ok_or_else(|| usage::<()>("inventory size overflow").unwrap_err())?;
@@ -990,7 +1209,7 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
             atomic_json(&inventory_path, &inventory)?;
             inventory
         };
-        let pipeline = Pipeline::new(
+        let mut pipeline = Pipeline::new(
             identity,
             work.clone(),
             destination,
@@ -1003,6 +1222,7 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
             clean,
             Arc::new(ProcessWorker),
         );
+        pipeline.native_policy = Some(native_policy);
         pipeline.run(&inventory.days).await
     })
 }

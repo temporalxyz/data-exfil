@@ -24,6 +24,10 @@ pub struct Job {
     pub input: PathBuf,
     pub work: PathBuf,
     pub ddl: String,
+    #[serde(default)]
+    pub native_policy: Option<super::policy::TablePolicy>,
+    #[serde(default)]
+    pub stop_path: Option<PathBuf>,
     pub overrides: Overrides,
     pub source_object: String,
     pub batch: String,
@@ -50,9 +54,12 @@ pub struct Checked {
     pub input_sha256: String,
     pub rows: u64,
     pub schema: arrow_schema::Schema,
+    pub input_schema: arrow_schema::Schema,
     pub outputs: Vec<Output>,
     pub findings: u64,
     pub findings_by_reason: BTreeMap<String, u64>,
+    pub finding_rows_by_column: BTreeMap<String, BTreeMap<String, u64>>,
+    pub field_audits: Vec<validation::FieldAudit>,
     pub profile: profile::Summary,
     pub elapsed_secs: f64,
 }
@@ -99,6 +106,9 @@ pub fn hash_file(path: &Path) -> Result<String> {
 }
 
 pub fn check(job: &Job) -> Result<Checked> {
+    if job.stop_path.as_ref().is_some_and(|p| p.exists()) {
+        return abort("run stopped before validation");
+    }
     let started = Instant::now();
     let limits = &job.overrides.limits;
     std::fs::create_dir_all(&job.work).map_err(infrastructure)?;
@@ -176,8 +186,13 @@ pub fn check(job: &Job) -> Result<Checked> {
         limits.max_expansion_ratio,
         "Parquet expansion",
     )?;
-    let ddl = parse_create_table(&job.ddl)?;
-    let contract = validation::build(&ddl, &job.overrides, builder.schema())?;
+    let contract = if let Some(native) = &job.native_policy {
+        validation::build_native(native, &job.overrides, builder.schema())?
+    } else {
+        let ddl = parse_create_table(&job.ddl)?;
+        validation::build(&ddl, &job.overrides, builder.schema())?
+    };
+    check_narrow_physical_integers(job, builder.parquet_schema(), &contract.kept)?;
     // Read only kept columns, but validate the complete source schema first.
     let projection = ProjectionMask::roots(builder.parquet_schema(), contract.kept.iter().copied());
     let input_schema = builder.schema().clone();
@@ -201,6 +216,7 @@ pub fn check(job: &Job) -> Result<Checked> {
     let mut findings = 0u64;
     let mut finding_samples_bytes = 0u64;
     let mut reasons = BTreeMap::new();
+    let mut finding_rows_by_column: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     let mut rows = 0u64;
     let mut outputs = Vec::new();
     let used = Arc::new(Mutex::new(0u64));
@@ -209,10 +225,16 @@ pub fn check(job: &Job) -> Result<Checked> {
     let mut chunk_decoded = 0u64;
     let mut decoded = 0u64;
     for next in reader {
+        if job.stop_path.as_ref().is_some_and(|p| p.exists()) {
+            return abort("run stopped during validation");
+        }
         if started.elapsed().as_secs() >= limits.wall_clock_secs {
             return infra("Parquet audit exceeded wall-clock budget");
         }
         let batch = next.map_err(finding_error)?;
+        for array in batch.columns() {
+            array.to_data().validate_full().map_err(finding_error)?;
+        }
         let batch_bytes = batch.get_array_memory_size() as u64;
         if batch_bytes > job.memory_bytes / 4 {
             return infra(
@@ -245,8 +267,18 @@ pub fn check(job: &Job) -> Result<Checked> {
         let full = RecordBatch::try_new(full_schema, columns).map_err(finding_error)?;
         for at in 0..full.num_rows() {
             let row = rows + at as u64 + 1;
+            let mut seen_findings = std::collections::BTreeSet::new();
             contract.check_row(&full, at, limits, job.file_index, row, &mut |finding| {
                 findings += 1;
+                if let Some(column) = &finding.column
+                    && seen_findings.insert((column.clone(), finding.reason.clone()))
+                {
+                    *finding_rows_by_column
+                        .entry(column.clone())
+                        .or_default()
+                        .entry(finding.reason.clone())
+                        .or_default() += 1;
+                }
                 *reasons.entry(finding.reason.clone()).or_insert(0u64) += 1;
                 let sample = serde_json::to_vec(&finding).map_err(infrastructure)?;
                 // Exact aggregate counts survive; diagnostic samples cannot exhaust day scratch.
@@ -255,8 +287,11 @@ pub fn check(job: &Job) -> Result<Checked> {
                     findings_file.write_all(b"\n").map_err(infrastructure)?;
                     finding_samples_bytes += sample.len() as u64 + 1;
                 }
-                if !job.survey {
+                if !job.survey || job.native_policy.is_some() {
                     findings_file.flush().map_err(infrastructure)?;
+                    if let Some(path) = &job.stop_path {
+                        super::stop::persist(path, &finding.reason)?;
+                    }
                     return abort("native Parquet field audit found a violation");
                 }
                 Ok(())
@@ -323,6 +358,9 @@ pub fn check(job: &Job) -> Result<Checked> {
     }
     findings_file.sync_all().map_err(infrastructure)?;
     let checked = Checked {
+        input_schema: validation::clean_schema(&input_schema),
+        field_audits: contract.field_audits(),
+        finding_rows_by_column,
         input_sha256,
         rows,
         schema: contract.schema.as_ref().clone(),
@@ -397,5 +435,96 @@ fn finish_chunk(
         rows,
         sha256,
     });
+    Ok(())
+}
+
+/// Arrow's INT32 -> Int8/Int16/UInt8/UInt16 adapter uses Rust `as` casts. Validate
+/// physical values first so a malformed logical annotation cannot silently wrap them.
+fn check_narrow_physical_integers(
+    job: &Job,
+    schema: &parquet::schema::types::SchemaDescriptor,
+    kept: &[usize],
+) -> Result<()> {
+    use parquet::basic::LogicalType;
+    use parquet::column::reader::ColumnReader;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let mut columns = Vec::new();
+    for (index, column) in schema.columns().iter().enumerate() {
+        if !kept.contains(&schema.get_column_root_idx(index)) {
+            continue;
+        }
+        let bounds = match column.logical_type() {
+            Some(LogicalType::Integer {
+                bit_width: 8,
+                is_signed: true,
+            }) => Some((-128, 127)),
+            Some(LogicalType::Integer {
+                bit_width: 16,
+                is_signed: true,
+            }) => Some((-32768, 32767)),
+            Some(LogicalType::Integer {
+                bit_width: 8,
+                is_signed: false,
+            }) => Some((0, 255)),
+            Some(LogicalType::Integer {
+                bit_width: 16,
+                is_signed: false,
+            }) => Some((0, 65535)),
+            _ => None,
+        };
+        // Legacy converted types carry the same narrowing semantics.
+        let bounds = bounds.or_else(|| match column.converted_type() {
+            parquet::basic::ConvertedType::INT_8 => Some((-128, 127)),
+            parquet::basic::ConvertedType::INT_16 => Some((-32768, 32767)),
+            parquet::basic::ConvertedType::UINT_8 => Some((0, 255)),
+            parquet::basic::ConvertedType::UINT_16 => Some((0, 65535)),
+            _ => None,
+        });
+        if let Some(bounds) = bounds {
+            columns.push((index, bounds));
+        }
+    }
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let reader = SerializedFileReader::new(File::open(&job.input).map_err(infrastructure)?)
+        .map_err(finding_error)?;
+    for group in 0..reader.num_row_groups() {
+        let group = reader.get_row_group(group).map_err(finding_error)?;
+        for (column, (min, max)) in &columns {
+            let ColumnReader::Int32ColumnReader(mut column) =
+                group.get_column_reader(*column).map_err(finding_error)?
+            else {
+                return abort("narrow integer has incompatible physical representation");
+            };
+            let mut values = Vec::new();
+            let mut definitions = Vec::new();
+            let mut repetitions = Vec::new();
+            loop {
+                if job.stop_path.as_ref().is_some_and(|p| p.exists()) {
+                    return abort("run stopped during physical type validation");
+                }
+                values.clear();
+                definitions.clear();
+                repetitions.clear();
+                let (records, _, _) = column
+                    .read_records(
+                        job.batch_rows,
+                        Some(&mut definitions),
+                        Some(&mut repetitions),
+                        &mut values,
+                    )
+                    .map_err(finding_error)?;
+                if values.iter().any(|v| v < min || v > max) {
+                    return abort(
+                        "physical Parquet integer exceeds its declared logical type range",
+                    );
+                }
+                if records == 0 {
+                    break;
+                }
+            }
+        }
+    }
     Ok(())
 }

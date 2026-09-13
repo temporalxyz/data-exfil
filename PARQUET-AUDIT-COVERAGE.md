@@ -106,6 +106,22 @@ incident indicators still apply. Malformed encoding, wrong length, non-string sc
 conflicting semantic override stop the run. Original encoded values are preserved.
 
 General SQL/shell and other text payload patterns are not applied to these opaque signature
-bytes or to speculative decodings of their encoded text. Other columns retain the full scanner.
+bytes or to speculative decodings of their encoded text. Other text columns retain the full scanner,
+except for the explicitly typed public keys below.
 This checks signature representation, not cryptographic validity or transaction authenticity.
 Use `SolanaSignature` in optional `types` rules for signature fields with other names.
+
+## Solana token public keys
+
+Every top-level `token_a` and `token_b` column uses `SolanaPublicKey` across native Parquet
+tables. These must be native strings containing canonical base58 that decodes to exactly
+32 bytes. Base64-only values, malformed encodings, wrong lengths and conflicting semantic
+overrides stop the run. Native nullability, byte caps, explicit patterns/length limits and
+configured incident indicators on the original and decoded bytes still apply. Original
+values are preserved in the output Parquet.
+
+These opaque public keys skip generic text payload scanning and speculative base64 decoding:
+a valid base58 address may also parse as base64 and produce unrelated punctuation bytes.
+The reported `GRp3fBQ9DAt4J34Cduqrb4eWuUQfN7UutoMNxYai4RYg` is covered by a regression test.
+This validates representation only; it does not establish ownership or require an on-curve
+address. Use `SolanaPublicKey` in optional `types` rules for other public-key column names.

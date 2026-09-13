@@ -1946,3 +1946,95 @@ fn every_signature_column_uses_the_contract_without_table_policy() {
         .insert("signature".into(), "String".into());
     assert!(file::check(&j).is_err());
 }
+
+#[test]
+fn solana_token_columns_accept_the_reported_address_without_speculative_base64() {
+    let address = "GRp3fBQ9DAt4J34Cduqrb4eWuUQfN7UutoMNxYai4RYg";
+    for name in ["token_a", "token_b"] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new(name, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![address]))],
+        );
+        let checked = file::check(&native_job(dir.path(), &b)).unwrap();
+        assert_eq!(
+            checked.field_audits[0].validated_type,
+            "SolanaPublicKey(base58,32 bytes)"
+        );
+        assert_eq!(
+            checked.field_audits[0].class,
+            crate::models::FreedomClass::Closed
+        );
+        let output = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            output
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            address
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    assert!(file::check(&native_job(dir.path(), &text_batch(&[address]))).is_err());
+}
+
+#[test]
+fn token_columns_reject_malformed_wrong_length_and_base64_only_values() {
+    use base64::Engine as _;
+    for value in [
+        "<script>".into(),
+        "0".repeat(44),
+        String::new(),
+        bs58::encode([1u8; 31]).into_string(),
+        bs58::encode([1u8; 33]).into_string(),
+        base64::engine::general_purpose::STANDARD.encode([255u8; 32]),
+        format!(" {}", bs58::encode([2u8; 32]).into_string()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("token_b", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        assert!(file::check(&native_job(dir.path(), &b)).is_err());
+    }
+}
+
+#[test]
+fn token_contract_retains_nullability_incident_checks_and_explicit_constraints() {
+    let address = bs58::encode([0u8; 32]).into_string();
+    let b = batch(
+        vec![Field::new("token_a", DataType::Utf8, true)],
+        vec![Arc::new(StringArray::from(vec![
+            None,
+            Some(address.as_str()),
+        ]))],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = native_job(dir.path(), &b);
+    assert_eq!(file::check(&j).unwrap().rows, 2);
+    j.native_policy.as_mut().unwrap().iocs.push(address);
+    assert!(file::check(&j).is_err());
+    j.native_policy.as_mut().unwrap().iocs.clear();
+    j.native_policy
+        .as_mut()
+        .unwrap()
+        .types
+        .insert("token_a".into(), "String".into());
+    assert!(file::check(&j).is_err());
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("token_b", DataType::UInt64, false)],
+        vec![Arc::new(UInt64Array::from(vec![1]))],
+    );
+    assert!(file::check(&native_job(dir.path(), &b)).is_err());
+}

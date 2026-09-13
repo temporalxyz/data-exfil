@@ -28,7 +28,7 @@ struct Node {
     children: Vec<Node>,
     iocs: Option<Arc<regex::bytes::RegexSet>>,
     binary: bool,
-    solana_signature: bool,
+    encoded: Option<EncodedField>,
 }
 
 fn inner(ty: &Ch) -> (&Ch, bool) {
@@ -134,24 +134,28 @@ pub fn build_native(
         }
         crate::clickhouse::types::Ident::new(name)?;
         let inferred = native_type(field, &overrides.limits, 1)?;
-        // Operator-selected contract for every column with this exact name, across tables.
-        let signature = name == "signature"
-            || policy
-                .types
-                .get(name)
-                .is_some_and(|t| t == "SolanaSignature");
-        if name == "signature"
-            && policy
-                .types
-                .get(name)
-                .is_some_and(|t| t != "SolanaSignature")
+        // Operator-selected contracts, scoped to these exact top-level column names.
+        let default_type = match name.as_str() {
+            "signature" => Some("SolanaSignature"),
+            "token_a" | "token_b" => Some("SolanaPublicKey"),
+            _ => None,
+        };
+        let explicit = policy.types.get(name).map(String::as_str);
+        if default_type
+            .zip(explicit)
+            .is_some_and(|(required, actual)| required != actual)
         {
-            return usage("signature columns require the SolanaSignature contract");
+            return usage("column semantic override conflicts with its required Solana contract");
         }
-        if signature && !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            return usage("SolanaSignature requires a native string field");
+        let encoded = match default_type.or(explicit) {
+            Some("SolanaSignature") => Some(EncodedField::Signature),
+            Some("SolanaPublicKey") => Some(EncodedField::PublicKey),
+            _ => None,
+        };
+        if encoded.is_some() && !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+            return usage("encoded Solana fields require native string columns");
         }
-        let ty = if let Some(semantic) = policy.types.get(name).filter(|_| !signature) {
+        let ty = if let Some(semantic) = policy.types.get(name).filter(|_| encoded.is_none()) {
             let ty = crate::clickhouse::types::parse_type(semantic)?;
             if field.is_nullable() {
                 Ch::Nullable(Box::new(ty))
@@ -169,12 +173,12 @@ pub fn build_native(
             over,
             &overrides.limits,
         )?;
-        if signature && over.is_some_and(|o| o.hex || o.enum_ids.is_some()) {
-            return usage("SolanaSignature cannot use hex or enum overrides");
+        if encoded.is_some() && over.is_some_and(|o| o.hex || o.enum_ids.is_some()) {
+            return usage("encoded Solana fields cannot use hex or enum overrides");
         }
-        node.solana_signature = signature;
+        node.encoded = encoded;
         configure_native(&mut node, over, &iocs)?;
-        if signature {
+        if encoded.is_some() {
             node.scalar.as_mut().unwrap().class = FreedomClass::Closed;
         }
         if over.is_some_and(|o| o.drop) {
@@ -222,7 +226,7 @@ fn configure_native(
             if matches!(
                 scalar.class,
                 FreedomClass::Closed | FreedomClass::Constrained
-            ) && !node.solana_signature
+            ) && node.encoded.is_none()
                 && scalar.pattern.is_none()
                 && !over.is_some_and(|o| o.drop || o.hex)
             {
@@ -521,7 +525,7 @@ impl Node {
             pattern,
             children,
             iocs: None,
-            solana_signature: false,
+            encoded: None,
             binary: matches!(
                 dt,
                 DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
@@ -555,9 +559,13 @@ impl Node {
                 return emit(self.finding(file, row, "value exceeds pinned field byte cap", &raw));
             }
             *remaining -= raw.len() as u64;
-            if self.solana_signature {
-                let Some(decoded) = decode_solana_signature(&raw) else {
-                    return emit(self.finding(file, row, "Solana signature must be canonical base58 or base64 encoding of exactly 64 bytes", &raw));
+            if let Some(encoded) = self.encoded {
+                let decoded = match encoded {
+                    EncodedField::Signature => decode_solana_signature(&raw).map(|b| b.to_vec()),
+                    EncodedField::PublicKey => decode_solana_public_key(&raw).map(|b| b.to_vec()),
+                };
+                let Some(decoded) = decoded else {
+                    return emit(self.finding(file, row, encoded.failure(), &raw));
                 };
                 if contract.max_len.is_some_and(|cap| raw.len() > cap as usize)
                     || self.pattern.is_some_and(|p| !p.is_match(&raw))
@@ -565,11 +573,11 @@ impl Node {
                     return emit(self.finding(
                         file,
                         row,
-                        "Solana signature violates its explicit field constraints",
+                        "encoded Solana value violates its explicit field constraints",
                         &raw,
                     ));
                 }
-                // Signature bytes are opaque, not text to run through speculative decoders.
+                // Signature and public-key bytes are opaque, not text to run through speculative decoders.
                 // Keep explicitly supplied incident indicators on both exact representations.
                 if self
                     .iocs
@@ -579,7 +587,7 @@ impl Node {
                     return emit(self.finding(
                         file,
                         row,
-                        "payload catalogue match: ioc_canary in Solana signature",
+                        "payload catalogue match: ioc_canary in encoded Solana value",
                         &raw,
                     ));
                 }
@@ -718,11 +726,9 @@ impl Contract {
             if let Some(scalar) = &node.scalar {
                 result.push(FieldAudit {
                     column: node.name.clone(),
-                    validated_type: if node.solana_signature {
-                        "SolanaSignature(base58|base64,64 bytes)".into()
-                    } else {
-                        node.ty.canonical()
-                    },
+                    validated_type: node
+                        .encoded
+                        .map_or_else(|| node.ty.canonical(), |kind| kind.label().into()),
                     class: scalar.class,
                     pattern: scalar.pattern.clone(),
                     max_len: scalar.max_len,
@@ -967,4 +973,42 @@ fn decode_solana_signature(raw: &[u8]) -> Option<[u8; 64]> {
         }
     }
     None
+}
+
+#[derive(Clone, Copy)]
+enum EncodedField {
+    Signature,
+    PublicKey,
+}
+impl EncodedField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Signature => "SolanaSignature(base58|base64,64 bytes)",
+            Self::PublicKey => "SolanaPublicKey(base58,32 bytes)",
+        }
+    }
+    fn failure(self) -> &'static str {
+        match self {
+            Self::Signature => {
+                "Solana signature must be canonical base58 or base64 encoding of exactly 64 bytes"
+            }
+            Self::PublicKey => {
+                "Solana public key must be canonical base58 encoding of exactly 32 bytes"
+            }
+        }
+    }
+}
+
+fn decode_solana_public_key(raw: &[u8]) -> Option<[u8; 32]> {
+    if !(32..=44).contains(&raw.len()) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    if bs58::decode(raw).onto(&mut bytes).ok() == Some(32)
+        && bs58::encode(bytes).into_string().as_bytes() == raw
+    {
+        Some(bytes)
+    } else {
+        None
+    }
 }

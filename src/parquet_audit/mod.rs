@@ -27,6 +27,45 @@ use store::{Location, Receipt, Source, Store};
 const MIB: u64 = 1024 * 1024;
 const FORMAT: &str = "salvage-parquet-v2";
 
+/// Log liveness without spawning detached tasks or changing cancellation semantics.
+async fn stage_progress<T>(
+    table: &str,
+    day: &str,
+    file: usize,
+    stage: &str,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = Instant::now();
+    tracing::info!(table, day, file, stage, "stage started");
+    tokio::pin!(operation);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), &mut operation).await {
+            Ok(result) => {
+                tracing::info!(
+                    table,
+                    day,
+                    file,
+                    stage,
+                    seconds = started.elapsed().as_secs_f64(),
+                    success = result.is_ok(),
+                    "stage finished"
+                );
+                return result;
+            }
+            Err(_) => {
+                tracing::info!(
+                    table,
+                    day,
+                    file,
+                    stage,
+                    seconds = started.elapsed().as_secs_f64(),
+                    "stage still running"
+                );
+            }
+        }
+    }
+}
+
 pub fn infrastructure(e: impl std::fmt::Display) -> SalvageError {
     infra::<()>(format!("Parquet pipeline infrastructure error: {e}")).unwrap_err()
 }
@@ -409,6 +448,13 @@ impl Pipeline {
         if self.stop.stopped() {
             return abort("run stopped; partition not started");
         }
+        tracing::info!(
+            table = self.identity.table,
+            day = day.date,
+            files = day.sources.len(),
+            verify = self.identity.dry_run,
+            "partition started"
+        );
         let result = std::panic::AssertUnwindSafe(self.day(day))
             .catch_unwind()
             .await
@@ -664,8 +710,16 @@ impl Pipeline {
                             return infra("day cancelled");
                         }
                         let download_started = Instant::now();
-                        let sha = self.raw.download(source, &input).await?;
+                        let sha = stage_progress(
+                            &self.identity.table,
+                            &day.date,
+                            index,
+                            "download",
+                            self.raw.download(source, &input),
+                        )
+                        .await?;
                         tracing::info!(
+                            table = self.identity.table,
                             day = day.date,
                             file = index,
                             bytes = source.size,
@@ -682,14 +736,22 @@ impl Pipeline {
                         let output_budget = ((u128::from(output_pool) * u128::from(source.size))
                             / u128::from(raw_bytes))
                             as u64;
-                        let checked = std::panic::AssertUnwindSafe(self.worker.check(file::Job {
-                            input: input.clone(),
-                            work: file_work.clone(),
-                            ddl: self.ddl.clone(),
-                            native_policy: self.native_policy.clone(),
-                            stop_path: self.native_policy.as_ref().map(|_| self.stop.path.clone()),
-                            overrides: self.overrides.clone(),
-                            source_object: format!(
+                        let checked = std::panic::AssertUnwindSafe(stage_progress(
+                            &self.identity.table,
+                            &day.date,
+                            index,
+                            "audit",
+                            self.worker.check(file::Job {
+                                input: input.clone(),
+                                work: file_work.clone(),
+                                ddl: self.ddl.clone(),
+                                native_policy: self.native_policy.clone(),
+                                stop_path: self
+                                    .native_policy
+                                    .as_ref()
+                                    .map(|_| self.stop.path.clone()),
+                                overrides: self.overrides.clone(),
+                                source_object: format!(
                                     "{}/{}",
                                     self.identity
                                         .source
@@ -700,16 +762,17 @@ impl Pipeline {
                                         .join("/"),
                                     source.key
                                 ),
-                            batch: self.identity.batch.clone(),
-                            imported_at: self.imported_at.clone(),
-                            file_index: index as u32,
-                            survey: self.identity.survey,
-                            batch_rows: self.tuning.batch_rows,
-                            row_group_bytes: self.tuning.row_group_bytes,
-                            chunk_bytes: self.tuning.chunk_bytes,
-                            memory_bytes: self.tuning.worker_memory_bytes,
-                            output_budget,
-                        }))
+                                batch: self.identity.batch.clone(),
+                                imported_at: self.imported_at.clone(),
+                                file_index: index as u32,
+                                survey: self.identity.survey,
+                                batch_rows: self.tuning.batch_rows,
+                                row_group_bytes: self.tuning.row_group_bytes,
+                                chunk_bytes: self.tuning.chunk_bytes,
+                                memory_bytes: self.tuning.worker_memory_bytes,
+                                output_budget,
+                            }),
+                        ))
                         .catch_unwind()
                         .await
                         .unwrap_or_else(|_| {
@@ -719,6 +782,14 @@ impl Pipeline {
                             self.stop.trip(error);
                         }
                         let checked = checked?;
+                        tracing::info!(
+                            table = self.identity.table,
+                            day = day.date,
+                            file = index,
+                            rows = checked.rows,
+                            output_chunks = checked.outputs.len(),
+                            "file audit complete"
+                        );
                         if sha != checked.input_sha256 {
                             return abort("downloaded source changed before/during audit");
                         }
@@ -837,15 +908,28 @@ impl Pipeline {
                 };
                 let key = self.output_key(day, &name);
                 let dir = work.join(format!("file-{index:06}"));
-                let receipt = self
-                    .clean
-                    .upload(
+                let receipt = stage_progress(
+                    &self.identity.table,
+                    &day.date,
+                    index,
+                    "upload",
+                    self.clean.upload(
                         &key,
                         &dir.join(&output.name),
                         &output.sha256,
                         &dir.join(format!("{}.session.json", output.name)),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
+                tracing::info!(
+                    table = self.identity.table,
+                    day = day.date,
+                    file = index,
+                    chunk = output.name,
+                    bytes = output.bytes,
+                    rows = output.rows,
+                    "upload complete"
+                );
                 Ok::<_, SalvageError>(ManifestObject {
                     source: day.sources[index].clone(),
                     input_sha256: checked.input_sha256.clone(),

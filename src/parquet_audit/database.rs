@@ -164,6 +164,8 @@ pub(super) async fn run(
     let mut failed = false;
     let mut interrupted = false;
     let mut report_error = None;
+    let started = Instant::now();
+    let selected: usize = inventories.iter().map(|i| i.days.len()).sum();
     let mut completed = 0usize;
     let mut total_rows = 0u64;
     while let Some((key, result)) = pending.next().await {
@@ -188,6 +190,10 @@ pub(super) async fn run(
         };
         tracing::info!(
             partition = key,
+            completed_partitions = completed,
+            selected_partitions = selected,
+            rows_in_completed_partitions = total_rows,
+            elapsed_secs = started.elapsed().as_secs_f64(),
             state = status.state,
             reason = status.reason,
             "database partition finished"

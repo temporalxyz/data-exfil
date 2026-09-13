@@ -1,7 +1,7 @@
 //! S3 transfers: pinned reads, resumable multipart writes, and create-only completion.
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -247,6 +247,8 @@ impl S3Store {
         let mut body = response.body;
         let mut hash = Sha256::new();
         let mut count = 0u64;
+        let started = Instant::now();
+        let mut last_progress = started;
         while let Some(bytes) = body.next().await {
             let bytes = bytes.map_err(infrastructure)?;
             count = count
@@ -257,6 +259,16 @@ impl S3Store {
             }
             hash.update(&bytes);
             file.write_all(&bytes).await.map_err(infrastructure)?;
+            if last_progress.elapsed() >= Duration::from_secs(15) {
+                tracing::info!(
+                    key = source.key,
+                    downloaded_bytes = count,
+                    total_bytes = source.size,
+                    mib_per_sec = count as f64 / 1048576.0 / started.elapsed().as_secs_f64(),
+                    "download progress"
+                );
+                last_progress = Instant::now();
+            }
         }
         if count != source.size {
             return infra("truncated S3 download");

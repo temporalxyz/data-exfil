@@ -215,3 +215,14 @@ The regular tests use generated Parquet fixtures, instrumented local stores, and
 replay responses: no AWS account, network, or ClickHouse is needed. The explicit throughput
 rehearsal compares serial and parallel validation on synthetic data; measure real S3 and the
 production worker process on the target Linux server before selecting final concurrency.
+
+### Progress logging
+
+With `-v`, the controller logs partition starts and download/audit/upload stage starts and
+finishes, plus a heartbeat every 15 seconds while a stage is running. Downloads also report
+bytes received, total bytes and average MiB/s every 15 seconds when data is flowing. Audit
+completion reports validated rows and output chunks; upload completion reports chunk bytes
+and rows. Database partition completion includes completed/selected partitions, rows in
+completed partitions and elapsed time. Audit heartbeats indicate liveness, not row-level
+completion; row totals are reported when the file audit finishes. Logs do not include field
+values. `--verify` produces no upload events because S3 writes are disabled.

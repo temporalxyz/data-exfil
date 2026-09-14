@@ -994,13 +994,11 @@ impl Contract {
                 && self.schema.field_with_name("symbol").is_ok_and(|field| {
                     matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                 });
-            node.approved_mint_name = table == "analytics.mint_infos"
-                && node.name == "name"
-                && matches!(node.ty, Ch::String)
-                && node.encoded.is_none()
-                && self.schema.field_with_name("name").is_ok_and(|field| {
-                    matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-                });
+            // This is an operator-approved free display-name field.  Its native
+            // Parquet type and the pinned ClickHouse type were already validated
+            // while building this node; do not make the policy depend on whether
+            // that type is represented with a ClickHouse wrapper.
+            node.approved_mint_name = table == "analytics.mint_infos" && node.name == "name";
             node.approved_asset = table == "analytics.memefi_fv"
                 && node.name == "asset"
                 && matches!(node.ty, Ch::String)

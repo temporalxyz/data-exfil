@@ -1874,7 +1874,6 @@ fn malformed_signatures_and_explicit_incident_indicators_still_stop() {
     use base64::Engine as _;
     let valid = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
     let invalid = vec![
-        String::new(),
         "<script>".into(),
         "a".repeat(128),
         "0".repeat(88),
@@ -1999,7 +1998,6 @@ fn token_columns_reject_malformed_wrong_length_and_base64_only_values() {
     for value in [
         "<script>".into(),
         "0".repeat(44),
-        String::new(),
         bs58::encode([1u8; 31]).into_string(),
         bs58::encode([1u8; 33]).into_string(),
         base64::engine::general_purpose::STANDARD.encode([255u8; 32]),
@@ -2692,4 +2690,75 @@ fn native_numeric_fast_path_matches_full_validators_and_output() {
     let mut capped = native_job(cap_dir.path(), &cap_batch);
     capped.overrides.limits.max_field_bytes = 19;
     assert!(file::check(&capped).is_err());
+}
+
+#[test]
+fn empty_solana_fields_are_preserved_and_explicit_policies_still_apply() {
+    for (name, semantic) in [
+        ("fee_payer", "SolanaPublicKey"),
+        ("token_a", "SolanaPublicKey"),
+        ("token_b", "SolanaPublicKey"),
+        ("signature", "SolanaSignature"),
+        ("custom_address", "SolanaPublicKey"),
+        ("custom_signature", "SolanaSignature"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = if semantic == "SolanaPublicKey" {
+            bs58::encode([3u8; 32]).into_string()
+        } else {
+            bs58::encode([3u8; 64]).into_string()
+        };
+        let b = batch(
+            vec![Field::new(name, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["", valid.as_str(), ""]))],
+        );
+        let mut job = native_job(dir.path(), &b);
+        if name.starts_with("custom_") {
+            job.native_policy
+                .as_mut()
+                .unwrap()
+                .types
+                .insert(name.into(), semantic.into());
+        }
+        let checked = file::check(&job).unwrap();
+        assert_eq!(checked.rows, 3);
+        assert_eq!(checked.profile.columns[0].nulls, 0);
+        assert!(checked.field_audits[0].allows_empty_encoded_value);
+        let mut actual = Vec::new();
+        for output in &checked.outputs {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(dir.path().join(&output.name)).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                assert!(!batch.schema().field(0).is_nullable());
+                actual.extend(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.map(str::to_owned)),
+                );
+            }
+        }
+        assert_eq!(actual, vec![Some("".into()), Some(valid), Some("".into())]);
+        job.overrides.columns.insert(
+            name.into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: Some("^.+$".into()),
+                max_len: None,
+                enum_ids: None,
+                hex: false,
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        assert!(file::check(&job).is_err());
+    }
 }

@@ -106,8 +106,8 @@ integration tests execute the actual isolated worker, including memory-limit fai
 ## Solana signature columns
 
 By operator instruction, every top-level column named exactly `signature` uses the
-`SolanaSignature` contract in every native Parquet table, without a policy file. The field must
-be a string containing canonical base58 or standard/URL-safe base64 (padded or unpadded), decoding
+`SolanaSignature` contract in every native Parquet table, without a policy file. Nonempty values must
+be strings containing canonical base58 or standard/URL-safe base64 (padded or unpadded), decoding
 to exactly 64 bytes. Native nullability, field caps, optional patterns/length limits and explicit
 incident indicators still apply. Malformed encoding, wrong length, non-string schemas or a
 conflicting semantic override stop the run. Original encoded values are preserved.
@@ -121,7 +121,7 @@ Use `SolanaSignature` in optional `types` rules for signature fields with other 
 ## Solana token public keys
 
 Every top-level `token_a`, `token_b` and `fee_payer` column uses `SolanaPublicKey` across native Parquet
-tables. These must be native strings containing canonical base58 that decodes to exactly
+tables. Nonempty values must be native strings containing canonical base58 that decodes to exactly
 32 bytes. Base64-only values, malformed encodings, wrong lengths and conflicting semantic
 overrides stop the run. Native nullability, byte caps, explicit patterns/length limits and
 configured incident indicators on the original and decoded bytes still apply. Original
@@ -152,3 +152,13 @@ payload: an attacker could encode a payload with a matching decoded length. Leng
 not establish safety, and short base64 payloads can contain SQL or shell syntax. Tests cover
 reported addresses, opaque signature representations, explicit constraints/indicators and
 short encoded injections that remain findings.
+
+## Empty encoded values
+
+By operator instruction, empty strings are allowed in every `SolanaSignature` and
+`SolanaPublicKey` field, including automatic named columns and explicit semantic policies.
+They are preserved as empty strings, never converted to NULL or a zero-filled key/signature.
+Nonempty values still require their exact encoding and decoded length; whitespace is not
+empty. Native NULL constraints and explicit field patterns/length limits/incident indicators
+remain enforced. FIELD-AUDIT.json records `allows_empty_encoded_value` for these contracts;
+this does not override an explicit pattern that requires a nonempty value.

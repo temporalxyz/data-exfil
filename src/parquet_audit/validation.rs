@@ -596,9 +596,11 @@ impl Node {
                         decode_solana_public_key(&raw).map(DecodedSolana::Address)
                     }
                 };
-                let Some(decoded) = decoded else {
+                // Empty strings are an operator-approved missing-value representation.
+                // They remain distinct from NULL and still obey explicit field policies.
+                if !raw.is_empty() && decoded.is_none() {
                     return emit(self.finding(file, row, encoded.failure(), &raw));
-                };
+                }
                 if contract.max_len.is_some_and(|cap| raw.len() > cap as usize)
                     || self.pattern.is_some_and(|p| !p.is_match(&raw))
                 {
@@ -611,11 +613,12 @@ impl Node {
                 }
                 // Signature and public-key bytes are opaque, not text to run through speculative decoders.
                 // Keep explicitly supplied incident indicators on both exact representations.
-                if self
-                    .iocs
-                    .as_ref()
-                    .is_some_and(|i| i.is_match(&raw) || i.is_match(decoded.as_ref()))
-                {
+                if self.iocs.as_ref().is_some_and(|i| {
+                    i.is_match(&raw)
+                        || decoded
+                            .as_ref()
+                            .is_some_and(|value| i.is_match(value.as_ref()))
+                }) {
                     return emit(self.finding(
                         file,
                         row,
@@ -781,6 +784,8 @@ pub struct FieldAudit {
     pub opaque_binary: bool,
     #[serde(default)]
     pub recognizes_solana_encodings: bool,
+    #[serde(default)]
+    pub allows_empty_encoded_value: bool,
     pub enum_ids: Option<Vec<i16>>,
 }
 
@@ -797,6 +802,7 @@ impl Contract {
                     pattern: scalar.pattern.clone(),
                     max_len: scalar.max_len,
                     opaque_binary: node.binary,
+                    allows_empty_encoded_value: node.encoded.is_some(),
                     recognizes_solana_encodings: node.recognize_solana
                         && matches!(node.ty, Ch::String | Ch::FixedString(_)),
                     enum_ids: match &scalar.validator {

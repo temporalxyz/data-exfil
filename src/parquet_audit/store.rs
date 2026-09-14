@@ -99,7 +99,99 @@ pub struct S3Store {
     part_concurrency: usize,
 }
 
+pub(super) struct PublishedHead {
+    pub source: Source,
+    pub sha256: String,
+}
+
 impl S3Store {
+    pub(super) async fn published_head(&self, key: &str) -> Result<Option<PublishedHead>> {
+        tokio::time::timeout(self.timeout, async {
+            let head = match self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+            {
+                Ok(head) => head,
+                Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(infrastructure(e)),
+            };
+            let size =
+                u64::try_from(head.content_length().unwrap_or(-1)).map_err(infrastructure)?;
+            let etag = head
+                .e_tag()
+                .ok_or_else(|| infra::<()>("published HEAD omitted ETag").unwrap_err())?
+                .to_owned();
+            let sha256 = head
+                .metadata()
+                .and_then(|m| m.get("sha256"))
+                .cloned()
+                .unwrap_or_default();
+            if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return abort("published object lacks valid audit hash metadata");
+            }
+            Ok(Some(PublishedHead {
+                source: Source {
+                    key: key.into(),
+                    size,
+                    etag,
+                    version: head
+                        .version_id()
+                        .filter(|v| *v != "null")
+                        .map(str::to_owned),
+                },
+                sha256,
+            }))
+        })
+        .await
+        .map_err(infrastructure)?
+    }
+
+    pub(super) async fn published_manifest(&self, key: &str) -> Result<Option<super::Manifest>> {
+        let Some(head) = self.published_head(key).await? else {
+            return Ok(None);
+        };
+        if head.source.size == 0 || head.source.size > 32 * 1024 * 1024 {
+            return abort("published manifest exceeds size bound");
+        }
+        tokio::time::timeout(self.timeout, async {
+            let mut body = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .set_version_id(head.source.version.clone())
+                .if_match(&head.source.etag)
+                .send()
+                .await
+                .map_err(infrastructure)?
+                .body;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(infrastructure)?;
+                if bytes.len() as u64 + chunk.len() as u64 > head.source.size {
+                    return abort("published manifest grew while reading");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if bytes.len() as u64 != head.source.size
+                || format!("{:x}", Sha256::digest(&bytes)) != head.sha256
+            {
+                return abort("published manifest hash or size mismatch");
+            }
+            serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|_| abort::<()>("invalid published manifest JSON").unwrap_err())
+        })
+        .await
+        .map_err(infrastructure)?
+    }
+
     pub(super) fn with_timeout(&self, seconds: u64) -> Self {
         Self {
             timeout: Duration::from_secs(seconds),
@@ -1028,5 +1120,73 @@ mod tests {
                 .actual_requests()
                 .any(|r| r.method() == "POST" && r.headers().get("if-none-match") == Some("*"))
         );
+    }
+    #[test]
+    fn published_head_distinguishes_absence_from_access_errors() {
+        let (s, replay) = store(vec![response(404, &[], "")]);
+        assert!(
+            rt().block_on(s.published_manifest("MANIFEST.json"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(replay.actual_requests().count(), 1);
+        let (s, _) = store(vec![response(403, &[], "")]);
+        assert!(
+            rt().block_on(s.published_manifest("MANIFEST.json"))
+                .is_err()
+        );
+        let (s, _) = store(vec![response(
+            200,
+            &[("etag", "e"), ("content-length", "10")],
+            "",
+        )]);
+        assert!(rt().block_on(s.published_head("part.parquet")).is_err());
+    }
+
+    #[test]
+    fn published_manifest_reads_are_pinned_bounded_and_hash_checked() {
+        let hash = crate::export::diff::sha256_hex(b"{}");
+        for (body, reason) in [
+            ("{}", "invalid published manifest JSON"),
+            ("[]", "published manifest hash or size mismatch"),
+        ] {
+            let (s, replay) = store(vec![
+                response(
+                    200,
+                    &[
+                        ("etag", "e"),
+                        ("content-length", "2"),
+                        ("x-amz-version-id", "v1"),
+                        ("x-amz-meta-sha256", &hash),
+                    ],
+                    "",
+                ),
+                response(200, &[], body),
+            ]);
+            let error = rt()
+                .block_on(s.published_manifest("MANIFEST.json"))
+                .err()
+                .unwrap();
+            assert_eq!(error.reason(), reason);
+            let requests: Vec<_> = replay.actual_requests().collect();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].method(), "GET");
+            assert!(requests[1].uri().contains("versionId=v1"));
+            assert_eq!(requests[1].headers().get("if-match"), Some("e"));
+        }
+        let (s, replay) = store(vec![response(
+            200,
+            &[
+                ("etag", "e"),
+                ("content-length", "33554433"),
+                ("x-amz-meta-sha256", &hash),
+            ],
+            "",
+        )]);
+        assert!(
+            rt().block_on(s.published_manifest("MANIFEST.json"))
+                .is_err()
+        );
+        assert_eq!(replay.actual_requests().count(), 1);
     }
 }

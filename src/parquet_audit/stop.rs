@@ -49,7 +49,10 @@ impl Stop {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    async fn transfer<T>(&self, future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    pub(super) async fn transfer<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
         if self.stopped() {
             return abort("run stopped; no further transfers allowed");
         }

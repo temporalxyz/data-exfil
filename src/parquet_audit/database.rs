@@ -108,6 +108,7 @@ fn identity(
         source: args.source.trim_end_matches('/').into(),
         source_layout: ParquetSourceLayout::TableDate,
         preserve_paths: true,
+        skip_published: args.skip_published,
         destination: destination_uri(args).trim_end_matches('/').into(),
         from: args.from.clone().unwrap_or_default(),
         through: args.through.clone().unwrap_or_default(),
@@ -168,13 +169,23 @@ pub(super) async fn run(
     let selected: usize = inventories.iter().map(|i| i.days.len()).sum();
     let mut completed = 0usize;
     let mut total_rows = 0u64;
+    let mut reused = 0usize;
     while let Some((key, result)) = pending.next().await {
         let status = match result {
             Ok(rows) => {
                 completed += 1;
                 total_rows = total_rows.saturating_add(rows);
+                let reused_partition = work.join(&key).join("REUSED.json").exists();
+                if reused_partition {
+                    reused += 1;
+                }
                 Status {
-                    state: "complete".into(),
+                    state: if reused_partition {
+                        "reused"
+                    } else {
+                        "complete"
+                    }
+                    .into(),
                     reason: format!("{rows} rows"),
                 }
             }
@@ -191,6 +202,7 @@ pub(super) async fn run(
         tracing::info!(
             partition = key,
             completed_partitions = completed,
+            reused_partitions = reused,
             selected_partitions = selected,
             rows_in_completed_partitions = total_rows,
             elapsed_secs = started.elapsed().as_secs_f64(),
@@ -219,6 +231,13 @@ pub(super) async fn run(
             total_rows,
         )?;
     }
+    let result_path = work.join("RESULT.json");
+    if result_path.exists() {
+        let mut result: serde_json::Value = read_json(&result_path)?;
+        result["reused_partitions"] = reused.into();
+        result["newly_completed_partitions"] = (completed - reused).into();
+        atomic_json(&result_path, &result)?;
+    }
     if failed {
         abort("one or more database partitions failed audit; those partitions were not published")
     } else if interrupted {
@@ -230,6 +249,9 @@ pub(super) async fn run(
 
 pub(super) fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
     let database = args.database.as_deref().expect("database dispatch");
+    if args.skip_published && matches!(args.mode, crate::cli::Mode::Survey) {
+        return usage("--skip-published requires an upload run in enforce mode");
+    }
     let _: TableRef = format!("{database}.placeholder")
         .parse()
         .map_err(|e: String| usage::<()>(e).unwrap_err())?;
@@ -328,6 +350,9 @@ pub(super) fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
             let clean: Arc<dyn Store> = match &clean_store { Some(s) => Arc::new(s.with_timeout(overrides.limits.wall_clock_secs)), None => Arc::new(store::NoUploadStore) };
             let mut pipeline = Pipeline::new(table.identity.clone(), work.join(&table.identity.table), destination.clone(), String::new(), overrides, tuning.clone(), inventory.imported_at.clone(), args.resume, raw, clean, Arc::new(ProcessWorker));
             pipeline.native_policy = Some(native);
+            if args.skip_published {
+                pipeline.published_store = clean_store.as_ref().map(|s| Arc::new(s.with_timeout(pipeline.overrides.limits.wall_clock_secs)) as Arc<dyn published::PublishedStore>);
+            }
             pipelines.push(pipeline);
         }
         if !args.resume {

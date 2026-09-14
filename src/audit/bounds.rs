@@ -169,25 +169,34 @@ pub fn check_value_precompiled(
     row: u64,
     pattern: Option<&Regex>,
 ) -> Result<Option<Finding>> {
-    check_value_impl(contract, field, limits, page, row, pattern, true)
+    check_value_impl(contract, field.bytes(), limits, page, row, pattern, true)
 }
 
-/// Validate type and explicit field constraints without the generic text payload scanner.
-/// Callers must establish a native scalar or an explicitly allowed opaque representation.
-pub(crate) fn check_constraints_precompiled(
+/// Check borrowed native bytes without copying them into a TSV field allocation.
+/// Generic text scanning may only be disabled for native scalars or accepted opaque values.
+pub(crate) fn check_bytes_precompiled(
     contract: &ColumnContract,
-    field: &Field,
+    bytes: &[u8],
     limits: &Limits,
     page: u32,
     row: u64,
     pattern: Option<&Regex>,
+    scan_payloads: bool,
 ) -> Result<Option<Finding>> {
-    check_value_impl(contract, field, limits, page, row, pattern, false)
+    check_value_impl(
+        contract,
+        Some(bytes),
+        limits,
+        page,
+        row,
+        pattern,
+        scan_payloads,
+    )
 }
 
 fn check_value_impl(
     contract: &ColumnContract,
-    field: &Field,
+    field: Option<&[u8]>,
     limits: &Limits,
     page: u32,
     row: u64,
@@ -207,7 +216,7 @@ fn check_value_impl(
     };
 
     let bytes = match field {
-        Field::Null => {
+        None => {
             if contract.nullable {
                 return Ok(None);
             }
@@ -219,7 +228,7 @@ fn check_value_impl(
                 b"",
             )));
         }
-        Field::Value(bytes) => bytes.as_slice(),
+        Some(bytes) => bytes,
     };
 
     // The section 8.3 bound, produced by the same match that produced the export form.

@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 use arrow_array::RecordBatch;
 use serde::{Deserialize, Serialize};
 
-use super::{finding_error, validation::hex};
-use crate::abort::Result;
+use super::validation::hex;
+use crate::abort::{Result, abort};
 
 const SAMPLE: usize = 256;
 
@@ -14,6 +14,9 @@ const SAMPLE: usize = 256;
 struct Sketch(BTreeSet<u64>);
 impl Sketch {
     fn add(&mut self, hash: u64) {
+        if self.0.len() == SAMPLE && self.0.last().is_some_and(|largest| hash >= *largest) {
+            return;
+        }
         self.0.insert(hash);
         if self.0.len() > SAMPLE {
             self.0.pop_last();
@@ -85,6 +88,71 @@ impl Profile {
     }
 
     pub fn add(&mut self, batch: &RecordBatch, kept: &[usize]) -> Result<()> {
+        let options = arrow_cast::display::FormatOptions::default();
+        let formatters: Vec<_> = kept
+            .iter()
+            .map(|index| {
+                let array = batch.column(*index);
+                if array.null_count() == array.len() {
+                    return Ok(None);
+                }
+                arrow_cast::display::ArrayFormatter::try_new(array.as_ref(), &options)
+                    .map(Some)
+                    .map_err(|_| profile_error())
+            })
+            .collect::<Result<_>>()?;
+        let mut text = String::new();
+        for row in 0..batch.num_rows() {
+            self.rows += 1;
+            let mut row_hash = std::collections::hash_map::DefaultHasher::new();
+            for (slot, index) in kept.iter().enumerate() {
+                let array = batch.column(*index);
+                if array.is_null(row) {
+                    self.columns[slot].nulls += 1;
+                    0u8.hash(&mut row_hash);
+                    continue;
+                }
+                1u8.hash(&mut row_hash);
+                text.clear();
+                formatters[slot]
+                    .as_ref()
+                    .expect("non-null column formatter")
+                    .value(row)
+                    .write(&mut text)
+                    .map_err(|_| profile_error())?;
+                text.hash(&mut row_hash);
+                let col = &mut self.columns[slot];
+                col.min_display_bytes = col.min_display_bytes.min(text.len());
+                col.max_display_bytes = col.max_display_bytes.max(text.len());
+                let key = hash(text.as_bytes());
+                self.seen[slot].add(key);
+                let top = &mut self.top[slot];
+                if let Some(entry) = top.get_mut(&key) {
+                    entry.1 += 1;
+                } else {
+                    let floor = if top.len() == 16 {
+                        let victim = *top.iter().min_by_key(|(_, (_, count, _))| count).unwrap().0;
+                        top.remove(&victim).unwrap().1
+                    } else {
+                        0
+                    };
+                    top.insert(
+                        key,
+                        (
+                            hex(&text.as_bytes()[..text.len().min(64)]),
+                            floor + 1,
+                            floor,
+                        ),
+                    );
+                }
+            }
+            self.rows_seen.add(row_hash.finish());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn add_reference(&mut self, batch: &RecordBatch, kept: &[usize]) -> Result<()> {
         for row in 0..batch.num_rows() {
             self.rows += 1;
             let mut row_hash = std::collections::hash_map::DefaultHasher::new();
@@ -97,7 +165,7 @@ impl Profile {
                 }
                 1u8.hash(&mut row_hash);
                 let text = arrow_cast::display::array_value_to_string(array.as_ref(), row)
-                    .map_err(finding_error)?;
+                    .map_err(|_| profile_error())?;
                 text.hash(&mut row_hash);
                 let col = &mut self.columns[slot];
                 col.min_display_bytes = col.min_display_bytes.min(text.len());
@@ -140,5 +208,29 @@ impl Profile {
                 .sort_by_key(|(_, count, _)| std::cmp::Reverse(*count));
         }
         Summary { rows: self.rows, duplicate_rows_estimate: self.rows.saturating_sub(self.rows_seen.estimate()), method: "KMV-256 distinct/duplicate estimates; SpaceSaving-16 frequent values (hex sample, estimated count, maximum overcount); lengths measure display bytes; row/null counts exact".into(), columns: self.columns }
+    }
+}
+
+fn profile_error() -> crate::abort::SalvageError {
+    abort::<()>("native Parquet shape profiling could not format a value").unwrap_err()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sketch_early_rejection_preserves_exact_sample() {
+        let mut fast = Sketch::default();
+        let mut reference = BTreeSet::new();
+        for i in 0u64..10_000 {
+            let value = hash(&(i % 1700).to_le_bytes());
+            fast.add(value);
+            reference.insert(value);
+            if reference.len() > SAMPLE {
+                reference.pop_last();
+            }
+            assert_eq!(fast.0, reference);
+        }
     }
 }

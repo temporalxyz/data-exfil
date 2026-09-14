@@ -30,7 +30,7 @@ base64                = "0.22"
 bs58                  = "0.5.1"
 percent-encoding      = "2"
 unicode-normalization = "0.1"
-arrow-array           = "56.2"
+arrow-array           = { version = "56.2", features = ["chrono-tz"] }
 arrow-cast            = "56.2"
 arrow-schema          = { version = "56.2", features = ["serde"] }
 parquet               = { version = "56.2", default-features = false, features = ["arrow", "snap", "flate2-zlib-rs", "lz4", "zstd"] }

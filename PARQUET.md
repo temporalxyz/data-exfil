@@ -175,7 +175,7 @@ until every file in that day passes**. Its uploads overlap downloads/checks for 
 manifest is uploaded only after all data and supporting artifacts are complete. Other days
 continue if one fails; the command returns nonzero if any selected day fails or is absent.
 
-With `-v`, logs report effective concurrency, transfer/check timings, queue waits, bytes, rows,
+With `-vv`, logs report effective concurrency, transfer/check timings, queue waits, bytes, rows,
 and day throughput. Start with defaults, then compare the same representative days at increasing
 concurrency; stop increasing workers once CPU, network or scratch I/O saturates. There is no
 fixed throughput guarantee without measuring the server and representative data.
@@ -218,7 +218,7 @@ production worker process on the target Linux server before selecting final conc
 
 ### Progress logging
 
-With `-v`, the controller logs partition starts and download/audit/upload stage starts and
+With `-vv`, the controller logs partition starts and download/audit/upload stage starts and
 finishes, plus a heartbeat every 15 seconds while a stage is running. Downloads also report
 bytes received, total bytes and average MiB/s every 15 seconds when data is flowing. Audit
 completion reports validated rows and output chunks; upload completion reports chunk bytes
@@ -226,3 +226,52 @@ and rows. Database partition completion includes completed/selected partitions, 
 completed partitions and elapsed time. Audit heartbeats indicate liveness, not row-level
 completion; row totals are reported when the file audit finishes. Logs do not include field
 values. `--verify` produces no upload events because S3 writes are disabled.
+
+### Reusing completed database publications
+
+Add `--skip-published` to an enforce-mode **database upload** command with a new batch ID.
+The source inventory is still listed and pinned. For each selected table/day, the pipeline
+checks the stable clean `database/table/YYYY/MM/DD/MANIFEST.json` before downloading source
+data. No manifest means normal auditing and publication. A committed manifest is read with
+pinned version/ETag and checked against its SHA-256 metadata. Its source keys, sizes, ETags,
+and versions must exactly cover the current partition; row totals and output keys must agree.
+Every referenced output is checked with HEAD for size, ETag, version and SHA-256 metadata;
+the three audit reports must also exist with valid hash metadata. Missing or inconsistent
+committed objects, changed sources, permission failures and schema disagreements stop the run.
+
+This trusts the clean bucket and the prior audit revision. It does **not** re-download clean
+Parquet, hash its bytes again, or claim that the current binary re-audited those rows. Custom
+field/type/incident policies or dropped columns are not eligible, and recorded audit limits
+must match. No previous STOP marker is removed, and no clean object is overwritten/deleted.
+Incomplete partitions without a manifest are not skipped; existing partial publication can
+still cause the normal create-only collision checks to stop the run.
+
+`report.json` marks reused partitions as `reused`; `RESULT.json` includes `reused_partitions`
+and `newly_completed_partitions`. Total completed counts include both. Each reused partition
+has a local `REUSED.json` recording its original batch, code revision, contract and row count.
+The flag cannot be combined with `--verify`, `--dry-run`, `--resume`, or single-table mode.
+Start a new batch after a stopped attempt. Progress is visible with `-vv`.
+
+### Audit throughput
+
+Native audits reuse Arrow display formatters once per batch/column and reuse the profiling
+string buffer, borrow source string/blob bytes, and avoid redundant base58 re-encoding.
+A thread-local cache holds at most 4096 successfully decoded public keys; it caches only
+representation decoding, never a field's audit decision. Explicit patterns, length limits,
+incident indicators and all other field checks still run. Shape statistics retain their
+existing algorithms and results. Download and upload concurrency are unchanged.
+
+`file audit complete` logs and local `checked.json` include `decode_secs`, `validation_secs`,
+`profile_secs`, and `write_secs`. These measure the batch-processing stages; initial hashing,
+footer parsing and physical narrow-integer prechecks are outside these individual counters.
+
+Run the repeatable local audit benchmark (fixture generation is excluded from timing):
+
+```bash
+cargo test --release --locked --lib parquet_native_audit_throughput -- --ignored --nocapture
+SALVAGE_BENCH_UNIQUE=1 cargo test --release --locked --lib parquet_native_audit_throughput -- --ignored --nocapture
+```
+
+The fixture has 100,000 rows, UTC timestamps, repeated addresses, a signature, UInt64 and Float64
+columns. The second command uses unique signatures. This measures local audit/profile/output
+throughput, not S3 throughput or production completion time.

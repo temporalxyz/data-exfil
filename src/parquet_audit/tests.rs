@@ -670,6 +670,7 @@ fn pipeline(
         source: "s3://raw".into(),
         source_layout: crate::cli::ParquetSourceLayout::DateTable,
         preserve_paths: false,
+        skip_published: false,
         destination: "s3://clean".into(),
         from: "2026-09-01".into(),
         through: "2026-09-03".into(),
@@ -2149,4 +2150,546 @@ fn solana_recognition_does_not_exempt_short_encoded_payloads() {
         let dir = tempfile::tempdir().unwrap();
         assert!(file::check(&native_job(dir.path(), &text_batch(&[&encoded]))).is_err());
     }
+}
+
+#[test]
+fn utc_millisecond_timestamps_survive_native_audit_profiling_and_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let values = vec![1783900800000i64, 1783900800123, 1783900800999];
+    let ty = DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, Some("UTC".into()));
+    let b = batch(
+        vec![
+            Field::new("insert_time", ty.clone(), false),
+            Field::new("block_time", ty.clone(), false),
+        ],
+        vec![
+            Arc::new(TimestampMillisecondArray::from(values.clone()).with_timezone("UTC")),
+            Arc::new(TimestampMillisecondArray::from(values.clone()).with_timezone("UTC")),
+        ],
+    );
+    let checked = file::check(&native_job(dir.path(), &b)).unwrap();
+    assert_eq!(checked.rows, 3);
+    assert_eq!(checked.profile.rows, 3);
+    for column in &checked.profile.columns {
+        assert_eq!(column.nulls, 0);
+        assert!(column.max_display_bytes > 0);
+        assert!(!column.frequent.is_empty());
+    }
+    let mut actual = [Vec::new(), Vec::new()];
+    for part in &checked.outputs {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(dir.path().join(&part.name)).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        for batch in reader {
+            let batch = batch.unwrap();
+            for (index, collected) in actual.iter_mut().enumerate() {
+                assert_eq!(batch.schema().field(index).data_type(), &ty);
+                assert!(!batch.schema().field(index).is_nullable());
+                let array = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .unwrap();
+                collected.extend(array.values().iter().copied());
+            }
+        }
+    }
+    assert_eq!(actual, [values.clone(), values]);
+}
+
+#[test]
+fn timezone_support_preserves_audit_restrictions_and_redacts_profile_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new(
+            "time",
+            DataType::Timestamp(
+                arrow_schema::TimeUnit::Millisecond,
+                Some("America/New_York".into()),
+            ),
+            false,
+        )],
+        vec![Arc::new(
+            TimestampMillisecondArray::from(vec![1783900800000]).with_timezone("America/New_York"),
+        )],
+    );
+    let job = native_job(dir.path(), &b);
+    assert!(
+        validation::build_native(
+            job.native_policy.as_ref().unwrap(),
+            &job.overrides,
+            b.schema().as_ref()
+        )
+        .is_err()
+    );
+
+    let b = batch(
+        vec![Field::new(
+            "time",
+            DataType::Timestamp(
+                arrow_schema::TimeUnit::Millisecond,
+                Some("untrusted-timezone-canary".into()),
+            ),
+            false,
+        )],
+        vec![Arc::new(
+            TimestampMillisecondArray::from(vec![0]).with_timezone("untrusted-timezone-canary"),
+        )],
+    );
+    let mut p = profile::Profile::new(std::iter::once("time".into()));
+    let error = p.add(&b, &[0]).unwrap_err();
+    assert_eq!(
+        error.reason(),
+        "native Parquet shape profiling could not format a value"
+    );
+    assert!(!error.to_string().contains("untrusted-timezone-canary"));
+}
+
+impl published::PublishedStore for FakeStore {
+    fn manifest<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Manifest>>> {
+        Box::pin(async move {
+            self.data
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|bytes| serde_json::from_slice(bytes).map_err(infrastructure))
+                .transpose()
+        })
+    }
+    fn head<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<store::PublishedHead>>> {
+        Box::pin(async move {
+            Ok(self.data.lock().unwrap().get(key).map(|bytes| {
+                let sha = crate::export::diff::sha256_hex(bytes);
+                store::PublishedHead {
+                    source: Source {
+                        key: key.into(),
+                        size: bytes.len() as u64,
+                        version: Some("1".into()),
+                        etag: sha.clone(),
+                    },
+                    sha256: sha,
+                }
+            }))
+        })
+    }
+}
+
+#[test]
+fn new_batch_reuses_published_partition_without_data_transfers_or_auditing() {
+    let old = tempfile::tempdir().unwrap();
+    let new = tempfile::tempdir().unwrap();
+    let track = Arc::new(Tracker::default());
+    let raw = Arc::new(FakeStore::new(track.clone()));
+    let clean = Arc::new(FakeStore::new(track.clone()));
+    let day = add_day(&raw, 1, &["safe"]);
+    let mut p = pipeline(old.path(), track.clone(), raw.clone(), clean.clone());
+    p.native_policy = Some(policy::TablePolicy::default());
+    p.identity.preserve_paths = true;
+    assert_eq!(runtime().block_on(p.run_day(&day)).unwrap(), 1);
+    stop::persist(&old.path().join("STOP.json"), "later partition failed").unwrap();
+    track.events.lock().unwrap().clear();
+    let mut next = pipeline(new.path(), track.clone(), raw, clean.clone());
+    next.native_policy = Some(policy::TablePolicy::default());
+    next.identity.preserve_paths = true;
+    next.identity.batch = "new-batch".into();
+    next.identity.contract_sha256 = "new-build-contract".into();
+    next.published_store = Some(clean);
+    assert_eq!(runtime().block_on(next.run_day(&day)).unwrap(), 1);
+    assert!(track.events.lock().unwrap().is_empty());
+    let reused: serde_json::Value =
+        read_json(&new.path().join(&day.date).join("REUSED.json")).unwrap();
+    assert_eq!(reused["original_batch"], "b1");
+    assert_eq!(reused["revalidated"], false);
+    assert!(old.path().join("STOP.json").exists());
+}
+
+#[test]
+fn published_reuse_rejects_changed_sources_missing_outputs_and_inconsistent_manifests() {
+    let old = tempfile::tempdir().unwrap();
+    let track = Arc::new(Tracker::default());
+    let raw = Arc::new(FakeStore::new(track.clone()));
+    let clean = Arc::new(FakeStore::new(track.clone()));
+    let day = add_day(&raw, 1, &["safe"]);
+    let mut p = pipeline(old.path(), track.clone(), raw.clone(), clean.clone());
+    p.native_policy = Some(policy::TablePolicy::default());
+    p.identity.preserve_paths = true;
+    runtime().block_on(p.run_day(&day)).unwrap();
+    let original = clean.data.lock().unwrap().clone();
+    let manifest_key = p.output_key(&day, "MANIFEST.json");
+    for case in [
+        "source",
+        "missing-output",
+        "changed-output",
+        "missing-report",
+        "rows",
+        "path",
+        "duplicate",
+        "policy",
+    ] {
+        *clean.data.lock().unwrap() = original.clone();
+        let new = tempfile::tempdir().unwrap();
+        let mut next = pipeline(new.path(), track.clone(), raw.clone(), clean.clone());
+        next.native_policy = Some(policy::TablePolicy::default());
+        next.identity.preserve_paths = true;
+        next.identity.batch = "new".into();
+        next.published_store = Some(clean.clone());
+        let mut changed_day = day.clone();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&original[&manifest_key]).unwrap();
+        let output = manifest["objects"][0]["key"].as_str().unwrap().to_owned();
+        match case {
+            "source" => changed_day.sources[0].etag = "changed".into(),
+            "missing-output" => {
+                clean.data.lock().unwrap().remove(&output);
+            }
+            "changed-output" => {
+                clean
+                    .data
+                    .lock()
+                    .unwrap()
+                    .insert(output, b"changed".to_vec());
+            }
+            "missing-report" => {
+                clean
+                    .data
+                    .lock()
+                    .unwrap()
+                    .remove(&p.output_key(&day, "FIELD-AUDIT.json"));
+            }
+            "rows" => manifest["rows"] = 999.into(),
+            "path" => manifest["objects"][0]["key"] = "other/partition.parquet".into(),
+            "duplicate" => {
+                let item = manifest["objects"][0].clone();
+                manifest["objects"].as_array_mut().unwrap().push(item);
+            }
+            "policy" => next
+                .native_policy
+                .as_mut()
+                .unwrap()
+                .iocs
+                .push("canary".into()),
+            _ => unreachable!(),
+        }
+        clean
+            .data
+            .lock()
+            .unwrap()
+            .insert(manifest_key.clone(), serde_json::to_vec(&manifest).unwrap());
+        track.events.lock().unwrap().clear();
+        assert!(
+            runtime().block_on(next.run_day(&changed_day)).is_err(),
+            "{case}"
+        );
+        assert!(track.events.lock().unwrap().is_empty(), "{case}");
+        assert!(!new.path().join(&day.date).join("REUSED.json").exists());
+    }
+}
+
+#[test]
+fn missing_publication_is_audited_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let track = Arc::new(Tracker::default());
+    let raw = Arc::new(FakeStore::new(track.clone()));
+    let clean = Arc::new(FakeStore::new(track.clone()));
+    let day = add_day(&raw, 1, &["safe"]);
+    let mut p = pipeline(dir.path(), track.clone(), raw, clean.clone());
+    p.native_policy = Some(policy::TablePolicy::default());
+    p.identity.preserve_paths = true;
+    p.published_store = Some(clean);
+    assert_eq!(runtime().block_on(p.run_day(&day)).unwrap(), 1);
+    assert!(
+        track
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_with("download:"))
+    );
+    assert!(!dir.path().join(&day.date).join("REUSED.json").exists());
+}
+
+#[test]
+fn skip_published_is_only_available_for_database_uploads() {
+    use clap::Parser;
+    let base = [
+        "salvage",
+        "audit-parquet",
+        "--database",
+        "analytics",
+        "--source",
+        "s3://raw/analytics/",
+        "--destination",
+        "s3://clean/",
+        "--batch",
+        "reuse-test",
+        "--skip-published",
+        "--memory-bytes",
+        "8589934592",
+        "--scratch-bytes",
+        "68719476736",
+        "--max-day-scratch-bytes",
+        "68719476736",
+    ];
+    crate::cli::Cli::try_parse_from(base).unwrap();
+    for flag in ["--verify", "--dry-run", "--resume"] {
+        assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain([flag])).is_err());
+    }
+}
+
+#[test]
+fn database_reports_reused_and_new_partitions_separately() {
+    let old = tempfile::tempdir().unwrap();
+    let new = tempfile::tempdir().unwrap();
+    let track = Arc::new(Tracker::default());
+    let raw = Arc::new(FakeStore::new(track.clone()));
+    let clean = Arc::new(FakeStore::new(track.clone()));
+    let first = add_day(&raw, 1, &["safe"]);
+    let second = add_day(&raw, 2, &["also-safe"]);
+    let mut p = pipeline(old.path(), track.clone(), raw.clone(), clean.clone());
+    p.native_policy = Some(policy::TablePolicy::default());
+    p.identity.preserve_paths = true;
+    runtime().block_on(p.run_day(&first)).unwrap();
+    let mut next = pipeline(&new.path().join("db.events"), track, raw, clean.clone());
+    next.native_policy = Some(policy::TablePolicy::default());
+    next.identity.preserve_paths = true;
+    next.identity.batch = "new".into();
+    next.published_store = Some(clean);
+    let inventory = Inventory {
+        identity: next.identity.clone(),
+        imported_at: next.imported_at.clone(),
+        days: vec![first, second],
+    };
+    let tuning = next.tuning.clone();
+    runtime()
+        .block_on(database::run(
+            &mut [next],
+            &[inventory],
+            new.path(),
+            &tuning,
+        ))
+        .unwrap();
+    let result: serde_json::Value = read_json(&new.path().join("RESULT.json")).unwrap();
+    assert_eq!(result["completed_partitions"], 2);
+    assert_eq!(result["reused_partitions"], 1);
+    assert_eq!(result["newly_completed_partitions"], 1);
+    assert_eq!(result["rows_in_completed_partitions"], 2);
+    let report: BTreeMap<String, Status> = read_json(&new.path().join("report.json")).unwrap();
+    assert_eq!(report["db.events/2026-09-01"].state, "reused");
+    assert_eq!(report["db.events/2026-09-02"].state, "complete");
+}
+
+/// Local CPU/disk benchmark, independent of S3; fixture construction is outside timing.
+#[test]
+#[ignore = "native audit throughput benchmark; run explicitly in release mode"]
+fn parquet_native_audit_throughput() {
+    let count = 100_000;
+    let addresses: Vec<_> = (0..64)
+        .map(|i| bs58::encode([i as u8; 32]).into_string())
+        .collect();
+    let unique = std::env::var_os("SALVAGE_BENCH_UNIQUE").is_some();
+    let signatures: Vec<_> = (0..count)
+        .map(|i| {
+            let mut bytes = [7u8; 64];
+            if unique {
+                bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            }
+            bs58::encode(bytes).into_string()
+        })
+        .collect();
+    let b = batch(
+        vec![
+            Field::new(
+                "insert_time",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("pool", DataType::Utf8, false),
+            Field::new("token_a", DataType::Utf8, false),
+            Field::new("signature", DataType::Utf8, false),
+            Field::new("slot", DataType::UInt64, false),
+            Field::new("price", DataType::Float64, false),
+        ],
+        vec![
+            Arc::new(
+                TimestampMillisecondArray::from_iter_values(
+                    (0..count).map(|i| 1783900800000 + i as i64),
+                )
+                .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from_iter_values(
+                (0..count).map(|i| addresses[i % 64].as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..count).map(|i| addresses[(i + 1) % 64].as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                signatures.iter().map(String::as_str),
+            )),
+            Arc::new(UInt64Array::from_iter_values((0..count).map(|i| i as u64))),
+            Arc::new(Float64Array::from_iter_values(
+                (0..count).map(|i| i as f64 / 7.0),
+            )),
+        ],
+    );
+    for run in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut job = native_job(dir.path(), &b);
+        job.batch_rows = 8192;
+        let reference = std::env::var_os("SALVAGE_BENCH_NUMERIC_REFERENCE").is_some();
+        if reference {
+            for name in ["slot", "price"] {
+                job.overrides.columns.insert(
+                    name.into(),
+                    crate::models::ColumnOverride {
+                        class: crate::models::FreedomClass::Closed,
+                        pattern: None,
+                        max_len: None,
+                        enum_ids: None,
+                        hex: false,
+                        drop: false,
+                        rotation_owner: None,
+                    },
+                );
+            }
+        }
+        let started = Instant::now();
+        let checked = file::check(&job).unwrap();
+        let seconds = started.elapsed().as_secs_f64();
+        assert_eq!(checked.rows, count as u64);
+        eprintln!(
+            "native-audit run={run} unique_signatures={unique} full_numeric_validators={reference} rows={count} seconds={seconds:.3} rows/sec={:.0}",
+            count as f64 / seconds
+        );
+        eprintln!(
+            "stages decode={:.3}s validation={:.3}s profile={:.3}s write={:.3}s",
+            checked.timings.decode_secs,
+            checked.timings.validation_secs,
+            checked.timings.profile_secs,
+            checked.timings.write_secs
+        );
+    }
+}
+
+#[test]
+fn optimized_profile_matches_reference_statistics() {
+    let n = 2048;
+    let b = batch(
+        vec![
+            Field::new("n", DataType::UInt64, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new(
+                "time",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("ratio", DataType::Float64, false),
+        ],
+        vec![
+            Arc::new(UInt64Array::from_iter_values((0..n).map(|i| i as u64))),
+            Arc::new(StringArray::from_iter((0..n).map(|i| {
+                if i % 7 == 0 {
+                    None
+                } else {
+                    Some(format!("v{}", i % 53))
+                }
+            }))),
+            Arc::new(
+                TimestampMillisecondArray::from_iter_values(
+                    (0..n).map(|i| 1783900800000 + i as i64),
+                )
+                .with_timezone("UTC"),
+            ),
+            Arc::new(Float64Array::from_iter_values((0..n).map(|i| {
+                match i % 7 {
+                    0 => f64::NAN,
+                    1 => f64::INFINITY,
+                    2 => -0.0,
+                    _ => i as f64 / 3.0,
+                }
+            }))),
+        ],
+    );
+    let mut fast = profile::Profile::new(b.schema().fields().iter().map(|f| f.name().clone()));
+    let mut reference = profile::Profile::new(b.schema().fields().iter().map(|f| f.name().clone()));
+    for start in (0..n).step_by(256) {
+        let slice = b.slice(start, 256);
+        fast.add(&slice, &[0, 1, 2, 3]).unwrap();
+        reference.add_reference(&slice, &[0, 1, 2, 3]).unwrap();
+    }
+    assert_eq!(
+        serde_json::to_value(fast.finish()).unwrap(),
+        serde_json::to_value(reference.finish()).unwrap()
+    );
+}
+
+#[test]
+fn native_numeric_fast_path_matches_full_validators_and_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let reference_dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![
+            Field::new("signed", DataType::Int64, false),
+            Field::new("unsigned", DataType::UInt64, false),
+            Field::new("float", DataType::Float64, false),
+            Field::new("boolean", DataType::Boolean, true),
+            Field::new("small", DataType::UInt8, false),
+        ],
+        vec![
+            Arc::new(Int64Array::from(vec![i64::MIN, -1, 0, 10, i64::MAX])),
+            Arc::new(UInt64Array::from(vec![u64::MAX, 0, 1, 9, 10])),
+            Arc::new(Float64Array::from(vec![
+                f64::NAN,
+                f64::INFINITY,
+                -0.0,
+                1.5,
+                f64::NEG_INFINITY,
+            ])),
+            Arc::new(BooleanArray::from(vec![
+                None,
+                Some(true),
+                Some(false),
+                Some(true),
+                None,
+            ])),
+            Arc::new(UInt8Array::from(vec![0, 1, 9, 10, 255])),
+        ],
+    );
+    let mut fast_job = native_job(dir.path(), &b);
+    fast_job.batch_rows = 2; // Exercises provenance buffer reuse and the final shorter batch.
+    let mut reference_job = fast_job.clone();
+    reference_job.work = reference_dir.path().into();
+    for field in b.schema().fields() {
+        reference_job.overrides.columns.insert(
+            field.name().clone(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: None,
+                max_len: None,
+                hex: false,
+                drop: false,
+                enum_ids: None,
+                rotation_owner: None,
+            },
+        );
+    }
+    let fast = file::check(&fast_job).unwrap();
+    let reference = file::check(&reference_job).unwrap();
+    assert_eq!(fast.outputs, reference.outputs);
+    assert_eq!(fast.schema, reference.schema);
+    assert_eq!(
+        serde_json::to_value(fast.profile).unwrap(),
+        serde_json::to_value(reference.profile).unwrap()
+    );
+
+    let cap_dir = tempfile::tempdir().unwrap();
+    let cap_batch = batch(
+        vec![Field::new("value", DataType::UInt64, false)],
+        vec![Arc::new(UInt64Array::from(vec![u64::MAX]))],
+    );
+    let mut capped = native_job(cap_dir.path(), &cap_batch);
+    capped.overrides.limits.max_field_bytes = 19;
+    assert!(file::check(&capped).is_err());
 }

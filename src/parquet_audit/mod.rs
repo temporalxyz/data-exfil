@@ -3,6 +3,7 @@ mod database;
 pub mod file;
 pub mod policy;
 pub mod profile;
+mod published;
 mod stop;
 pub mod store;
 pub mod validation;
@@ -206,6 +207,8 @@ pub struct Identity {
     pub source_layout: crate::cli::ParquetSourceLayout,
     #[serde(default)]
     pub preserve_paths: bool,
+    #[serde(default)]
+    pub skip_published: bool,
     pub destination: String,
     pub from: String,
     pub through: String,
@@ -377,6 +380,7 @@ pub struct Pipeline {
     pub ddl: String,
     pub native_policy: Option<policy::TablePolicy>,
     schema_lock: std::sync::Mutex<()>,
+    published_store: Option<Arc<dyn published::PublishedStore>>,
     stop: Arc<stop::Stop>,
     pub overrides: Overrides,
     pub tuning: Tuning,
@@ -425,6 +429,7 @@ impl Pipeline {
             ddl,
             native_policy: None,
             schema_lock: std::sync::Mutex::new(()),
+            published_store: None,
             overrides,
             tuning,
             imported_at,
@@ -455,10 +460,20 @@ impl Pipeline {
             verify = self.identity.dry_run,
             "partition started"
         );
-        let result = std::panic::AssertUnwindSafe(self.day(day))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| abort("partition panicked; entire run stopped"));
+        let result = std::panic::AssertUnwindSafe(async {
+            if let Some(store) = &self.published_store
+                && let Some(rows) = self
+                    .stop
+                    .transfer(published::reuse(self, day, store.as_ref()))
+                    .await?
+            {
+                return Ok(rows);
+            }
+            self.day(day).await
+        })
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| abort("partition panicked; entire run stopped"));
         if let Err(error) = &result {
             self.stop.trip(error);
         }
@@ -788,6 +803,10 @@ impl Pipeline {
                             file = index,
                             rows = checked.rows,
                             output_chunks = checked.outputs.len(),
+                            decode_secs = checked.timings.decode_secs,
+                            validation_secs = checked.timings.validation_secs,
+                            profile_secs = checked.timings.profile_secs,
+                            write_secs = checked.timings.write_secs,
                             "file audit complete"
                         );
                         if sha != checked.input_sha256 {
@@ -841,6 +860,17 @@ impl Pipeline {
         // Publication is per partition; a later drift rejects that partition, never mutates the baseline.
         if self.native_policy.is_some() {
             let _lock = self.schema_lock.lock().map_err(infrastructure)?;
+            let reused_schema = self.work.join("REUSED-SOURCE-SCHEMA.json");
+            if reused_schema.exists() {
+                let expected: String = read_json(&reused_schema)?;
+                let actual = crate::export::diff::sha256_hex(
+                    &serde_json::to_vec(&checked.values().next().unwrap().input_schema)
+                        .map_err(infrastructure)?,
+                );
+                if actual != expected {
+                    return abort("source schema differs from reused published partitions");
+                }
+            }
             let path = self.work.join("SOURCE-SCHEMA.json");
             let baseline = if path.exists() {
                 read_json::<arrow_schema::Schema>(&path)?
@@ -1172,6 +1202,7 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
         source: args.source.trim_end_matches('/').into(),
         source_layout: args.source_layout,
         preserve_paths: false,
+        skip_published: false,
         destination: destination_uri(args).trim_end_matches('/').into(),
         from: from.into(),
         through: through.into(),

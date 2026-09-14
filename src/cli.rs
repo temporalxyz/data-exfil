@@ -414,6 +414,10 @@ pub struct ParquetArgs {
     /// Database name. Source is its S3 prefix; destination is the clean bucket/root.
     #[arg(long, conflicts_with = "table")]
     pub database: Option<String>,
+    /// Reuse committed clean manifests from earlier batches (database upload runs only).
+    /// Checks source identities and clean object metadata; does not re-audit their contents.
+    #[arg(long, requires = "database", conflicts_with_all = ["verify", "dry_run", "resume"])]
+    pub skip_published: bool,
     /// Optional TOML field rules and limits; Parquet supplies schemas without DDL files.
     #[arg(long)]
     pub audit_policy: Option<PathBuf>,

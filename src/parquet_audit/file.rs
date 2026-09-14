@@ -49,6 +49,14 @@ pub struct Output {
     pub sha256: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuditTimings {
+    pub decode_secs: f64,
+    pub validation_secs: f64,
+    pub profile_secs: f64,
+    pub write_secs: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checked {
     pub input_sha256: String,
@@ -62,6 +70,8 @@ pub struct Checked {
     pub field_audits: Vec<validation::FieldAudit>,
     pub profile: profile::Summary,
     pub elapsed_secs: f64,
+    #[serde(default)]
+    pub timings: AuditTimings,
 }
 
 /// Enforce output reservations *during writes*, including parquet footer/metadata overhead.
@@ -200,7 +210,7 @@ pub fn check(job: &Job) -> Result<Checked> {
     // against an ordered full batch below by retaining original positions.
     let mut projected_indices = contract.kept.clone();
     projected_indices.sort_unstable();
-    let reader = builder
+    let mut reader = builder
         .with_projection(projection)
         .with_batch_size(job.batch_rows)
         .build()
@@ -224,7 +234,30 @@ pub fn check(job: &Job) -> Result<Checked> {
     let mut chunk_rows = 0u64;
     let mut chunk_decoded = 0u64;
     let mut decoded = 0u64;
-    for next in reader {
+    let mut timings = AuditTimings::default();
+    let has_dropped_columns = contract.kept.len() != input_schema.fields().len();
+    let projected_positions: Vec<_> = (0..input_schema.fields().len())
+        .map(|index| {
+            projected_indices
+                .iter()
+                .position(|projected| *projected == index)
+        })
+        .collect();
+    let full_schema = Arc::new(arrow_schema::Schema::new(
+        input_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+    ));
+    let mut provenance: Vec<ArrayRef> = Vec::new();
+    loop {
+        let decode_started = Instant::now();
+        let Some(next) = reader.next() else {
+            break;
+        };
+        timings.decode_secs += decode_started.elapsed().as_secs_f64();
+        let validation_started = Instant::now();
         if job.stop_path.as_ref().is_some_and(|p| p.exists()) {
             return abort("run stopped during validation");
         }
@@ -246,25 +279,24 @@ pub fn check(job: &Job) -> Result<Checked> {
             .ok_or_else(|| abort::<()>("decoded byte counter overflow").unwrap_err())?;
         // Dictionary/slice buffers can be counted repeatedly; metadata and per-batch bounds are
         // the hostile-input limits. This counter is for output rotation, not source byte claims.
-        let mut columns = Vec::with_capacity(input_schema.fields().len());
-        for (i, f) in input_schema.fields().iter().enumerate() {
-            columns.push(
-                if let Some(at) = projected_indices.iter().position(|index| *index == i) {
-                    batch.column(at).clone()
-                } else {
-                    arrow_array::new_null_array(f.data_type(), batch.num_rows())
-                },
-            );
-        }
-        // Dropped non-nullable columns are placeholders only and never checked or forwarded.
-        let full_schema = Arc::new(arrow_schema::Schema::new(
-            input_schema
+        let full = if !has_dropped_columns {
+            batch
+        } else {
+            let columns = input_schema
                 .fields()
                 .iter()
-                .map(|f| f.as_ref().clone().with_nullable(true))
-                .collect::<Vec<_>>(),
-        ));
-        let full = RecordBatch::try_new(full_schema, columns).map_err(finding_error)?;
+                .enumerate()
+                .map(|(i, f)| {
+                    if let Some(at) = projected_positions[i] {
+                        batch.column(at).clone()
+                    } else {
+                        arrow_array::new_null_array(f.data_type(), batch.num_rows())
+                    }
+                })
+                .collect();
+            // Dropped non-nullable columns are placeholders only, never checked or forwarded.
+            RecordBatch::try_new(full_schema.clone(), columns).map_err(finding_error)?
+        };
         for at in 0..full.num_rows() {
             let row = rows + at as u64 + 1;
             let mut seen_findings = std::collections::BTreeSet::new();
@@ -297,12 +329,16 @@ pub fn check(job: &Job) -> Result<Checked> {
                 Ok(())
             })?;
         }
+        timings.validation_secs += validation_started.elapsed().as_secs_f64();
+        let profile_started = Instant::now();
         profile.add(&full, &contract.kept)?;
+        timings.profile_secs += profile_started.elapsed().as_secs_f64();
         rows += full.num_rows() as u64;
         if rows > expected_rows {
             return abort("decoded rows exceed Parquet footer count");
         }
         if !job.survey {
+            let write_started = Instant::now();
             if writer.is_none() {
                 writer = Some(new_writer(
                     job,
@@ -316,11 +352,25 @@ pub fn check(job: &Job) -> Result<Checked> {
                 .iter()
                 .map(|index| full.column(*index).clone())
                 .collect();
-            for literal in [&job.source_object, &job.batch, &job.imported_at] {
-                arrays.push(Arc::new(StringArray::from_iter_values(
-                    std::iter::repeat_n(literal.as_str(), full.num_rows()),
-                )));
+            if provenance
+                .first()
+                .is_none_or(|array| array.len() < full.num_rows())
+            {
+                provenance = [&job.source_object, &job.batch, &job.imported_at]
+                    .into_iter()
+                    .map(|literal| {
+                        Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                            literal.as_str(),
+                            full.num_rows(),
+                        ))) as ArrayRef
+                    })
+                    .collect();
             }
+            arrays.extend(
+                provenance
+                    .iter()
+                    .map(|array| array.slice(0, full.num_rows())),
+            );
             let output =
                 RecordBatch::try_new(contract.schema.clone(), arrays).map_err(finding_error)?;
             let w = writer.as_mut().unwrap();
@@ -342,12 +392,14 @@ pub fn check(job: &Job) -> Result<Checked> {
                 chunk_rows = 0;
                 chunk_decoded = 0;
             }
+            timings.write_secs += write_started.elapsed().as_secs_f64();
         }
     }
     if rows != expected_rows {
         return abort("decoded row count differs from Parquet footer");
     }
     if !job.survey {
+        let write_started = Instant::now();
         // Preserve an empty input as a valid, schema-bearing Parquet file.
         if writer.is_none() && outputs.is_empty() {
             writer = Some(new_writer(job, 0, contract.schema.clone(), used)?);
@@ -355,6 +407,7 @@ pub fn check(job: &Job) -> Result<Checked> {
         if let Some(writer) = writer {
             finish_chunk(job, writer, chunk_rows, &mut outputs)?;
         }
+        timings.write_secs += write_started.elapsed().as_secs_f64();
     }
     findings_file.sync_all().map_err(infrastructure)?;
     let checked = Checked {
@@ -369,6 +422,7 @@ pub fn check(job: &Job) -> Result<Checked> {
         findings_by_reason: reasons,
         profile: profile.finish(),
         elapsed_secs: started.elapsed().as_secs_f64(),
+        timings,
     };
     atomic_json(&job.work.join("checked.json"), &checked)?;
     tracing::info!(

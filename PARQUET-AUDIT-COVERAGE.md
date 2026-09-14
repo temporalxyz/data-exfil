@@ -251,3 +251,20 @@ FIELD-AUDIT.json records `PackedCurve(base64,994 bytes)` and its empty-value pol
 This validates encoding and size only, not the unavailable internal curve
 layout or numerical correctness. Other columns (including `tox_data`) and other
 tables retain their existing audits. The TSV path is unchanged.
+
+## Packed oracle toxicity data
+
+The operator approved empty strings or exactly 35/70 decoded bytes for
+`analytics.memefi_oracle_updates.tox_data`, following a 50-file scan:
+5,869,363 empty values, 3,347,497 values of 70 bytes and 881,602 of 35 bytes.
+Nonempty values must be canonical standard padded base64. Other encodings and
+lengths stop the run. This is scoped to the exact table and column; the curve
+column still requires 994 bytes.
+
+The same packed-binary checks apply: native string schema and nullability,
+field budgets, explicit patterns/length limits, and incident indicators on raw
+text and the exact decoded bytes. Generic payload scanning is skipped for these
+opaque representations. Output preserves original strings and NULLs; the
+decoded binary is never executed. FIELD-AUDIT.json records
+`PackedTox(base64,35|70 bytes)` and the empty-value policy. Validation covers
+encoding and size, not the undocumented internal structure.

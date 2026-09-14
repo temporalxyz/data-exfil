@@ -3452,3 +3452,132 @@ fn packed_curve_requires_native_strings_and_applies_constraints_to_empty() {
     );
     assert!(file::check(&j).is_err());
 }
+
+#[test]
+fn packed_tox_preserves_approved_sizes_empty_and_null() {
+    use base64::Engine as _;
+    let values = vec![
+        Some(String::new()),
+        Some(base64::engine::general_purpose::STANDARD.encode([255; 35])),
+        Some(base64::engine::general_purpose::STANDARD.encode([255; 70])),
+        None,
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("tox_data", DataType::Utf8, true)],
+        vec![Arc::new(StringArray::from(values.clone()))],
+    );
+    let mut j = native_job(dir.path(), &b);
+    j.table = "analytics.memefi_oracle_updates".into();
+    let checked = file::check(&j).unwrap();
+    assert_eq!(
+        checked.field_audits[0].validated_type,
+        "PackedTox(base64,35|70 bytes)"
+    );
+    assert!(checked.field_audits[0].allows_empty_encoded_value);
+    let mut actual = Vec::new();
+    for output in checked.outputs {
+        for b in ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(dir.path().join(output.name)).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        {
+            let b = b.unwrap();
+            actual.extend(
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.map(str::to_owned)),
+            );
+        }
+    }
+    assert_eq!(actual, values);
+}
+
+#[test]
+fn packed_tox_rejects_wrong_sizes_encodings_scopes_and_constraints() {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut invalid: Vec<String> = [1, 34, 36, 69, 71, 994]
+        .into_iter()
+        .map(|n| engine.encode(vec![0; n]))
+        .collect();
+    invalid.extend([
+        " ".into(),
+        "bad!".into(),
+        engine.encode([255; 35]).trim_end_matches('=').into(),
+        base64::engine::general_purpose::URL_SAFE.encode([255; 70]),
+    ]);
+    let mut noncanonical = engine.encode([255; 35]).into_bytes();
+    noncanonical[46] = b'9'; // /8= -> /9= retains nonzero padding bits.
+    invalid.push(String::from_utf8(noncanonical).unwrap());
+    for value in invalid {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("tox_data", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = "analytics.memefi_oracle_updates".into();
+        assert!(file::check(&j).is_err());
+    }
+    for size in [35, 70] {
+        for rule in [
+            "table",
+            "column",
+            "ioc",
+            "decoded_ioc",
+            "pattern",
+            "length",
+            "hex",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut bytes = vec![0; size];
+            bytes[..12].copy_from_slice(b"';curl x|=1!");
+            let value = engine.encode(bytes);
+            let name = if rule == "column" {
+                "other"
+            } else {
+                "tox_data"
+            };
+            let b = batch(
+                vec![Field::new(name, DataType::Utf8, false)],
+                vec![Arc::new(StringArray::from(vec![value.as_str()]))],
+            );
+            let mut j = native_job(dir.path(), &b);
+            j.table = if rule == "table" {
+                "other.memefi_oracle_updates"
+            } else {
+                "analytics.memefi_oracle_updates"
+            }
+            .into();
+            j.overrides.columns.insert(
+                name.into(),
+                crate::models::ColumnOverride {
+                    class: crate::models::FreedomClass::Closed,
+                    pattern: (rule == "pattern").then(|| "^never$".into()),
+                    max_len: (rule == "length").then_some(3),
+                    enum_ids: None,
+                    hex: rule == "hex",
+                    drop: false,
+                    rotation_owner: None,
+                },
+            );
+            if rule == "ioc" {
+                j.native_policy
+                    .as_mut()
+                    .unwrap()
+                    .iocs
+                    .push(value[..16].into());
+            }
+            if rule == "decoded_ioc" {
+                j.native_policy.as_mut().unwrap().iocs.push("curl".into());
+            }
+            assert!(file::check(&j).is_err(), "{size} {rule}");
+        }
+    }
+}

@@ -268,3 +268,17 @@ opaque representations. Output preserves original strings and NULLs; the
 decoded binary is never executed. FIELD-AUDIT.json records
 `PackedTox(base64,35|70 bytes)` and the empty-value policy. Validation covers
 encoding and size, not the undocumented internal structure.
+
+## Reviewed mint name
+
+The operator approved the exact spelling `Somethig's Gotta Change` only in
+`analytics.mint_infos.name`. For that native string value, the raw SQL catalogue
+hit caused by its apostrophe is suppressed. All other raw catalogue classes,
+Unicode normalization and decoded-form checks (including base64), explicit
+incident indicators, native nullability, byte budgets, length limits and patterns
+remain active. The stored string is preserved exactly.
+
+This does not allow apostrophes globally, approve corrected spellings, or exempt
+other tables/columns. FIELD-AUDIT.json records the exact value in
+`approved_raw_sql_exempt_values`; it is not a base64 exception. The shared
+default and TSV scanners retain their existing behavior.

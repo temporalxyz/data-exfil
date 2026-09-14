@@ -71,6 +71,7 @@ struct Node {
     native_numeric: bool,
     approved_label: bool,
     approved_asset: bool,
+    approved_mint_name: bool,
     packed_binary: Option<PackedBinary>,
 }
 
@@ -610,6 +611,7 @@ impl Node {
             native_numeric: false,
             approved_label: false,
             approved_asset: false,
+            approved_mint_name: false,
             packed_binary: None,
             binary: matches!(
                 dt,
@@ -794,8 +796,15 @@ impl Node {
                 || (self.approved_asset
                     && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                     && raw.as_ref() == b"ge87");
-            if approved_value {
-                let scan = payloads::scan_without_base64(&raw, limits)?;
+            let approved_mint_name = self.approved_mint_name
+                && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                && raw.as_ref() == b"Somethig's Gotta Change";
+            if approved_value || approved_mint_name {
+                let scan = if approved_mint_name {
+                    payloads::scan_reviewed_mint_name(&raw, limits)?
+                } else {
+                    payloads::scan_without_base64(&raw, limits)?
+                };
                 if !scan.is_clean() {
                     emit(self.finding(
                         file,
@@ -812,7 +821,7 @@ impl Node {
                 file,
                 row,
                 self.pattern,
-                source_text && opaque_solana.is_none() && !approved_value,
+                source_text && opaque_solana.is_none() && !approved_value && !approved_mint_name,
             )? {
                 emit(finding)?;
             }
@@ -935,6 +944,8 @@ pub struct FieldAudit {
     pub allows_empty_encoded_value: bool,
     #[serde(default)]
     pub approved_base64_exempt_values: Vec<String>,
+    #[serde(default)]
+    pub approved_raw_sql_exempt_values: Vec<String>,
     pub enum_ids: Option<Vec<i16>>,
 }
 
@@ -970,6 +981,13 @@ impl Contract {
         }
 
         for node in &mut self.nodes {
+            node.approved_mint_name = table == "analytics.mint_infos"
+                && node.name == "name"
+                && matches!(node.ty, Ch::String)
+                && node.encoded.is_none()
+                && self.schema.field_with_name("name").is_ok_and(|field| {
+                    matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                });
             node.approved_asset = table == "analytics.memefi_fv"
                 && node.name == "asset"
                 && matches!(node.ty, Ch::String)
@@ -1017,6 +1035,11 @@ impl Contract {
                     pattern: scalar.pattern.clone(),
                     max_len: scalar.max_len,
                     opaque_binary: node.binary,
+                    approved_raw_sql_exempt_values: if node.approved_mint_name {
+                        vec!["Somethig's Gotta Change".into()]
+                    } else {
+                        Vec::new()
+                    },
                     approved_base64_exempt_values: if node.approved_label {
                         APPROVED_PROGRAM_LABELS.lines().map(str::to_owned).collect()
                     } else if node.approved_asset {

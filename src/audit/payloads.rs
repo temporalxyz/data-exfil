@@ -371,12 +371,23 @@ pub fn scan_with_iocs(
     limits: &Limits,
     iocs: Option<&RegexSet>,
 ) -> Result<ScanResult> {
-    scan_with_decoding(value, limits, iocs, true)
+    scan_with_decoding(value, limits, iocs, true, false)
 }
 
 /// For exact operator-approved values only; all non-base64 checks remain active.
 pub(crate) fn scan_without_base64(value: &[u8], limits: &Limits) -> Result<ScanResult> {
-    scan_with_decoding(value, limits, None, false)
+    scan_with_decoding(value, limits, None, false, false)
+}
+
+/// Only the reviewed literal's raw apostrophe finding is exempt.
+pub(crate) fn scan_reviewed_mint_name(value: &[u8], limits: &Limits) -> Result<ScanResult> {
+    scan_with_decoding(
+        value,
+        limits,
+        None,
+        true,
+        value == b"Somethig's Gotta Change",
+    )
 }
 
 fn scan_with_decoding(
@@ -384,6 +395,7 @@ fn scan_with_decoding(
     limits: &Limits,
     iocs: Option<&RegexSet>,
     base64: bool,
+    reviewed_raw_sql: bool,
 ) -> Result<ScanResult> {
     let cat = catalogue()?;
     let matches = |bytes: &[u8]| {
@@ -409,7 +421,11 @@ fn scan_with_decoding(
         }
     };
 
-    record("raw", matches(value), &mut out);
+    let mut raw_hits = matches(value);
+    if reviewed_raw_sql {
+        raw_hits.retain(|class| *class != "sql");
+    }
+    record("raw", raw_hits, &mut out);
 
     // NFC, applied to both forms as the document requires. Only valid UTF-8 can be normalised; a
     // value that is not UTF-8 is already a finding at the bounds layer.

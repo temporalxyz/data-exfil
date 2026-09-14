@@ -3581,3 +3581,131 @@ fn packed_tox_rejects_wrong_sizes_encodings_scopes_and_constraints() {
         }
     }
 }
+
+#[test]
+fn approved_mint_name_is_preserved_and_exception_is_exactly_scoped() {
+    for (table, column, value, passes) in [
+        (
+            "analytics.mint_infos",
+            "name",
+            "Somethig's Gotta Change",
+            true,
+        ),
+        ("analytics.other", "name", "Somethig's Gotta Change", false),
+        ("other.mint_infos", "name", "Somethig's Gotta Change", false),
+        (
+            "analytics.mint_infos",
+            "symbol",
+            "Somethig's Gotta Change",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "name",
+            "Something's Gotta Change",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "name",
+            "Somethig's Gotta Change ",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "name",
+            "Somethig's Gotta Change; DROP TABLE x",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "name",
+            "JztEUk9QIFRBQkxFIHg7",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new(column, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = table.into();
+        let result = file::check(&j);
+        assert_eq!(result.is_ok(), passes, "{table}.{column}: {value}");
+        if let Ok(checked) = result {
+            assert_eq!(
+                checked.field_audits[0].approved_raw_sql_exempt_values,
+                vec![value]
+            );
+            assert!(
+                checked.field_audits[0]
+                    .approved_base64_exempt_values
+                    .is_empty()
+            );
+            let output = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                value
+            );
+        }
+    }
+}
+
+#[test]
+fn approved_mint_name_keeps_field_constraints_and_incident_checks() {
+    for rule in ["ioc", "pattern", "length"] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("name", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["Somethig's Gotta Change"]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = "analytics.mint_infos".into();
+        j.overrides.columns.insert(
+            "name".into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(3),
+                enum_ids: None,
+                hex: false,
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            j.native_policy.as_mut().unwrap().iocs.push("'".into());
+        }
+        assert!(file::check(&j).is_err(), "{rule}");
+    }
+    let config = overrides();
+    assert!(
+        !crate::audit::payloads::scan(b"Somethig's Gotta Change", &config.limits)
+            .unwrap()
+            .is_clean()
+    );
+    assert!(
+        !crate::audit::payloads::scan_reviewed_mint_name(b"' OR 1=1 --", &config.limits)
+            .unwrap()
+            .is_clean()
+    );
+    assert!(
+        !crate::audit::payloads::scan_reviewed_mint_name(b"JztEUk9QIFRBQkxFIHg7", &config.limits)
+            .unwrap()
+            .is_clean()
+    );
+}

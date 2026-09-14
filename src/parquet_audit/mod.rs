@@ -757,6 +757,7 @@ impl Pipeline {
                             index,
                             "audit",
                             self.worker.check(file::Job {
+                                table: self.identity.table.clone(),
                                 input: input.clone(),
                                 work: file_work.clone(),
                                 ddl: self.ddl.clone(),

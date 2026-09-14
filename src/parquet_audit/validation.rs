@@ -31,6 +31,7 @@ struct Node {
     encoded: Option<EncodedField>,
     recognize_solana: bool,
     native_numeric: bool,
+    approved_label: bool,
 }
 
 fn inner(ty: &Ch) -> (&Ch, bool) {
@@ -567,6 +568,7 @@ impl Node {
             encoded: None,
             recognize_solana: false,
             native_numeric: false,
+            approved_label: false,
             binary: matches!(
                 dt,
                 DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
@@ -696,6 +698,20 @@ impl Node {
             } else {
                 None
             };
+            let approved_label = self.approved_label
+                && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                && raw.as_ref() == b"Dynamic Bonding Curve";
+            if approved_label {
+                let scan = payloads::scan_without_base64(&raw, limits)?;
+                if !scan.is_clean() {
+                    emit(self.finding(
+                        file,
+                        row,
+                        "approved label failed non-base64 payload checks",
+                        &raw,
+                    ))?;
+                }
+            }
             if let Some(finding) = bounds::check_bytes_precompiled(
                 contract,
                 &value,
@@ -703,7 +719,7 @@ impl Node {
                 file,
                 row,
                 self.pattern,
-                source_text && opaque_solana.is_none(),
+                source_text && opaque_solana.is_none() && !approved_label,
             )? {
                 emit(finding)?;
             }
@@ -824,10 +840,20 @@ pub struct FieldAudit {
     pub recognizes_solana_encodings: bool,
     #[serde(default)]
     pub allows_empty_encoded_value: bool,
+    #[serde(default)]
+    pub approved_base64_exempt_values: Vec<String>,
     pub enum_ids: Option<Vec<i16>>,
 }
 
 impl Contract {
+    pub fn apply_label_exception(&mut self, table: &str) {
+        if table == "analytics.solana_program_labels" {
+            for node in &mut self.nodes {
+                node.approved_label = node.name == "label";
+            }
+        }
+    }
+
     pub fn field_audits(&self) -> Vec<FieldAudit> {
         fn visit(node: &Node, result: &mut Vec<FieldAudit>) {
             if let Some(scalar) = &node.scalar {
@@ -840,6 +866,11 @@ impl Contract {
                     pattern: scalar.pattern.clone(),
                     max_len: scalar.max_len,
                     opaque_binary: node.binary,
+                    approved_base64_exempt_values: if node.approved_label {
+                        vec!["Dynamic Bonding Curve".into()]
+                    } else {
+                        Vec::new()
+                    },
                     allows_empty_encoded_value: node
                         .encoded
                         .is_some_and(EncodedField::allows_empty),

@@ -371,6 +371,20 @@ pub fn scan_with_iocs(
     limits: &Limits,
     iocs: Option<&RegexSet>,
 ) -> Result<ScanResult> {
+    scan_with_decoding(value, limits, iocs, true)
+}
+
+/// For exact operator-approved values only; all non-base64 checks remain active.
+pub(crate) fn scan_without_base64(value: &[u8], limits: &Limits) -> Result<ScanResult> {
+    scan_with_decoding(value, limits, None, false)
+}
+
+fn scan_with_decoding(
+    value: &[u8],
+    limits: &Limits,
+    iocs: Option<&RegexSet>,
+    base64: bool,
+) -> Result<ScanResult> {
     let cat = catalogue()?;
     let matches = |bytes: &[u8]| {
         let mut hits = cat.matches(bytes);
@@ -422,7 +436,7 @@ pub fn scan_with_iocs(
         }
     }
 
-    for (via, decoded) in decodings(value, limits)? {
+    for (via, decoded) in decodings_with_base64(value, limits, base64)? {
         record(via, matches(&decoded), &mut out);
 
         // Decoding and normalisation **compose**. Scanning `raw`, `NFC(raw)`, `NFKC(raw)` and
@@ -460,6 +474,14 @@ pub fn scan_with_iocs(
 /// through. Note the cap is still a cap: it bounds the work, and reaching it is not an error,
 /// because a value that is legitimately deep is a value we simply stop unwrapping.
 pub fn decodings(value: &[u8], limits: &Limits) -> Result<Vec<(&'static str, Vec<u8>)>> {
+    decodings_with_base64(value, limits, true)
+}
+
+fn decodings_with_base64(
+    value: &[u8],
+    limits: &Limits,
+    base64: bool,
+) -> Result<Vec<(&'static str, Vec<u8>)>> {
     let mut out: Vec<(&'static str, Vec<u8>)> = Vec::new();
     if limits.max_decode_rounds == 0 {
         return Ok(out);
@@ -486,11 +508,13 @@ pub fn decodings(value: &[u8], limits: &Limits) -> Result<Vec<(&'static str, Vec
                 ("html_entity", html_entity_decode(current)),
                 ("unicode_escape", unicode_escape_decode(current)),
             ];
-            candidates.extend(
-                base64_decode_if_plausible(current, budget)?
-                    .into_iter()
-                    .map(|b| ("base64", b)),
-            );
+            if base64 {
+                candidates.extend(
+                    base64_decode_if_plausible(current, budget)?
+                        .into_iter()
+                        .map(|b| ("base64", b)),
+                );
+            }
             for (via, bytes) in candidates {
                 if bytes.is_empty() || bytes.len() > budget || seen.contains(&bytes) {
                     continue;

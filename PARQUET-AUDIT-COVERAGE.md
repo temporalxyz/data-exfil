@@ -196,3 +196,19 @@ overrides stop the run. Empty binary values are not allowed. Other binary column
 names retain their existing scanner unless an explicit `SolanaPublicKeyBytes`
 type policy is supplied. String columns named `address` retain their existing
 string audit behavior; `label` and `address_str` are also audited as before.
+
+## Reviewed program-label exception
+
+The operator approved the exact UTF-8 value `Dynamic Bonding Curve` in
+`analytics.solana_program_labels.label`. Only speculative base64 catalogue
+scanning is skipped for that exact table/column/value. Raw catalogue checks,
+Unicode normalization, percent/entity/Unicode-escape decoding, native type and
+nullability, byte budgets, explicit patterns and length limits remain active.
+Explicit incident indicators still scan all representations, including base64.
+
+Different case, whitespace, suffixes, tables or columns do not receive this
+exception; other values retain the full audit. FIELD-AUDIT.json records the
+approved value in `approved_base64_exempt_values`. Table identity is supplied by
+the controller to the isolated worker, not inferred from source field data.
+Jobs without a table identity receive no exception. The general and TSV scanners
+retain their original behavior.

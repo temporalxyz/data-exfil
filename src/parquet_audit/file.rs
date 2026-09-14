@@ -24,6 +24,8 @@ use crate::models::Overrides;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
+    #[serde(default)]
+    pub table: String,
     pub input: PathBuf,
     pub work: PathBuf,
     pub ddl: String,
@@ -213,7 +215,11 @@ pub fn check(job: &Job) -> Result<Checked> {
         "Parquet expansion",
     )?;
     let contract = if let Some(native) = &job.native_policy {
-        validation::build_native(native, &job.overrides, builder.schema())?
+        {
+            let mut contract = validation::build_native(native, &job.overrides, builder.schema())?;
+            contract.apply_label_exception(&job.table);
+            contract
+        }
     } else {
         let ddl = parse_create_table(&job.ddl)?;
         validation::build(&ddl, &job.overrides, builder.schema())?

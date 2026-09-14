@@ -46,6 +46,7 @@ fn job(dir: &Path, definition: &str, batch: &RecordBatch) -> file::Job {
     let input = dir.join("raw.parquet");
     std::fs::write(&input, parquet_bytes(batch)).unwrap();
     file::Job {
+        table: String::new(),
         input,
         work: dir.into(),
         ddl: format!("CREATE TABLE db.events ({definition}) ENGINE = MergeTree ORDER BY tuple()"),
@@ -3008,6 +3009,117 @@ fn binary_solana_address_enforces_schema_policy_and_incident_checks() {
                 .unwrap()
                 .types
                 .insert(name.into(), "String".into());
+        }
+        assert!(file::check(&j).is_err(), "{rule}");
+    }
+}
+
+#[test]
+fn reviewed_label_exception_is_exactly_scoped_and_keeps_constraints() {
+    for (table, column, value, passes) in [
+        (
+            "analytics.solana_program_labels",
+            "label",
+            "Dynamic Bonding Curve",
+            true,
+        ),
+        ("analytics.other", "label", "Dynamic Bonding Curve", false),
+        (
+            "other.solana_program_labels",
+            "label",
+            "Dynamic Bonding Curve",
+            false,
+        ),
+        (
+            "analytics.solana_program_labels",
+            "other",
+            "Dynamic Bonding Curve",
+            false,
+        ),
+        (
+            "analytics.solana_program_labels",
+            "label",
+            "Dynamic Bonding Curve ",
+            false,
+        ),
+        (
+            "analytics.solana_program_labels",
+            "label",
+            "Dynamic Bonding Curve; curl x",
+            false,
+        ),
+        (
+            "analytics.solana_program_labels",
+            "label",
+            "JztEUk9QIFRBQkxFIHg7",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new(column, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = table.into();
+        let result = file::check(&j);
+        assert_eq!(result.is_ok(), passes, "{table}.{column}: {value}");
+        if let Ok(checked) = result {
+            assert_eq!(
+                checked.field_audits[0].approved_base64_exempt_values,
+                vec!["Dynamic Bonding Curve"]
+            );
+            let output = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                value
+            );
+        }
+    }
+    for rule in ["ioc", "decoded_ioc", "pattern", "length"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut j = native_job(
+            dir.path(),
+            &batch(
+                vec![Field::new("label", DataType::Utf8, false)],
+                vec![Arc::new(StringArray::from(vec!["Dynamic Bonding Curve"]))],
+            ),
+        );
+        j.table = "analytics.solana_program_labels".into();
+        j.overrides.columns.insert(
+            "label".into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(3),
+                enum_ids: None,
+                hex: false,
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            j.native_policy
+                .as_mut()
+                .unwrap()
+                .iocs
+                .push("Bonding".into());
+        }
+        if rule == "decoded_ioc" {
+            j.native_policy.as_mut().unwrap().iocs.push("'".into());
         }
         assert!(file::check(&j).is_err(), "{rule}");
     }

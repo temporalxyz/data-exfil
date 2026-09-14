@@ -1150,7 +1150,7 @@ impl EncodedField {
 
 const ADDRESS_CACHE_ENTRIES: usize = 4096;
 thread_local! {
-    static ADDRESS_CACHE: std::cell::RefCell<std::collections::HashMap<Vec<u8>, [u8; 32]>> =
+    static ADDRESS_CACHE: std::cell::RefCell<std::collections::HashMap<[u8; 45], [u8; 32]>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -1158,8 +1158,11 @@ fn decode_solana_public_key(raw: &[u8]) -> Option<[u8; 32]> {
     if !(32..=44).contains(&raw.len()) {
         return None;
     }
+    let mut key = [0u8; 45];
+    key[0] = raw.len() as u8;
+    key[1..=raw.len()].copy_from_slice(raw);
     ADDRESS_CACHE.with(|cache| {
-        if let Some(bytes) = cache.borrow().get(raw).copied() {
+        if let Some(bytes) = cache.borrow().get(&key).copied() {
             return Some(bytes);
         }
         let bytes = decode_solana_public_key_uncached(raw)?;
@@ -1167,7 +1170,7 @@ fn decode_solana_public_key(raw: &[u8]) -> Option<[u8; 32]> {
         if cache.len() >= ADDRESS_CACHE_ENTRIES {
             cache.clear();
         }
-        cache.insert(raw.to_vec(), bytes);
+        cache.insert(key, bytes);
         Some(bytes)
     })
 }

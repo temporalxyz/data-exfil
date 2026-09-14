@@ -275,3 +275,26 @@ SALVAGE_BENCH_UNIQUE=1 cargo test --release --locked --lib parquet_native_audit_
 The fixture has 100,000 rows, UTC timestamps, repeated addresses, a signature, UInt64 and Float64
 columns. The second command uses unique signatures. This measures local audit/profile/output
 throughput, not S3 throughput or production completion time.
+
+### Audit hot-path allocation and synchronization
+
+Row validation and profiling do not use shared mutexes. Public-key decode caches
+are thread-local and bounded to 4096 entries, with inline keys rather than one
+heap allocation per address. The frequent-value profiler uses a sorted 16-entry
+vector and reuses its 128-byte hex sample buffers on eviction. Hashes,
+tie-breaking, sample truncation and report ordering match the reference algorithm.
+
+Output scratch accounting uses an atomic reservation before each write, with
+unwritten bytes released on errors or short writes. It does not hold a mutex
+during disk I/O. The per-table schema mutex remains at partition completion to
+serialize schema-baseline checks and publication prerequisites; it is not taken
+per row. Transfer semaphores and memory/scratch reservations remain necessary
+backpressure, and library internals are not guaranteed to be lock-free.
+
+A local release-mode comparison of the 100,000-row native audit fixture measured
+median throughput of approximately 264,000 rows/sec before these changes and
+373,000 afterward (41% higher throughput, 29% shorter elapsed time). Profile time
+fell from approximately 167 ms to 58 ms. This includes local decode, audit,
+profiling and Parquet regeneration, but excludes fixture creation and S3 I/O.
+It is not a throughput prediction for the production Linux server or its wider
+tables. Use the benchmark above and production stage timings to measure those.

@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Instant;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
@@ -77,24 +80,37 @@ pub struct Checked {
 /// Enforce output reservations *during writes*, including parquet footer/metadata overhead.
 struct QuotaWriter {
     file: File,
-    used: Arc<Mutex<u64>>,
+    used: Arc<AtomicU64>,
     cap: u64,
 }
 impl Write for QuotaWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let mut used = self
-            .used
-            .lock()
-            .map_err(|_| std::io::Error::other("scratch accounting poisoned"))?;
-        if bytes.len() as u64 > self.cap.saturating_sub(*used) {
-            return Err(std::io::Error::other(
-                "per-file scratch reservation exhausted; increase day scratch budget",
-            ));
+        // Only the counter is shared; it does not publish data between threads.
+        // Reserve before I/O, then release any unwritten portion.
+        let requested = bytes.len() as u64;
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(requested).filter(|next| *next <= self.cap)
+            })
+            .map_err(|_| {
+                std::io::Error::other(
+                    "per-file scratch reservation exhausted; increase day scratch budget",
+                )
+            })?;
+        match self.file.write(bytes) {
+            Ok(n) => {
+                if n as u64 != requested {
+                    self.used.fetch_sub(requested - n as u64, Ordering::Relaxed);
+                }
+                Ok(n)
+            }
+            Err(error) => {
+                self.used.fetch_sub(requested, Ordering::Relaxed);
+                Err(error)
+            }
         }
-        let n = self.file.write(bytes)?;
-        *used += n as u64;
-        Ok(n)
     }
+
     fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
     }
@@ -229,7 +245,7 @@ pub fn check(job: &Job) -> Result<Checked> {
     let mut finding_rows_by_column: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     let mut rows = 0u64;
     let mut outputs = Vec::new();
-    let used = Arc::new(Mutex::new(0u64));
+    let used = Arc::new(AtomicU64::new(0));
     let mut writer: Option<ArrowWriter<QuotaWriter>> = None;
     let mut chunk_rows = 0u64;
     let mut chunk_decoded = 0u64;
@@ -438,7 +454,7 @@ fn new_writer(
     job: &Job,
     index: usize,
     schema: Arc<arrow_schema::Schema>,
-    used: Arc<Mutex<u64>>,
+    used: Arc<AtomicU64>,
 ) -> Result<ArrowWriter<QuotaWriter>> {
     if index >= 10_000 {
         return infra("source file exceeds 10000 output chunks; increase output chunk bytes");
@@ -581,4 +597,73 @@ fn check_narrow_physical_integers(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn quota_is_shared_across_chunks_and_rejects_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let used = Arc::new(AtomicU64::new(0));
+        for i in 0..2 {
+            let mut writer = QuotaWriter {
+                file: File::create(dir.path().join(i.to_string())).unwrap(),
+                used: used.clone(),
+                cap: 8,
+            };
+            writer.write_all(b"1234").unwrap();
+        }
+        let path = dir.path().join("overflow");
+        let mut writer = QuotaWriter {
+            file: File::create(&path).unwrap(),
+            used: used.clone(),
+            cap: 8,
+        };
+        assert!(writer.write_all(b"x").is_err());
+        assert_eq!(used.load(Ordering::Relaxed), 8);
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn failed_write_releases_its_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly");
+        std::fs::write(&path, b"").unwrap();
+        let used = Arc::new(AtomicU64::new(0));
+        let mut writer = QuotaWriter {
+            file: File::open(path).unwrap(),
+            used: used.clone(),
+            cap: 4,
+        };
+        assert!(writer.write(b"1234").is_err());
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_writers_cannot_exceed_shared_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let used = Arc::new(AtomicU64::new(0));
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let used = used.clone();
+                let path = dir.path().join(i.to_string());
+                scope.spawn(move || {
+                    let mut writer = QuotaWriter {
+                        file: File::create(path).unwrap(),
+                        used,
+                        cap: 1024,
+                    };
+                    while writer.write_all(&[0; 16]).is_ok() {}
+                });
+            }
+        });
+        let total: u64 = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert_eq!(total, 1024);
+        assert_eq!(used.load(Ordering::Relaxed), total);
+    }
 }

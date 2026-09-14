@@ -4268,7 +4268,7 @@ fn patrick_star_mint_exception_is_exactly_scoped_and_keeps_constraints() {
 }
 
 #[test]
-fn mint_info_names_are_operator_approved_free_text_only_in_that_field() {
+fn mint_info_names_and_symbols_are_operator_approved_free_text_only_in_those_fields() {
     for (table, column, value, passes) in [
         (
             "analytics.mint_infos",
@@ -4285,12 +4285,9 @@ fn mint_info_names_are_operator_approved_free_text_only_in_that_field() {
         ("analytics.mint_infos", "name", "=SUM(1,1)", true),
         ("analytics.other", "name", "Make America Goon Again", false),
         ("other.mint_infos", "name", "' OR 1=1 --", false),
-        (
-            "analytics.mint_infos",
-            "symbol",
-            "CakeMas; DROP TABLE x",
-            false,
-        ),
+        ("analytics.mint_infos", "symbol", "M&M'S", true),
+        ("analytics.mint_infos", "symbol", "=SUM(1,1)", true),
+        ("analytics.other", "symbol", "M&M'S", false),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let batch = batch(
@@ -4316,34 +4313,35 @@ fn mint_info_names_are_operator_approved_free_text_only_in_that_field() {
         }
     }
 
-    for rule in ["ioc", "pattern", "length"] {
-        let dir = tempfile::tempdir().unwrap();
-        let batch = batch(
-            vec![Field::new("name", DataType::Utf8, false)],
-            vec![Arc::new(StringArray::from(vec!["Make America Goon Again"]))],
-        );
-        let mut job = native_job(dir.path(), &batch);
-        job.table = "analytics.mint_infos".into();
-        job.overrides.columns.insert(
-            "name".into(),
-            crate::models::ColumnOverride {
-                class: crate::models::FreedomClass::Closed,
-                pattern: (rule == "pattern").then(|| "^never$".into()),
-                max_len: (rule == "length").then_some(3),
-                enum_ids: None,
-                hex: false,
-                drop: false,
-                rotation_owner: None,
-            },
-        );
-        if rule == "ioc" {
-            job.native_policy
-                .as_mut()
-                .unwrap()
-                .iocs
-                .push("America".into());
+    for (column, value, ioc) in [
+        ("name", "Make America Goon Again", "America"),
+        ("symbol", "M&M'S", "M&M"),
+    ] {
+        for rule in ["ioc", "pattern", "length"] {
+            let dir = tempfile::tempdir().unwrap();
+            let batch = batch(
+                vec![Field::new(column, DataType::Utf8, false)],
+                vec![Arc::new(StringArray::from(vec![value]))],
+            );
+            let mut job = native_job(dir.path(), &batch);
+            job.table = "analytics.mint_infos".into();
+            job.overrides.columns.insert(
+                column.into(),
+                crate::models::ColumnOverride {
+                    class: crate::models::FreedomClass::Closed,
+                    pattern: (rule == "pattern").then(|| "^never$".into()),
+                    max_len: (rule == "length").then_some(3),
+                    enum_ids: None,
+                    hex: false,
+                    drop: false,
+                    rotation_owner: None,
+                },
+            );
+            if rule == "ioc" {
+                job.native_policy.as_mut().unwrap().iocs.push(ioc.into());
+            }
+            assert!(file::check(&job).is_err(), "{column} {rule}");
         }
-        assert!(file::check(&job).is_err(), "{rule}");
     }
 }
 

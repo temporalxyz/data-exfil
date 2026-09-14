@@ -295,3 +295,8 @@ tables, or modified values retain their existing checks.
 FIELD-AUDIT.json records this value in `approved_base64_exempt_values`.
 The separate `Somethig's Gotta Change` exception still exempts only its raw
 SQL match; it does not inherit this base64 exception.
+
+The operator also approved the exact name `Janction` for the same
+`analytics.mint_infos.name` base64 exception. It is recorded alongside
+`Halal Language Model`. Scope, unchanged output, and all retained checks above
+apply equally; trailing whitespace or added text does not qualify.

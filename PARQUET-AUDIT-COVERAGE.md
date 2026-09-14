@@ -281,6 +281,7 @@ match the stored value directly. Other tables and columns retain their normal
 payload checks. FIELD-AUDIT.json records this with
 `operator_approved_free_text: true`.
 
-`analytics.mint_infos.symbol` also permits an embedded NUL byte (`0x00`) so
-that source symbols can be preserved byte-for-byte. All other forbidden control
-bytes remain rejected. FIELD-AUDIT.json records this as `allows_nul: true`.
+`analytics.mint_infos.name` and `analytics.mint_infos.symbol` also permit an
+embedded NUL byte (`0x00`) so source display strings can be preserved
+byte-for-byte. All other forbidden control bytes remain rejected.
+FIELD-AUDIT.json records this as `allows_nul: true`.

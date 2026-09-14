@@ -4283,6 +4283,8 @@ fn mint_info_names_and_symbols_are_operator_approved_free_text_only_in_those_fie
             true,
         ),
         ("analytics.mint_infos", "name", "=SUM(1,1)", true),
+        ("analytics.mint_infos", "name", "\u{05db}\u{05dc}\0", true),
+        ("analytics.mint_infos", "name", "bad\u{0001}", false),
         ("analytics.other", "name", "Make America Goon Again", false),
         ("other.mint_infos", "name", "' OR 1=1 --", false),
         ("analytics.mint_infos", "symbol", "M&M'S", true),

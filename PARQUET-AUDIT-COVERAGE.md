@@ -305,3 +305,10 @@ The exact value `1 wish can change your life` is also operator-approved for
 the same `analytics.mint_infos.name` base64-only exception. Its exact spelling
 is preserved and recorded in FIELD-AUDIT.json; all scope restrictions and
 retained checks above remain active.
+
+The operator also approved the exact Unicode name
+`1 硬币\u200e can change your life` (where `\u200e` denotes the actual
+U+200E left-to-right mark) for that same base64-only exception in
+`analytics.mint_infos.name`. The mark is preserved; removing it or replacing it
+does not qualify. Unicode/raw checks, field constraints and explicit incident
+indicators remain active, and the exact approved value is recorded in the report.

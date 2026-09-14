@@ -800,7 +800,10 @@ impl Node {
                     && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                     && matches!(
                         raw.as_ref(),
-                        b"Halal Language Model" | b"Janction" | b"1 wish can change your life"
+                        b"Halal Language Model"
+                            | b"Janction"
+                            | b"1 wish can change your life"
+                            | b"1 \xe7\xa1\xac\xe5\xb8\x81\xe2\x80\x8e can change your life"
                     ));
             let approved_mint_name = self.approved_mint_name
                 && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
@@ -1055,6 +1058,7 @@ impl Contract {
                             "Halal Language Model".into(),
                             "Janction".into(),
                             "1 wish can change your life".into(),
+                            "1 硬币\u{200e} can change your life".into(),
                         ]
                     } else {
                         Vec::new()

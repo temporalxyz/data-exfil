@@ -271,15 +271,12 @@ encoding and size, not the undocumented internal structure.
 
 ## Operator-approved mint names
 
-By operator instruction, `analytics.mint_infos.name` is a free display-name
-field. Every valid source string is preserved and accepted; generic payload
+By operator instruction, `analytics.mint_infos.name` and
+`analytics.mint_infos.symbol` are free display-name fields. Every valid source
+string is preserved and accepted; generic payload
 catalogue scanning, including raw, normalized, and decoded forms, is disabled
 for this exact table and column. Type/nullability, byte budgets, explicit
 patterns and length limits remain enforced. Explicit incident indicators still
 match the stored value directly. Other tables and columns retain their normal
 payload checks. FIELD-AUDIT.json records this with
 `operator_approved_free_text: true`.
-
-The separate exact `CakeMas` base64 exception remains limited to
-`analytics.mint_infos.symbol`. It does not broaden symbol validation or affect
-any other table or column.

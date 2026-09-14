@@ -797,10 +797,8 @@ impl Node {
             let approved_value = approved_label
                 || (self.approved_asset
                     && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-                    && raw.as_ref() == b"ge87")
-                || (self.approved_mint_symbol
-                    && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-                    && raw.as_ref() == b"CakeMas");
+                    && raw.as_ref() == b"ge87");
+            let operator_approved_free_text = self.approved_mint_name || self.approved_mint_symbol;
             if approved_value {
                 let scan = payloads::scan_without_base64(&raw, limits)?;
                 if !scan.is_clean() {
@@ -822,14 +820,14 @@ impl Node {
                 source_text
                     && opaque_solana.is_none()
                     && !approved_value
-                    && !self.approved_mint_name,
+                    && !operator_approved_free_text,
             )? {
                 emit(finding)?;
             }
             if let Some(iocs) = &self.iocs {
                 let matched = if let Some(decoded) = &opaque_solana {
                     iocs.is_match(&raw) || iocs.is_match(decoded.as_ref())
-                } else if self.approved_mint_name {
+                } else if operator_approved_free_text {
                     iocs.is_match(&raw)
                 } else if source_text {
                     payloads::scan_with_iocs(&raw, limits, Some(iocs))?
@@ -844,7 +842,7 @@ impl Node {
             }
             // Hex is only a validator representation. Scan actual blob bytes too: encoding a
             // payload into hex must never conceal it from the shared injection catalogue.
-            if is_hex && opaque_solana.is_none() {
+            if is_hex && opaque_solana.is_none() && !operator_approved_free_text {
                 let scan = payloads::scan(&raw, limits)?;
                 if !scan.is_clean() {
                     emit(self.finding(
@@ -1051,14 +1049,11 @@ impl Contract {
                         APPROVED_PROGRAM_LABELS.lines().map(str::to_owned).collect()
                     } else if node.approved_asset {
                         vec!["ge87".into()]
-                    } else if node.approved_mint_name {
-                        Vec::new()
-                    } else if node.approved_mint_symbol {
-                        vec!["CakeMas".into()]
                     } else {
                         Vec::new()
                     },
-                    operator_approved_free_text: node.approved_mint_name,
+                    operator_approved_free_text: node.approved_mint_name
+                        || node.approved_mint_symbol,
                     allows_empty_encoded_value: node.packed_binary.is_some()
                         || node.encoded.is_some_and(EncodedField::allows_empty),
                     recognizes_solana_encodings: node.recognize_solana

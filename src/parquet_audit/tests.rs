@@ -3067,7 +3067,9 @@ fn reviewed_label_exception_is_exactly_scoped_and_keeps_constraints() {
         if let Ok(checked) = result {
             assert_eq!(
                 checked.field_audits[0].approved_base64_exempt_values,
-                vec!["Dynamic Bonding Curve"]
+                validation::APPROVED_PROGRAM_LABELS
+                    .lines()
+                    .collect::<Vec<_>>()
             );
             let output = ParquetRecordBatchReaderBuilder::try_new(
                 std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
@@ -3095,7 +3097,11 @@ fn reviewed_label_exception_is_exactly_scoped_and_keeps_constraints() {
             dir.path(),
             &batch(
                 vec![Field::new("label", DataType::Utf8, false)],
-                vec![Arc::new(StringArray::from(vec!["Dynamic Bonding Curve"]))],
+                vec![Arc::new(StringArray::from(
+                    validation::APPROVED_PROGRAM_LABELS
+                        .lines()
+                        .collect::<Vec<_>>(),
+                ))],
             ),
         );
         j.table = "analytics.solana_program_labels".into();
@@ -3123,4 +3129,79 @@ fn reviewed_label_exception_is_exactly_scoped_and_keeps_constraints() {
         }
         assert!(file::check(&j).is_err(), "{rule}");
     }
+}
+
+#[test]
+fn all_reviewed_program_labels_pass_and_are_preserved() {
+    let labels: Vec<_> = validation::APPROVED_PROGRAM_LABELS.lines().collect();
+    assert_eq!(labels.len(), 148);
+    assert_eq!(
+        labels
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        labels.len()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("label", DataType::Utf8, false)],
+        vec![Arc::new(StringArray::from(labels.clone()))],
+    );
+    let mut j = native_job(dir.path(), &b);
+    j.table = "analytics.solana_program_labels".into();
+    let checked = file::check(&j).unwrap();
+    let mut actual = Vec::new();
+    for output in &checked.outputs {
+        for b in ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(dir.path().join(&output.name)).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        {
+            let b = b.unwrap();
+            actual.extend(
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.unwrap().to_owned()),
+            );
+        }
+    }
+    assert_eq!(actual, labels);
+}
+
+#[test]
+fn unreviewed_labels_and_non_string_label_schemas_stop() {
+    for value in [
+        "New Program",
+        "jupiter Lend Earn",
+        "Jupiter Lend Earn ",
+        "",
+        "Dynamic Bonding Curve\u{200b}",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("label", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = "analytics.solana_program_labels".into();
+        assert!(file::check(&j).is_err(), "{value}");
+        assert!(
+            std::fs::read_to_string(dir.path().join("findings.jsonl"))
+                .unwrap()
+                .contains("operator-approved allowlist")
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("label", DataType::UInt64, false)],
+        vec![Arc::new(UInt64Array::from(vec![1]))],
+    );
+    let mut j = native_job(dir.path(), &b);
+    j.table = "analytics.solana_program_labels".into();
+    assert!(file::check(&j).is_err());
 }

@@ -1,0 +1,148 @@
+1DEX
+Abyss AMM
+Adrena
+Aldrin
+Aldrin V2
+AlphaQ
+Aquifer
+Archer
+Axifi
+Axiom Blur
+BinaryFi
+BisonFi Predict
+Bisonfi
+Bonkswap
+Boop.fun
+Byreal
+Byreal PAMM
+Carrot
+Clearpools
+Crema
+Cropper
+DFlow
+Daos.fun
+Denali
+Deriverse
+DexLab
+Dynamic Bonding Curve
+Exponent CLMM
+Exponent Orderbook
+Flux
+FluxBeam
+Fusion
+GatorSwap
+Gavel
+GlamSingleAssetVault
+GoonFi V2
+Goonfi
+GooseFX GAMMA
+Greenspan
+Guacswap
+Hadron
+Hashflow
+Heaven
+Helium Network
+Huma
+Humbility
+Humidifi
+Hylo
+Hylo Stability Pool
+Invariant
+Jupiter Lend DEX
+Jupiter Lend Earn
+Jupiter V6
+JupiterRfqV2
+Kdex
+Kestrel
+Kipseli
+LemmingsFi
+Lifinity
+Lifinity V2
+Liquid Unstaker
+M Swap
+Manifest
+Mayflower
+Mercurial
+MetaDAO
+Meteora CPMM
+Meteora CPMM V2
+Meteora DLMM
+Metric
+MoonPay
+Moonit
+Mozart
+OKX V1
+OKX V2
+Oasis
+Obric V2
+Obsidian AMM
+Omnipair
+OnRe
+Openbook
+Openbook V2
+Orca V1
+Orca V2
+Overpass
+PancakeSwap
+Penguin
+Perena
+Perena Star
+Perps
+Phoenix
+PropS
+Pumpfun
+Pumpfun AMM
+Quantum
+Quay
+Raydium AMM
+Raydium CLMM
+Raydium CPMM
+Raydium Launchlab
+Raydium Router
+Raydium Stable Swap
+Reflect AMM
+Reflect Whitelabel
+Riptide
+Rubicon
+RunnerRodeo
+Saber
+Saber (Decimals)
+Sanctum
+Sanctum Infinity
+Sanctum SOLS
+Saros
+Saros DLMM
+Scale Amm
+Scale Vmm
+Scorch
+Sencha
+Serum V3
+Solayer
+Solfi
+Solfi V2
+Stabble
+Stabble CLMM
+Stabble Weighted Swap
+Step Finance Swap
+StepN
+SweetSpot
+TaurusFi
+Tempest
+Tessera
+Titan Argos V1
+Titan Limit Orders
+Token Mill
+Token Swap
+Trench
+Trends
+Vader
+Vault Unstakepool
+Vertigo
+Virtuals
+Voltr
+WhaleStreet
+Whirlpool
+Woofi
+XOrca
+Zerofi
+memefi-test

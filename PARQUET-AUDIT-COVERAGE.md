@@ -197,18 +197,23 @@ names retain their existing scanner unless an explicit `SolanaPublicKeyBytes`
 type policy is supplied. String columns named `address` retain their existing
 string audit behavior; `label` and `address_str` are also audited as before.
 
-## Reviewed program-label exception
+## Reviewed program-label allowlist
 
-The operator approved the exact UTF-8 value `Dynamic Bonding Curve` in
-`analytics.solana_program_labels.label`. Only speculative base64 catalogue
-scanning is skipped for that exact table/column/value. Raw catalogue checks,
-Unicode normalization, percent/entity/Unicode-escape decoding, native type and
-nullability, byte budgets, explicit patterns and length limits remain active.
-Explicit incident indicators still scan all representations, including base64.
+The operator approved the 148 exact UTF-8 labels pinned in
+[src/parquet_audit/approved_program_labels.txt](src/parquet_audit/approved_program_labels.txt).
+This list applies only to `analytics.solana_program_labels.label`. Non-null values
+not present in the list stop the run for review, including case changes, empty
+strings, and added whitespace. The column must retain its native string schema.
 
-Different case, whitespace, suffixes, tables or columns do not receive this
-exception; other values retain the full audit. FIELD-AUDIT.json records the
-approved value in `approved_base64_exempt_values`. Table identity is supplied by
+For approved values, only speculative base64 catalogue scanning is skipped.
+Raw catalogue checks, Unicode normalization, percent/entity/Unicode-escape
+decoding, native nullability, byte budgets, explicit patterns and length limits
+remain active. Explicit incident indicators still scan all representations,
+including base64. Values are preserved without normalization or rewriting.
+
+Other tables and columns receive no exception. FIELD-AUDIT.json records the
+complete list in `approved_base64_exempt_values`. Table identity is supplied by
 the controller to the isolated worker, not inferred from source field data.
-Jobs without a table identity receive no exception. The general and TSV scanners
-retain their original behavior.
+Jobs without a table identity receive no exception. General and TSV scanners
+retain their original behavior. Tests cover all 148 values, exact output
+preservation, unknown values, schema rejection, scope, and explicit constraints.

@@ -1,4 +1,6 @@
 //! Native-value adapter to the existing bounds and injection audit. No TSV serialization.
+pub(super) const APPROVED_PROGRAM_LABELS: &str = include_str!("approved_program_labels.txt");
+
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -700,7 +702,17 @@ impl Node {
             };
             let approved_label = self.approved_label
                 && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-                && raw.as_ref() == b"Dynamic Bonding Curve";
+                && APPROVED_PROGRAM_LABELS
+                    .lines()
+                    .any(|label| label.as_bytes() == raw.as_ref());
+            if self.approved_label && !approved_label {
+                return emit(self.finding(
+                    file,
+                    row,
+                    "program label is not in the operator-approved allowlist",
+                    &raw,
+                ));
+            }
             if approved_label {
                 let scan = payloads::scan_without_base64(&raw, limits)?;
                 if !scan.is_clean() {
@@ -846,12 +858,29 @@ pub struct FieldAudit {
 }
 
 impl Contract {
-    pub fn apply_label_exception(&mut self, table: &str) {
+    pub fn apply_label_exception(&mut self, table: &str) -> Result<()> {
         if table == "analytics.solana_program_labels" {
             for node in &mut self.nodes {
                 node.approved_label = node.name == "label";
+                if node.approved_label {
+                    if !matches!(
+                        self.schema
+                            .field_with_name("label")
+                            .map_err(|_| usage::<()>("missing program label schema").unwrap_err())?
+                            .data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8
+                    ) {
+                        return usage("approved program labels require native string columns");
+                    }
+                    if node.encoded.is_some() || !matches!(node.ty, Ch::String) {
+                        return usage(
+                            "approved program labels cannot override their string contract",
+                        );
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     pub fn field_audits(&self) -> Vec<FieldAudit> {
@@ -867,7 +896,7 @@ impl Contract {
                     max_len: scalar.max_len,
                     opaque_binary: node.binary,
                     approved_base64_exempt_values: if node.approved_label {
-                        vec!["Dynamic Bonding Curve".into()]
+                        APPROVED_PROGRAM_LABELS.lines().map(str::to_owned).collect()
                     } else {
                         Vec::new()
                     },

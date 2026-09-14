@@ -217,7 +217,7 @@ pub fn check(job: &Job) -> Result<Checked> {
     let contract = if let Some(native) = &job.native_policy {
         {
             let mut contract = validation::build_native(native, &job.overrides, builder.schema())?;
-            contract.apply_label_exception(&job.table);
+            contract.apply_label_exception(&job.table)?;
             contract
         }
     } else {

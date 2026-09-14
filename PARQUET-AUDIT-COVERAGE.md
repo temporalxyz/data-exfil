@@ -282,3 +282,16 @@ This does not allow apostrophes globally, approve corrected spellings, or exempt
 other tables/columns. FIELD-AUDIT.json records the exact value in
 `approved_raw_sql_exempt_values`; it is not a base64 exception. The shared
 default and TSV scanners retain their existing behavior.
+
+## Reviewed mint-name base64 exception
+
+The exact native string `Halal Language Model` is operator-approved only in
+`analytics.mint_infos.name`. It skips speculative base64 catalogue scanning,
+while retaining raw catalogue checks, Unicode/non-base64 decoding, native
+nullability, byte limits, patterns, and explicit incident indicators (including
+on decoded forms). The original string is preserved. Other names, columns,
+tables, or modified values retain their existing checks.
+
+FIELD-AUDIT.json records this value in `approved_base64_exempt_values`.
+The separate `Somethig's Gotta Change` exception still exempts only its raw
+SQL match; it does not inherit this base64 exception.

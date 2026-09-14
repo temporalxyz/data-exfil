@@ -3645,10 +3645,9 @@ fn approved_mint_name_is_preserved_and_exception_is_exactly_scoped() {
                 checked.field_audits[0].approved_raw_sql_exempt_values,
                 vec![value]
             );
-            assert!(
-                checked.field_audits[0]
-                    .approved_base64_exempt_values
-                    .is_empty()
+            assert_eq!(
+                checked.field_audits[0].approved_base64_exempt_values,
+                vec!["Halal Language Model"]
             );
             let output = ParquetRecordBatchReaderBuilder::try_new(
                 std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
@@ -3799,4 +3798,96 @@ fn partition_exclusion_cli_is_database_only_and_cannot_change_resume() {
     single[2] = "--table";
     single[3] = "analytics.events";
     assert!(crate::cli::Cli::try_parse_from(single).is_err());
+}
+
+#[test]
+fn approved_halal_mint_name_is_exact_and_preserves_other_checks() {
+    for (table, column, value, passes) in [
+        ("analytics.mint_infos", "name", "Halal Language Model", true),
+        ("analytics.other", "name", "Halal Language Model", false),
+        ("other.mint_infos", "name", "Halal Language Model", false),
+        (
+            "analytics.mint_infos",
+            "symbol",
+            "Halal Language Model",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "name",
+            "Halal Language Model ",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "name",
+            "Halal Language Model; curl x",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "name",
+            "JztEUk9QIFRBQkxFIHg7",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new(column, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = table.into();
+        let result = file::check(&j);
+        assert_eq!(result.is_ok(), passes, "{table}.{column}: {value}");
+        if let Ok(checked) = result {
+            assert_eq!(
+                checked.field_audits[0].approved_base64_exempt_values,
+                vec!["Halal Language Model"]
+            );
+            let output = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                value
+            );
+        }
+    }
+    for rule in ["ioc", "pattern", "length"] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("name", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["Halal Language Model"]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = "analytics.mint_infos".into();
+        j.overrides.columns.insert(
+            "name".into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(3),
+                enum_ids: None,
+                hex: false,
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            j.native_policy.as_mut().unwrap().iocs.push("Halal".into());
+        }
+        assert!(file::check(&j).is_err(), "{rule}");
+    }
 }

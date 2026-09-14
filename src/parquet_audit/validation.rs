@@ -795,7 +795,10 @@ impl Node {
             let approved_value = approved_label
                 || (self.approved_asset
                     && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-                    && raw.as_ref() == b"ge87");
+                    && raw.as_ref() == b"ge87")
+                || (self.approved_mint_name
+                    && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                    && raw.as_ref() == b"Halal Language Model");
             let approved_mint_name = self.approved_mint_name
                 && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                 && raw.as_ref() == b"Somethig's Gotta Change";
@@ -1044,6 +1047,8 @@ impl Contract {
                         APPROVED_PROGRAM_LABELS.lines().map(str::to_owned).collect()
                     } else if node.approved_asset {
                         vec!["ge87".into()]
+                    } else if node.approved_mint_name {
+                        vec!["Halal Language Model".into()]
                     } else {
                         Vec::new()
                     },

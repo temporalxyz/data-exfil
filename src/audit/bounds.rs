@@ -169,11 +169,21 @@ pub fn check_value_precompiled(
     row: u64,
     pattern: Option<&Regex>,
 ) -> Result<Option<Finding>> {
-    check_value_impl(contract, field.bytes(), limits, page, row, pattern, true)
+    check_value_impl(
+        contract,
+        field.bytes(),
+        limits,
+        page,
+        row,
+        pattern,
+        true,
+        false,
+    )
 }
 
 /// Check borrowed native bytes without copying them into a TSV field allocation.
 /// Generic text scanning may only be disabled for native scalars or accepted opaque values.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_bytes_precompiled(
     contract: &ColumnContract,
     bytes: &[u8],
@@ -182,6 +192,7 @@ pub(crate) fn check_bytes_precompiled(
     row: u64,
     pattern: Option<&Regex>,
     scan_payloads: bool,
+    allow_nul: bool,
 ) -> Result<Option<Finding>> {
     check_value_impl(
         contract,
@@ -191,9 +202,11 @@ pub(crate) fn check_bytes_precompiled(
         row,
         pattern,
         scan_payloads,
+        allow_nul,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_value_impl(
     contract: &ColumnContract,
     field: Option<&[u8]>,
@@ -202,6 +215,7 @@ fn check_value_impl(
     row: u64,
     pattern: Option<&Regex>,
     scan_payloads: bool,
+    allow_nul: bool,
 ) -> Result<Option<Finding>> {
     let finding = |reason: &str, escalate: bool, sample: &[u8]| Finding {
         phase: "bounds".to_owned(),
@@ -240,11 +254,19 @@ fn check_value_impl(
     // re-emitting a rejected value forward, and `models.rs` claims the struct structurally cannot;
     // the careful `hex_sample()` beside it was being bypassed by the field next to it.
     if let Err(e) = contract.validator.check(bytes) {
-        return Ok(Some(finding(
-            e.reason(),
-            contract.class.escalates_on_match(),
-            bytes,
-        )));
+        let permitted_nul = allow_nul
+            && matches!(contract.validator, Validator::FreeText { .. })
+            && std::str::from_utf8(bytes).is_ok()
+            && !bytes
+                .iter()
+                .any(|b| matches!(*b, 0x01..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F));
+        if !permitted_nul {
+            return Ok(Some(finding(
+                e.reason(),
+                contract.class.escalates_on_match(),
+                bytes,
+            )));
+        }
     }
 
     if let Some(cap) = contract.max_len {

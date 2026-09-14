@@ -4287,6 +4287,8 @@ fn mint_info_names_and_symbols_are_operator_approved_free_text_only_in_those_fie
         ("other.mint_infos", "name", "' OR 1=1 --", false),
         ("analytics.mint_infos", "symbol", "M&M'S", true),
         ("analytics.mint_infos", "symbol", "=SUM(1,1)", true),
+        ("analytics.mint_infos", "symbol", "\u{05e2}\u{05d1}\0", true),
+        ("analytics.mint_infos", "symbol", "bad\u{0001}", false),
         ("analytics.other", "symbol", "M&M'S", false),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -4310,6 +4312,7 @@ fn mint_info_names_and_symbols_are_operator_approved_free_text_only_in_those_fie
                     .approved_raw_sql_exempt_values
                     .is_empty()
             );
+            assert_eq!(checked.field_audits[0].allows_nul, column == "symbol");
         }
     }
 

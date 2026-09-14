@@ -180,3 +180,19 @@ semantic/hex/enum overrides stop the run. Empty values do not satisfy this
 contract. FIELD-AUDIT.json records the contract; other binary fields retain
 their existing full payload scans. Optional `types` policies may explicitly
 assign `UInt128Bytes` to other columns. The legacy TSV path is unchanged.
+
+## Raw Solana public-key bytes
+
+Top-level binary columns named `address` use `SolanaPublicKeyBytes`, requiring
+native fixed-size binary of exactly 32 bytes. This covers the confirmed
+`analytics.solana_program_labels.address` schema. Bytes are preserved unchanged,
+without speculative text/base64 scans of their generated hex display. Any 32-byte
+value is a possible public-key representation; this does not prove authenticity,
+ownership, or consistency with a separate `address_str` field.
+
+Native nullability, byte budgets, explicit patterns/length limits and incident
+indicators remain enforced. Wrong widths, variable binary schemas and conflicting
+overrides stop the run. Empty binary values are not allowed. Other binary column
+names retain their existing scanner unless an explicit `SolanaPublicKeyBytes`
+type policy is supplied. String columns named `address` retain their existing
+string audit behavior; `label` and `address_str` are also audited as before.

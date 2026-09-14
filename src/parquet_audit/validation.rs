@@ -139,6 +139,14 @@ pub fn build_native(
         // Operator-selected contracts, scoped to these exact top-level column names.
         let default_type = match name.as_str() {
             "signature" => Some("SolanaSignature"),
+            "address"
+                if matches!(
+                    field.data_type(),
+                    DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+                ) =>
+            {
+                Some("SolanaPublicKeyBytes")
+            }
             "token_a" | "token_b" | "fee_payer" => Some("SolanaPublicKey"),
             "mid_a_to_b_num" | "mid_a_to_b_denom" | "mid_b_to_a_num" | "mid_b_to_a_denom" => {
                 Some("UInt128Bytes")
@@ -156,9 +164,17 @@ pub fn build_native(
             Some("SolanaSignature") => Some(EncodedField::Signature),
             Some("SolanaPublicKey") => Some(EncodedField::PublicKey),
             Some("UInt128Bytes") => Some(EncodedField::UInt128Bytes),
+            Some("SolanaPublicKeyBytes") => Some(EncodedField::PublicKeyBytes),
             _ => None,
         };
         match encoded {
+            Some(EncodedField::PublicKeyBytes)
+                if field.data_type() != &DataType::FixedSizeBinary(32) =>
+            {
+                return usage(
+                    "SolanaPublicKeyBytes requires native fixed-size binary of exactly 32 bytes",
+                );
+            }
             Some(EncodedField::UInt128Bytes)
                 if field.data_type() != &DataType::FixedSizeBinary(16) =>
             {
@@ -608,6 +624,9 @@ impl Node {
                     }
                     EncodedField::PublicKey => {
                         decode_solana_public_key(&raw).map(DecodedOpaque::Address)
+                    }
+                    EncodedField::PublicKeyBytes => {
+                        raw.as_ref().try_into().ok().map(DecodedOpaque::Address)
                     }
                     EncodedField::UInt128Bytes => raw
                         .as_ref()
@@ -1122,6 +1141,7 @@ fn decode_solana_signature(raw: &[u8]) -> Option<[u8; 64]> {
 enum EncodedField {
     Signature,
     PublicKey,
+    PublicKeyBytes,
     UInt128Bytes,
 }
 impl EncodedField {
@@ -1132,12 +1152,14 @@ impl EncodedField {
         match self {
             Self::Signature => "SolanaSignature(base58|base64,64 bytes)",
             Self::PublicKey => "SolanaPublicKey(base58,32 bytes)",
+            Self::PublicKeyBytes => "SolanaPublicKeyBytes(raw,32 bytes)",
             Self::UInt128Bytes => "UInt128Bytes(16 bytes, preserved byte order)",
         }
     }
     fn failure(self) -> &'static str {
         match self {
             Self::UInt128Bytes => "UInt128Bytes must contain exactly 16 bytes",
+            Self::PublicKeyBytes => "Solana public key bytes must contain exactly 32 bytes",
             Self::Signature => {
                 "Solana signature must be canonical base58 or base64 encoding of exactly 64 bytes"
             }

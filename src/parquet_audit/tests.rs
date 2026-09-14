@@ -2902,3 +2902,113 @@ fn native_untyped_binary_keeps_payload_scanning() {
     );
     assert!(file::check(&native_job(dir.path(), &b)).is_err());
 }
+
+#[test]
+fn binary_solana_address_preserves_reported_bytes_and_nullability() {
+    let reported = [
+        0x00, 0x36, 0xf3, 0x86, 0x2b, 0x07, 0x57, 0xe1, 0x5b, 0x27, 0x24, 0x22, 0x68, 0xfa, 0xdf,
+        0x5d, 0x75, 0x23, 0x72, 0x87, 0x65, 0xd2, 0x55, 0x47, 0x94, 0x4a, 0xd6, 0x7e, 0x56, 0x55,
+        0x5b, 0x51,
+    ];
+    for nullable in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut expected = vec![Some(reported), Some([0; 32]), Some([255; 32])];
+        if nullable {
+            expected.push(None);
+        }
+        let b = batch(
+            vec![Field::new(
+                "address",
+                DataType::FixedSizeBinary(32),
+                nullable,
+            )],
+            vec![Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    expected.clone().into_iter(),
+                    32,
+                )
+                .unwrap(),
+            )],
+        );
+        let j = native_job(dir.path(), &b);
+        let checked = file::check(&j).unwrap();
+        assert_eq!(
+            checked.field_audits[0].validated_type,
+            "SolanaPublicKeyBytes(raw,32 bytes)"
+        );
+        assert!(!checked.field_audits[0].allows_empty_encoded_value);
+        let mut actual = Vec::new();
+        for output in &checked.outputs {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(dir.path().join(&output.name)).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            for b in reader {
+                let b = b.unwrap();
+                assert_eq!(b.schema().field(0).is_nullable(), nullable);
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .unwrap();
+                actual.extend(
+                    a.iter()
+                        .map(|v| v.map(|v| <[u8; 32]>::try_from(v).unwrap())),
+                );
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn binary_solana_address_enforces_schema_policy_and_incident_checks() {
+    for rule in [
+        "width", "variable", "pattern", "length", "ioc", "conflict", "generic",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let value = *b"incident-canary!!!!!!!!!!!!!!!!!!";
+        let a: ArrayRef = match rule {
+            "width" => {
+                Arc::new(FixedSizeBinaryArray::try_from_iter(vec![[1u8; 31]].into_iter()).unwrap())
+            }
+            "variable" => Arc::new(BinaryArray::from(vec![&value[..]])),
+            _ => Arc::new(FixedSizeBinaryArray::try_from_iter(vec![value].into_iter()).unwrap()),
+        };
+        let name = if rule == "generic" { "blob" } else { "address" };
+        let b = batch(
+            vec![Field::new(name, a.data_type().clone(), false)],
+            vec![a],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.overrides.columns.insert(
+            name.into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(31),
+                enum_ids: None,
+                hex: false,
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            j.native_policy
+                .as_mut()
+                .unwrap()
+                .iocs
+                .push("incident-canary".into());
+        }
+        if rule == "conflict" {
+            j.native_policy
+                .as_mut()
+                .unwrap()
+                .types
+                .insert(name.into(), "String".into());
+        }
+        assert!(file::check(&j).is_err(), "{rule}");
+    }
+}

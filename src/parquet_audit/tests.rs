@@ -3286,3 +3286,169 @@ fn reviewed_asset_exception_is_exact_and_keeps_other_checks() {
         assert!(file::check(&j).is_err(), "{rule}");
     }
 }
+
+#[test]
+fn packed_curve_accepts_exact_size_and_preserves_strings_and_nulls() {
+    use base64::Engine as _;
+    let mut raw = [255u8; 994];
+    raw[..12].copy_from_slice(b"';curl x|=1!");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+    let expected = vec![Some(""), Some(encoded.as_str()), None];
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("curve_packed", DataType::Utf8, true)],
+        vec![Arc::new(StringArray::from(expected.clone()))],
+    );
+    let mut j = native_job(dir.path(), &b);
+    j.table = "analytics.memefi_oracle_updates".into();
+    let checked = file::check(&j).unwrap();
+    assert_eq!(
+        checked.field_audits[0].validated_type,
+        "PackedCurve(base64,994 bytes)"
+    );
+    assert!(checked.field_audits[0].allows_empty_encoded_value);
+    let mut actual = Vec::new();
+    for output in checked.outputs {
+        for b in ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(dir.path().join(output.name)).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        {
+            let b = b.unwrap();
+            actual.extend(
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.map(str::to_owned)),
+            );
+        }
+    }
+    assert_eq!(
+        actual,
+        expected
+            .into_iter()
+            .map(|s| s.map(str::to_owned))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn packed_curve_rejects_invalid_encodings_and_preserves_scope_and_policies() {
+    use base64::Engine as _;
+    let raw = [255u8; 994];
+    let valid = base64::engine::general_purpose::STANDARD.encode(raw);
+    let mut noncanonical = valid.clone().into_bytes();
+    noncanonical[1325] = b'x'; // /w== becomes /x==: nonzero trailing padding bits.
+    for value in [
+        "not base64".into(),
+        base64::engine::general_purpose::STANDARD.encode([0u8; 993]),
+        base64::engine::general_purpose::STANDARD.encode([0u8; 995]),
+        valid.trim_end_matches('=').into(),
+        format!("{valid}\n"),
+        base64::engine::general_purpose::URL_SAFE.encode(raw),
+        String::from_utf8(noncanonical).unwrap(),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("curve_packed", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = "analytics.memefi_oracle_updates".into();
+        assert!(file::check(&j).is_err());
+    }
+    for rule in [
+        "table",
+        "column",
+        "ioc",
+        "decoded_ioc",
+        "pattern",
+        "length",
+        "hex",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let name = if rule == "column" {
+            "other"
+        } else {
+            "curve_packed"
+        };
+        let mut data = [0u8; 994];
+        data[..12].copy_from_slice(b"';curl x|=1!");
+        let value = base64::engine::general_purpose::STANDARD.encode(data);
+        let b = batch(
+            vec![Field::new(name, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value.as_str()]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = if rule == "table" {
+            "other.memefi_oracle_updates"
+        } else {
+            "analytics.memefi_oracle_updates"
+        }
+        .into();
+        j.overrides.columns.insert(
+            name.into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(100),
+                enum_ids: None,
+                hex: rule == "hex",
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            j.native_policy
+                .as_mut()
+                .unwrap()
+                .iocs
+                .push(value[..16].into());
+        }
+        if rule == "decoded_ioc" {
+            j.native_policy.as_mut().unwrap().iocs.push("curl".into());
+        }
+        assert!(file::check(&j).is_err(), "{rule}");
+    }
+}
+
+#[test]
+fn packed_curve_requires_native_strings_and_applies_constraints_to_empty() {
+    for array in [
+        Arc::new(BinaryArray::from(vec![&b""[..]])) as ArrayRef,
+        Arc::new(UInt64Array::from(vec![994])),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("curve_packed", array.data_type().clone(), false)],
+            vec![array],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = "analytics.memefi_oracle_updates".into();
+        assert!(file::check(&j).is_err());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let b = batch(
+        vec![Field::new("curve_packed", DataType::Utf8, false)],
+        vec![Arc::new(StringArray::from(vec![""]))],
+    );
+    let mut j = native_job(dir.path(), &b);
+    j.table = "analytics.memefi_oracle_updates".into();
+    j.overrides.columns.insert(
+        "curve_packed".into(),
+        crate::models::ColumnOverride {
+            class: crate::models::FreedomClass::Closed,
+            pattern: Some("^.+$".into()),
+            max_len: None,
+            enum_ids: None,
+            hex: false,
+            drop: false,
+            rotation_owner: None,
+        },
+    );
+    assert!(file::check(&j).is_err());
+}

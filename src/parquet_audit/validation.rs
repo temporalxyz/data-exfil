@@ -35,6 +35,7 @@ struct Node {
     native_numeric: bool,
     approved_label: bool,
     approved_asset: bool,
+    packed_curve: bool,
 }
 
 fn inner(ty: &Ch) -> (&Ch, bool) {
@@ -573,6 +574,7 @@ impl Node {
             native_numeric: false,
             approved_label: false,
             approved_asset: false,
+            packed_curve: false,
             binary: matches!(
                 dt,
                 DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
@@ -623,6 +625,41 @@ impl Node {
                 return emit(self.finding(file, row, "value exceeds pinned field byte cap", &raw));
             }
             *remaining -= raw.len() as u64;
+            if self.packed_curve {
+                use base64::Engine as _;
+                let mut decoded = [0u8; 994];
+                let valid = raw.is_empty()
+                    || (raw.len() == 1328
+                        && base64::engine::general_purpose::STANDARD
+                            .decode_slice(&raw, &mut decoded)
+                            .ok()
+                            == Some(994));
+                if !valid {
+                    return emit(self.finding(file, row,
+                        "curve_packed must be empty or canonical standard base64 of exactly 994 bytes", &raw));
+                }
+                if contract.max_len.is_some_and(|cap| raw.len() > cap as usize)
+                    || self.pattern.is_some_and(|pattern| !pattern.is_match(&raw))
+                {
+                    return emit(self.finding(
+                        file,
+                        row,
+                        "packed curve violates its explicit field constraints",
+                        &raw,
+                    ));
+                }
+                if self.iocs.as_ref().is_some_and(|iocs| {
+                    iocs.is_match(&raw) || (!raw.is_empty() && iocs.is_match(&decoded))
+                }) {
+                    return emit(self.finding(
+                        file,
+                        row,
+                        "payload catalogue match: ioc_canary in packed curve",
+                        &raw,
+                    ));
+                }
+                return Ok(());
+            }
             if let Some(encoded) = self.encoded {
                 let decoded = match encoded {
                     EncodedField::Signature => {
@@ -865,6 +902,33 @@ pub struct FieldAudit {
 
 impl Contract {
     pub fn apply_label_exception(&mut self, table: &str) -> Result<()> {
+        if table == "analytics.memefi_oracle_updates" {
+            for node in &mut self.nodes {
+                if node.name != "curve_packed" {
+                    continue;
+                }
+                let field = self
+                    .schema
+                    .field_with_name("curve_packed")
+                    .map_err(|_| usage::<()>("missing packed curve schema").unwrap_err())?;
+                let scalar = node.scalar.as_mut().ok_or_else(|| {
+                    usage::<()>("packed curve requires a scalar string contract").unwrap_err()
+                })?;
+                if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                    || !matches!(node.ty, Ch::String)
+                    || node.encoded.is_some()
+                    || !matches!(
+                        scalar.validator,
+                        Validator::FreeText { .. } | Validator::ColumnPattern { .. }
+                    )
+                {
+                    return usage("curve_packed requires an unencoded native string contract");
+                }
+                node.packed_curve = true;
+                scalar.class = FreedomClass::Closed;
+            }
+        }
+
         for node in &mut self.nodes {
             node.approved_asset = table == "analytics.memefi_fv"
                 && node.name == "asset"
@@ -903,9 +967,12 @@ impl Contract {
             if let Some(scalar) = &node.scalar {
                 result.push(FieldAudit {
                     column: node.name.clone(),
-                    validated_type: node
-                        .encoded
-                        .map_or_else(|| node.ty.canonical(), |kind| kind.label().into()),
+                    validated_type: if node.packed_curve {
+                        "PackedCurve(base64,994 bytes)".into()
+                    } else {
+                        node.encoded
+                            .map_or_else(|| node.ty.canonical(), |kind| kind.label().into())
+                    },
                     class: scalar.class,
                     pattern: scalar.pattern.clone(),
                     max_len: scalar.max_len,
@@ -917,9 +984,8 @@ impl Contract {
                     } else {
                         Vec::new()
                     },
-                    allows_empty_encoded_value: node
-                        .encoded
-                        .is_some_and(EncodedField::allows_empty),
+                    allows_empty_encoded_value: node.packed_curve
+                        || node.encoded.is_some_and(EncodedField::allows_empty),
                     recognizes_solana_encodings: node.recognize_solana
                         && matches!(node.ty, Ch::String | Ch::FixedString(_)),
                     enum_ids: match &scalar.validator {

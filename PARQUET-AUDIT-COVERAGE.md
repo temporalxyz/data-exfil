@@ -230,3 +230,24 @@ FIELD-AUDIT.json records `ge87` in `approved_base64_exempt_values`.
 This is a single-value exception, not a closed asset allowlist. Other asset values
 retain their complete audit. Other tables, columns, and altered values receive
 no exception. The program-label allowlist remains separate and closed.
+
+## Packed oracle curves
+
+By operator approval after a scan of 50 source files (1,598,148 nonempty values,
+all decoding to 994 bytes, plus 8,500,314 empty values),
+`analytics.memefi_oracle_updates.curve_packed` uses a scoped opaque-binary
+representation contract. The native column must be a string. Empty strings are
+allowed; otherwise canonical standard padded base64 must decode to exactly
+994 bytes (1328 encoded ASCII bytes). Wrong sizes, malformed/noncanonical
+encodings, whitespace, and conflicting semantic/hex/enum policies stop the run.
+
+The decoded binary and its base64 text skip generic payload catalogue scanning.
+Explicit incident indicators still inspect both representations. Native
+nullability, field byte budgets, explicit length limits and patterns still
+apply, including to empty values. Original strings and NULLs are preserved.
+Decoding uses a fixed stack buffer, without per-value heap allocation.
+FIELD-AUDIT.json records `PackedCurve(base64,994 bytes)` and its empty-value policy.
+
+This validates encoding and size only, not the unavailable internal curve
+layout or numerical correctness. Other columns (including `tox_data`) and other
+tables retain their existing audits. The TSV path is unchanged.

@@ -821,7 +821,6 @@ impl Node {
                     && opaque_solana.is_none()
                     && !approved_value
                     && !operator_approved_free_text,
-                self.approved_mint_symbol,
             )? {
                 emit(finding)?;
             }
@@ -945,8 +944,6 @@ pub struct FieldAudit {
     #[serde(default)]
     pub allows_empty_encoded_value: bool,
     #[serde(default)]
-    pub allows_nul: bool,
-    #[serde(default)]
     pub approved_base64_exempt_values: Vec<String>,
     /// Operator-approved display-name field: generic payload scanning is disabled.
     #[serde(default)]
@@ -1057,7 +1054,6 @@ impl Contract {
                     },
                     operator_approved_free_text: node.approved_mint_name
                         || node.approved_mint_symbol,
-                    allows_nul: node.approved_mint_symbol,
                     allows_empty_encoded_value: node.packed_binary.is_some()
                         || node.encoded.is_some_and(EncodedField::allows_empty),
                     recognizes_solana_encodings: node.recognize_solana

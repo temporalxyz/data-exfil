@@ -3205,3 +3205,84 @@ fn unreviewed_labels_and_non_string_label_schemas_stop() {
     j.table = "analytics.solana_program_labels".into();
     assert!(file::check(&j).is_err());
 }
+
+#[test]
+fn reviewed_asset_exception_is_exact_and_keeps_other_checks() {
+    for (table, column, value, passes) in [
+        ("analytics.memefi_fv", "asset", "ge87", true),
+        ("analytics.other", "asset", "ge87", false),
+        ("other.memefi_fv", "asset", "ge87", false),
+        ("analytics.memefi_fv", "other", "ge87", false),
+        ("analytics.memefi_fv", "asset", "ge87 ", false),
+        ("analytics.memefi_fv", "asset", "ge87;curl x", false),
+        (
+            "analytics.memefi_fv",
+            "asset",
+            "JztEUk9QIFRBQkxFIHg7",
+            false,
+        ),
+        ("analytics.memefi_fv", "asset", "SOL", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new(column, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = table.into();
+        let result = file::check(&j);
+        assert_eq!(result.is_ok(), passes, "{table}.{column}: {value}");
+        if let Ok(checked) = result {
+            assert_eq!(
+                checked.field_audits[0].approved_base64_exempt_values,
+                vec!["ge87"]
+            );
+            let output = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                value
+            );
+        }
+    }
+    for rule in ["ioc", "decoded_ioc", "pattern", "length"] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("asset", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["ge87"]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = "analytics.memefi_fv".into();
+        j.overrides.columns.insert(
+            "asset".into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(3),
+                enum_ids: None,
+                hex: false,
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            j.native_policy.as_mut().unwrap().iocs.push("ge87".into());
+        }
+        if rule == "decoded_ioc" {
+            j.native_policy.as_mut().unwrap().iocs.push(";".into());
+        }
+        assert!(file::check(&j).is_err(), "{rule}");
+    }
+}

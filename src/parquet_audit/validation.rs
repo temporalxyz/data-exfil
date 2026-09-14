@@ -34,6 +34,7 @@ struct Node {
     recognize_solana: bool,
     native_numeric: bool,
     approved_label: bool,
+    approved_asset: bool,
 }
 
 fn inner(ty: &Ch) -> (&Ch, bool) {
@@ -571,6 +572,7 @@ impl Node {
             recognize_solana: false,
             native_numeric: false,
             approved_label: false,
+            approved_asset: false,
             binary: matches!(
                 dt,
                 DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
@@ -713,13 +715,17 @@ impl Node {
                     &raw,
                 ));
             }
-            if approved_label {
+            let approved_value = approved_label
+                || (self.approved_asset
+                    && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                    && raw.as_ref() == b"ge87");
+            if approved_value {
                 let scan = payloads::scan_without_base64(&raw, limits)?;
                 if !scan.is_clean() {
                     emit(self.finding(
                         file,
                         row,
-                        "approved label failed non-base64 payload checks",
+                        "approved value failed non-base64 payload checks",
                         &raw,
                     ))?;
                 }
@@ -731,7 +737,7 @@ impl Node {
                 file,
                 row,
                 self.pattern,
-                source_text && opaque_solana.is_none() && !approved_label,
+                source_text && opaque_solana.is_none() && !approved_value,
             )? {
                 emit(finding)?;
             }
@@ -859,6 +865,15 @@ pub struct FieldAudit {
 
 impl Contract {
     pub fn apply_label_exception(&mut self, table: &str) -> Result<()> {
+        for node in &mut self.nodes {
+            node.approved_asset = table == "analytics.memefi_fv"
+                && node.name == "asset"
+                && matches!(node.ty, Ch::String)
+                && node.encoded.is_none()
+                && self.schema.field_with_name("asset").is_ok_and(|field| {
+                    matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                });
+        }
         if table == "analytics.solana_program_labels" {
             for node in &mut self.nodes {
                 node.approved_label = node.name == "label";
@@ -897,6 +912,8 @@ impl Contract {
                     opaque_binary: node.binary,
                     approved_base64_exempt_values: if node.approved_label {
                         APPROVED_PROGRAM_LABELS.lines().map(str::to_owned).collect()
+                    } else if node.approved_asset {
+                        vec!["ge87".into()]
                     } else {
                         Vec::new()
                     },

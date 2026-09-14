@@ -217,3 +217,16 @@ the controller to the isolated worker, not inferred from source field data.
 Jobs without a table identity receive no exception. General and TSV scanners
 retain their original behavior. Tests cover all 148 values, exact output
 preservation, unknown values, schema rejection, scope, and explicit constraints.
+
+## Reviewed memefi asset exception
+
+The exact native string `ge87` is operator-approved only in
+`analytics.memefi_fv.asset`. It skips speculative base64 catalogue scanning;
+raw/Unicode/non-base64 decoding checks, type/nullability, byte caps and explicit
+field constraints remain active. Explicit incident indicators still inspect all
+decoded forms, including base64. Output retains the exact original string.
+FIELD-AUDIT.json records `ge87` in `approved_base64_exempt_values`.
+
+This is a single-value exception, not a closed asset allowlist. Other asset values
+retain their complete audit. Other tables, columns, and altered values receive
+no exception. The program-label allowlist remains separate and closed.

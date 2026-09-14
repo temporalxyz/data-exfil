@@ -162,3 +162,21 @@ Nonempty values still require their exact encoding and decoded length; whitespac
 empty. Native NULL constraints and explicit field patterns/length limits/incident indicators
 remain enforced. FIELD-AUDIT.json records `allows_empty_encoded_value` for these contracts;
 this does not override an explicit pattern that requires a nonempty value.
+
+## Assumed UInt128 binary fields
+
+By operator instruction, the exact top-level names `mid_a_to_b_num`,
+`mid_a_to_b_denom`, `mid_b_to_a_num` and `mid_b_to_a_denom` use the
+`UInt128Bytes` contract across native Parquet tables. They must have native
+fixed-size binary type of exactly 16 bytes. Every bit pattern is accepted as
+an opaque UInt128 representation, with bytes and native nullability preserved.
+The source schema establishes width only: unsigned integer meaning is an
+operator assumption, and no byte order is inferred or changed.
+
+Generic text payload scans, including speculative base64 decoding of generated
+hex, do not apply to these fields. Explicit incident indicators, patterns,
+length limits and field byte budgets still apply. Wrong schemas and conflicting
+semantic/hex/enum overrides stop the run. Empty values do not satisfy this
+contract. FIELD-AUDIT.json records the contract; other binary fields retain
+their existing full payload scans. Optional `types` policies may explicitly
+assign `UInt128Bytes` to other columns. The legacy TSV path is unchanged.

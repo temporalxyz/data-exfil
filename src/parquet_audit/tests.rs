@@ -2762,3 +2762,143 @@ fn empty_solana_fields_are_preserved_and_explicit_policies_still_apply() {
         assert!(file::check(&job).is_err());
     }
 }
+
+fn uint128_bytes_batch(name: &str, values: Vec<Option<[u8; 16]>>) -> RecordBatch {
+    let nullable = values.iter().any(Option::is_none);
+    batch(
+        vec![Field::new(name, DataType::FixedSizeBinary(16), nullable)],
+        vec![Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 16).unwrap(),
+        )],
+    )
+}
+
+#[test]
+fn native_uint128_bytes_preserve_reported_value_extremes_and_nulls() {
+    let reported = [
+        0xe6, 0xc7, 0x7c, 0xdc, 0x13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    for name in [
+        "mid_a_to_b_num",
+        "mid_a_to_b_denom",
+        "mid_b_to_a_num",
+        "mid_b_to_a_denom",
+        "custom_uint128",
+    ] {
+        for nullable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut expected = vec![Some(reported), Some([0; 16]), Some([255; 16])];
+            if nullable {
+                expected.push(None);
+            }
+            let b = uint128_bytes_batch(name, expected.clone());
+            let mut j = native_job(dir.path(), &b);
+            if name == "custom_uint128" {
+                j.native_policy
+                    .as_mut()
+                    .unwrap()
+                    .types
+                    .insert(name.into(), "UInt128Bytes".into());
+            }
+            let checked = file::check(&j).unwrap();
+            assert_eq!(
+                checked.field_audits[0].validated_type,
+                "UInt128Bytes(16 bytes, preserved byte order)"
+            );
+            assert!(!checked.field_audits[0].allows_empty_encoded_value);
+            let mut actual = Vec::new();
+            for output in &checked.outputs {
+                let reader = ParquetRecordBatchReaderBuilder::try_new(
+                    std::fs::File::open(dir.path().join(&output.name)).unwrap(),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+                for b in reader {
+                    let b = b.unwrap();
+                    assert_eq!(b.schema().field(0).is_nullable(), nullable);
+                    let a = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<FixedSizeBinaryArray>()
+                        .unwrap();
+                    actual.extend(
+                        a.iter()
+                            .map(|v| v.map(|v| <[u8; 16]>::try_from(v).unwrap())),
+                    );
+                }
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn native_uint128_bytes_reject_wrong_schema_and_conflicting_semantics() {
+    for array in [
+        Arc::new(StringArray::from(vec!["0000000000000000"])) as ArrayRef,
+        Arc::new(BinaryArray::from(vec![&[0u8; 16][..]])),
+        Arc::new(FixedSizeBinaryArray::try_from_iter(vec![[0u8; 15]].into_iter()).unwrap()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new(
+                "mid_a_to_b_num",
+                array.data_type().clone(),
+                false,
+            )],
+            vec![array],
+        );
+        assert!(file::check(&native_job(dir.path(), &b)).is_err());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let b = uint128_bytes_batch("mid_a_to_b_num", vec![Some([0; 16])]);
+    let mut j = native_job(dir.path(), &b);
+    j.native_policy
+        .as_mut()
+        .unwrap()
+        .types
+        .insert("mid_a_to_b_num".into(), "String".into());
+    assert!(file::check(&j).is_err());
+}
+
+#[test]
+fn native_uint128_bytes_keep_explicit_constraints_and_incident_checks() {
+    for rule in ["pattern", "length", "ioc", "hex", "enum"] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = uint128_bytes_batch("mid_a_to_b_num", vec![Some(*b"incident-canary!")]);
+        let mut j = native_job(dir.path(), &b);
+        j.overrides.columns.insert(
+            "mid_a_to_b_num".into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(15),
+                enum_ids: (rule == "enum").then(|| vec![1]),
+                hex: rule == "hex",
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            j.native_policy
+                .as_mut()
+                .unwrap()
+                .iocs
+                .push("incident-canary".into());
+        }
+        assert!(file::check(&j).is_err(), "{rule}");
+    }
+}
+
+#[test]
+fn native_untyped_binary_keeps_payload_scanning() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = uint128_bytes_batch(
+        "untyped_blob",
+        vec![Some([
+            0xe6, 0xc7, 0x7c, 0xdc, 0x13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])],
+    );
+    assert!(file::check(&native_job(dir.path(), &b)).is_err());
+}

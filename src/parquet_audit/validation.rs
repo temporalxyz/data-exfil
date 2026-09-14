@@ -140,6 +140,9 @@ pub fn build_native(
         let default_type = match name.as_str() {
             "signature" => Some("SolanaSignature"),
             "token_a" | "token_b" | "fee_payer" => Some("SolanaPublicKey"),
+            "mid_a_to_b_num" | "mid_a_to_b_denom" | "mid_b_to_a_num" | "mid_b_to_a_denom" => {
+                Some("UInt128Bytes")
+            }
             _ => None,
         };
         let explicit = policy.types.get(name).map(String::as_str);
@@ -147,15 +150,26 @@ pub fn build_native(
             .zip(explicit)
             .is_some_and(|(required, actual)| required != actual)
         {
-            return usage("column semantic override conflicts with its required Solana contract");
+            return usage("column semantic override conflicts with its required field contract");
         }
         let encoded = match default_type.or(explicit) {
             Some("SolanaSignature") => Some(EncodedField::Signature),
             Some("SolanaPublicKey") => Some(EncodedField::PublicKey),
+            Some("UInt128Bytes") => Some(EncodedField::UInt128Bytes),
             _ => None,
         };
-        if encoded.is_some() && !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            return usage("encoded Solana fields require native string columns");
+        match encoded {
+            Some(EncodedField::UInt128Bytes)
+                if field.data_type() != &DataType::FixedSizeBinary(16) =>
+            {
+                return usage("UInt128Bytes requires native fixed-size binary of exactly 16 bytes");
+            }
+            Some(EncodedField::Signature | EncodedField::PublicKey)
+                if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+            {
+                return usage("encoded Solana fields require native string columns");
+            }
+            _ => {}
         }
         let ty = if let Some(semantic) = policy.types.get(name).filter(|_| encoded.is_none()) {
             let ty = crate::clickhouse::types::parse_type(semantic)?;
@@ -176,7 +190,7 @@ pub fn build_native(
             &overrides.limits,
         )?;
         if encoded.is_some() && over.is_some_and(|o| o.hex || o.enum_ids.is_some()) {
-            return usage("encoded Solana fields cannot use hex or enum overrides");
+            return usage("opaque typed fields cannot use hex or enum overrides");
         }
         node.encoded = encoded;
         configure_native(&mut node, over, &iocs)?;
@@ -590,15 +604,20 @@ impl Node {
             if let Some(encoded) = self.encoded {
                 let decoded = match encoded {
                     EncodedField::Signature => {
-                        decode_solana_signature(&raw).map(DecodedSolana::Signature)
+                        decode_solana_signature(&raw).map(DecodedOpaque::Signature)
                     }
                     EncodedField::PublicKey => {
-                        decode_solana_public_key(&raw).map(DecodedSolana::Address)
+                        decode_solana_public_key(&raw).map(DecodedOpaque::Address)
                     }
+                    EncodedField::UInt128Bytes => raw
+                        .as_ref()
+                        .try_into()
+                        .ok()
+                        .map(DecodedOpaque::UInt128Bytes),
                 };
                 // Empty strings are an operator-approved missing-value representation.
                 // They remain distinct from NULL and still obey explicit field policies.
-                if !raw.is_empty() && decoded.is_none() {
+                if decoded.is_none() && !(raw.is_empty() && encoded.allows_empty()) {
                     return emit(self.finding(file, row, encoded.failure(), &raw));
                 }
                 if contract.max_len.is_some_and(|cap| raw.len() > cap as usize)
@@ -607,11 +626,11 @@ impl Node {
                     return emit(self.finding(
                         file,
                         row,
-                        "encoded Solana value violates its explicit field constraints",
+                        "opaque typed value violates its explicit field constraints",
                         &raw,
                     ));
                 }
-                // Signature and public-key bytes are opaque, not text to run through speculative decoders.
+                // Typed opaque bytes are not text to run through speculative decoders.
                 // Keep explicitly supplied incident indicators on both exact representations.
                 if self.iocs.as_ref().is_some_and(|i| {
                     i.is_match(&raw)
@@ -622,7 +641,7 @@ impl Node {
                     return emit(self.finding(
                         file,
                         row,
-                        "payload catalogue match: ioc_canary in encoded Solana value",
+                        "payload catalogue match: ioc_canary in opaque typed value",
                         &raw,
                     ));
                 }
@@ -653,8 +672,8 @@ impl Node {
                 && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
             {
                 decode_solana_public_key(&raw)
-                    .map(DecodedSolana::Address)
-                    .or_else(|| decode_solana_signature(&raw).map(DecodedSolana::Signature))
+                    .map(DecodedOpaque::Address)
+                    .or_else(|| decode_solana_signature(&raw).map(DecodedOpaque::Signature))
             } else {
                 None
             };
@@ -802,7 +821,9 @@ impl Contract {
                     pattern: scalar.pattern.clone(),
                     max_len: scalar.max_len,
                     opaque_binary: node.binary,
-                    allows_empty_encoded_value: node.encoded.is_some(),
+                    allows_empty_encoded_value: node
+                        .encoded
+                        .is_some_and(EncodedField::allows_empty),
                     recognizes_solana_encodings: node.recognize_solana
                         && matches!(node.ty, Ch::String | Ch::FixedString(_)),
                     enum_ids: match &scalar.validator {
@@ -1101,16 +1122,22 @@ fn decode_solana_signature(raw: &[u8]) -> Option<[u8; 64]> {
 enum EncodedField {
     Signature,
     PublicKey,
+    UInt128Bytes,
 }
 impl EncodedField {
+    fn allows_empty(self) -> bool {
+        matches!(self, Self::Signature | Self::PublicKey)
+    }
     fn label(self) -> &'static str {
         match self {
             Self::Signature => "SolanaSignature(base58|base64,64 bytes)",
             Self::PublicKey => "SolanaPublicKey(base58,32 bytes)",
+            Self::UInt128Bytes => "UInt128Bytes(16 bytes, preserved byte order)",
         }
     }
     fn failure(self) -> &'static str {
         match self {
+            Self::UInt128Bytes => "UInt128Bytes must contain exactly 16 bytes",
             Self::Signature => {
                 "Solana signature must be canonical base58 or base64 encoding of exactly 64 bytes"
             }
@@ -1158,15 +1185,17 @@ fn decode_solana_public_key_uncached(raw: &[u8]) -> Option<[u8; 32]> {
 }
 
 #[derive(Clone, Copy)]
-enum DecodedSolana {
+enum DecodedOpaque {
     Address([u8; 32]),
     Signature([u8; 64]),
+    UInt128Bytes([u8; 16]),
 }
-impl AsRef<[u8]> for DecodedSolana {
+impl AsRef<[u8]> for DecodedOpaque {
     fn as_ref(&self) -> &[u8] {
         match self {
             Self::Address(bytes) => bytes,
             Self::Signature(bytes) => bytes,
+            Self::UInt128Bytes(bytes) => bytes,
         }
     }
 }

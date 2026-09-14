@@ -798,7 +798,10 @@ impl Node {
                     && raw.as_ref() == b"ge87")
                 || (self.approved_mint_name
                     && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-                    && matches!(raw.as_ref(), b"Halal Language Model" | b"Janction"));
+                    && matches!(
+                        raw.as_ref(),
+                        b"Halal Language Model" | b"Janction" | b"1 wish can change your life"
+                    ));
             let approved_mint_name = self.approved_mint_name
                 && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                 && raw.as_ref() == b"Somethig's Gotta Change";
@@ -1048,7 +1051,11 @@ impl Contract {
                     } else if node.approved_asset {
                         vec!["ge87".into()]
                     } else if node.approved_mint_name {
-                        vec!["Halal Language Model".into(), "Janction".into()]
+                        vec![
+                            "Halal Language Model".into(),
+                            "Janction".into(),
+                            "1 wish can change your life".into(),
+                        ]
                     } else {
                         Vec::new()
                     },

@@ -300,3 +300,8 @@ The operator also approved the exact name `Janction` for the same
 `analytics.mint_infos.name` base64 exception. It is recorded alongside
 `Halal Language Model`. Scope, unchanged output, and all retained checks above
 apply equally; trailing whitespace or added text does not qualify.
+
+The exact value `1 wish can change your life` is also operator-approved for
+the same `analytics.mint_infos.name` base64-only exception. Its exact spelling
+is preserved and recorded in FIELD-AUDIT.json; all scope restrictions and
+retained checks above remain active.

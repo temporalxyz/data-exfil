@@ -3647,7 +3647,11 @@ fn approved_mint_name_is_preserved_and_exception_is_exactly_scoped() {
             );
             assert_eq!(
                 checked.field_audits[0].approved_base64_exempt_values,
-                vec!["Halal Language Model", "Janction"]
+                vec![
+                    "Halal Language Model",
+                    "Janction",
+                    "1 wish can change your life"
+                ]
             );
             let output = ParquetRecordBatchReaderBuilder::try_new(
                 std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
@@ -3843,7 +3847,11 @@ fn approved_halal_mint_name_is_exact_and_preserves_other_checks() {
         if let Ok(checked) = result {
             assert_eq!(
                 checked.field_audits[0].approved_base64_exempt_values,
-                vec!["Halal Language Model", "Janction"]
+                vec![
+                    "Halal Language Model",
+                    "Janction",
+                    "1 wish can change your life"
+                ]
             );
             let output = ParquetRecordBatchReaderBuilder::try_new(
                 std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
@@ -3919,7 +3927,11 @@ fn janction_mint_exception_is_scoped_and_keeps_constraints() {
         if let Ok(checked) = result {
             assert_eq!(
                 checked.field_audits[0].approved_base64_exempt_values,
-                vec!["Halal Language Model", "Janction"]
+                vec![
+                    "Halal Language Model",
+                    "Janction",
+                    "1 wish can change your life"
+                ]
             );
             let output = ParquetRecordBatchReaderBuilder::try_new(
                 std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
@@ -3967,6 +3979,117 @@ fn janction_mint_exception_is_scoped_and_keeps_constraints() {
                 .unwrap()
                 .iocs
                 .push("Janction".into());
+        }
+        assert!(file::check(&j).is_err(), "{rule}");
+    }
+}
+
+#[test]
+fn wish_mint_exception_is_scoped_and_keeps_constraints() {
+    for (table, column, value, passes) in [
+        (
+            "analytics.mint_infos",
+            "name",
+            "1 wish can change your life",
+            true,
+        ),
+        (
+            "analytics.other",
+            "name",
+            "1 wish can change your life",
+            false,
+        ),
+        (
+            "other.mint_infos",
+            "name",
+            "1 wish can change your life",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "symbol",
+            "1 wish can change your life",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "name",
+            "1 wish can change your life ",
+            false,
+        ),
+        (
+            "analytics.mint_infos",
+            "name",
+            "1 wish can change your life; DROP TABLE x",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new(column, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = table.into();
+        let result = file::check(&j);
+        assert_eq!(result.is_ok(), passes, "{table}.{column}: {value}");
+        if let Ok(checked) = result {
+            assert_eq!(
+                checked.field_audits[0].approved_base64_exempt_values,
+                vec![
+                    "Halal Language Model",
+                    "Janction",
+                    "1 wish can change your life"
+                ]
+            );
+            let output = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                value
+            );
+        }
+    }
+    for rule in ["ioc", "pattern", "length"] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("name", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![
+                "1 wish can change your life",
+            ]))],
+        );
+        let mut j = native_job(dir.path(), &b);
+        j.table = "analytics.mint_infos".into();
+        j.overrides.columns.insert(
+            "name".into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(3),
+                enum_ids: None,
+                hex: false,
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            j.native_policy
+                .as_mut()
+                .unwrap()
+                .iocs
+                .push("1 wish can change your life".into());
         }
         assert!(file::check(&j).is_err(), "{rule}");
     }

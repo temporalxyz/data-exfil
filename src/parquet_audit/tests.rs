@@ -4194,6 +4194,69 @@ fn unicode_coin_mint_exception_preserves_mark_and_exact_scope() {
 }
 
 #[test]
+fn patrick_star_mint_exception_is_exactly_scoped_and_keeps_constraints() {
+    for (table, column, value, passes) in [
+        ("analytics.mint_infos", "name", "Patrick Star", true),
+        ("analytics.other", "name", "Patrick Star", false),
+        ("other.mint_infos", "name", "Patrick Star", false),
+        ("analytics.mint_infos", "symbol", "Patrick Star", false),
+        ("analytics.mint_infos", "name", "Patrick Star ", false),
+        (
+            "analytics.mint_infos",
+            "name",
+            "Patrick Star; DROP TABLE x",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = batch(
+            vec![Field::new(column, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut job = native_job(dir.path(), &batch);
+        job.table = table.into();
+        let result = file::check(&job);
+        assert_eq!(result.is_ok(), passes, "{table}.{column}: {value}");
+        if let Ok(checked) = result {
+            assert!(
+                checked.field_audits[0]
+                    .approved_base64_exempt_values
+                    .contains(&"Patrick Star".to_owned())
+            );
+        }
+    }
+    for rule in ["ioc", "pattern", "length"] {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = batch(
+            vec![Field::new("name", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["Patrick Star"]))],
+        );
+        let mut job = native_job(dir.path(), &batch);
+        job.table = "analytics.mint_infos".into();
+        job.overrides.columns.insert(
+            "name".into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(3),
+                enum_ids: None,
+                hex: false,
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            job.native_policy
+                .as_mut()
+                .unwrap()
+                .iocs
+                .push("Patrick".into());
+        }
+        assert!(file::check(&job).is_err(), "{rule}");
+    }
+}
+
+#[test]
 fn cakemas_symbol_exception_is_exactly_scoped_and_keeps_constraints() {
     for (table, column, value, passes) in [
         ("analytics.mint_infos", "symbol", "CakeMas", true),

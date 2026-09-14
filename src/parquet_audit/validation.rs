@@ -804,6 +804,7 @@ impl Node {
                         raw.as_ref(),
                         b"Halal Language Model"
                             | b"Janction"
+                            | b"Patrick Star"
                             | b"1 wish can change your life"
                             | b"1 \xe7\xa1\xac\xe5\xb8\x81\xe2\x80\x8e can change your life"
                     ))
@@ -1069,6 +1070,7 @@ impl Contract {
                         vec![
                             "Halal Language Model".into(),
                             "Janction".into(),
+                            "Patrick Star".into(),
                             "1 wish can change your life".into(),
                             "1 硬币\u{200e} can change your life".into(),
                         ]

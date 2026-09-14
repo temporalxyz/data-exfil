@@ -317,3 +317,7 @@ The operator approved the exact `CakeMas` value only for
 `analytics.mint_infos.symbol`. It receives the same base64-only exception; its
 raw checks, constraints, and explicit incident indicators remain active. Names,
 other symbols, and modified values do not qualify.
+
+The operator also approved the exact `Patrick Star` value only for
+`analytics.mint_infos.name` under the base64-only exception. The value is
+preserved and all remaining field and incident checks still apply.

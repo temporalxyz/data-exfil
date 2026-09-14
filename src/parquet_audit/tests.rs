@@ -2461,6 +2461,11 @@ fn database_reports_reused_and_new_partitions_separately() {
         imported_at: next.imported_at.clone(),
         days: vec![first, second],
     };
+    atomic_json(
+        &new.path().join("EXCLUDED-PARTITIONS.json"),
+        &vec!["db.events/2026-09-03"],
+    )
+    .unwrap();
     let tuning = next.tuning.clone();
     runtime()
         .block_on(database::run(
@@ -2472,6 +2477,8 @@ fn database_reports_reused_and_new_partitions_separately() {
         .unwrap();
     let result: serde_json::Value = read_json(&new.path().join("RESULT.json")).unwrap();
     assert_eq!(result["completed_partitions"], 2);
+    assert_eq!(result["excluded_partition_count"], 1);
+    assert_eq!(result["excluded_partitions"][0], "db.events/2026-09-03");
     assert_eq!(result["reused_partitions"], 1);
     assert_eq!(result["newly_completed_partitions"], 1);
     assert_eq!(result["rows_in_completed_partitions"], 2);
@@ -3708,4 +3715,88 @@ fn approved_mint_name_keeps_field_constraints_and_incident_checks() {
             .unwrap()
             .is_clean()
     );
+}
+
+#[test]
+fn exact_partition_exclusion_keeps_other_days_and_tables() {
+    let root = Location::parse("s3://raw/analytics").unwrap();
+    let sources = [
+        "analytics/memefi_slippage_exceeded/2026/09/13/data.parquet",
+        "analytics/memefi_slippage_exceeded/2026/09/14/data.parquet",
+        "analytics/other/2026/09/13/data.parquet",
+    ]
+    .map(|key| Source {
+        key: key.into(),
+        size: 1,
+        version: None,
+        etag: "etag".into(),
+    })
+    .to_vec();
+    let original = database::discover(&root, "analytics", sources, None, None).unwrap();
+    let excluded = "analytics.memefi_slippage_exceeded/2026-09-13".to_owned();
+    let mut found = original.clone();
+    database::exclude_partitions(&mut found, std::slice::from_ref(&excluded)).unwrap();
+    assert_eq!(found["analytics.memefi_slippage_exceeded"].len(), 1);
+    assert_eq!(
+        found["analytics.memefi_slippage_exceeded"][0].date,
+        "2026-09-14"
+    );
+    assert_eq!(found["analytics.other"][0].date, "2026-09-13");
+    for bad in [
+        vec!["analytics.other/2026-09-12".into()],
+        vec!["other.other/2026-09-13".into()],
+        vec!["analytics.other/2026/09/13".into()],
+        vec![excluded.clone(), excluded.clone()],
+    ] {
+        assert!(database::exclude_partitions(&mut original.clone(), &bad).is_err());
+    }
+    let mut found = original.clone();
+    database::exclude_partitions(&mut found, &["analytics.other/2026-09-13".into()]).unwrap();
+    assert!(!found.contains_key("analytics.other"));
+    assert!(
+        database::exclude_partitions(
+            &mut found,
+            &[
+                excluded,
+                "analytics.memefi_slippage_exceeded/2026-09-14".into()
+            ]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn partition_exclusion_cli_is_database_only_and_cannot_change_resume() {
+    use clap::Parser;
+    let base = [
+        "salvage",
+        "audit-parquet",
+        "--database",
+        "analytics",
+        "--source",
+        "s3://raw/analytics",
+        "--verify",
+        "--batch",
+        "exclude1",
+        "--memory-bytes",
+        "17179869184",
+        "--scratch-bytes",
+        "549755813888",
+        "--max-day-scratch-bytes",
+        "137438953472",
+        "--exclude-partition",
+        "analytics.events/2026-09-13",
+    ];
+    let parsed = crate::cli::Cli::try_parse_from(base).unwrap();
+    let crate::cli::Command::AuditParquet(args) = parsed.command else {
+        unreachable!()
+    };
+    assert_eq!(args.exclude_partition, vec!["analytics.events/2026-09-13"]);
+    let mut resume = base.to_vec();
+    resume.push("--resume");
+    assert!(crate::cli::Cli::try_parse_from(resume).is_err());
+    let mut single = base.to_vec();
+    single[2] = "--table";
+    single[3] = "analytics.events";
+    assert!(crate::cli::Cli::try_parse_from(single).is_err());
 }

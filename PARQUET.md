@@ -298,3 +298,24 @@ fell from approximately 167 ms to 58 ms. This includes local decode, audit,
 profiling and Parquet regeneration, but excludes fixture creation and S3 I/O.
 It is not a throughput prediction for the production Linux server or its wider
 tables. Use the benchmark above and production stage timings to measure those.
+
+### Excluding a partition
+
+Database runs accept repeatable exact exclusions:
+
+```text
+--exclude-partition analytics.memefi_slippage_exceeded/2026-09-13
+```
+
+This omits all source files for that table/day before workers or published-output
+checks are scheduled. It does not delete source or destination objects, and it
+does not count the partition as published. Other days and tables remain selected.
+Exclusions must match the discovered source/date selection exactly; duplicates,
+missing partitions and exclusions that remove the entire selection are errors.
+
+Excluded identities are pinned in INVENTORY.json, listed in
+EXCLUDED-PARTITIONS.json, printed at startup, and included in RESULT.json as
+`excluded_partitions` and `excluded_partition_count`. A resumed run retains its
+pinned exclusions; passing this flag with `--resume` is rejected. Use a new batch
+to change the selection. Completion means all selected partitions completed;
+excluded partitions still require separate resolution.

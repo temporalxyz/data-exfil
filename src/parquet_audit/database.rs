@@ -7,6 +7,39 @@ struct DatabaseInventory {
     database: String,
     imported_at: String,
     tables: Vec<Inventory>,
+    #[serde(default)]
+    excluded_partitions: Vec<String>,
+}
+
+/// Match exclusions exactly against discovery so typos cannot silently omit data.
+pub(super) fn exclude_partitions(
+    tables: &mut BTreeMap<String, Vec<Day>>,
+    excluded: &[String],
+) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for partition in excluded {
+        if !seen.insert(partition) {
+            return usage("duplicate excluded partition");
+        }
+        let Some((table, day)) = partition.split_once('/') else {
+            return usage("excluded partition must be database.table/YYYY-MM-DD");
+        };
+        if !tables
+            .get(table)
+            .is_some_and(|days| days.iter().any(|d| d.date == day))
+        {
+            return usage("excluded partition was not found in the selected source/date range");
+        }
+    }
+    for partition in excluded {
+        let (table, day) = partition.split_once('/').unwrap();
+        tables.get_mut(table).unwrap().retain(|d| d.date != day);
+    }
+    tables.retain(|_, days| !days.is_empty());
+    if tables.is_empty() {
+        return usage("exclusions removed every selected partition");
+    }
+    Ok(())
 }
 
 /// A database prefix contains table/YYYY/MM/DD/file.parquet, with no guessed layouts.
@@ -234,6 +267,14 @@ pub(super) async fn run(
     let result_path = work.join("RESULT.json");
     if result_path.exists() {
         let mut result: serde_json::Value = read_json(&result_path)?;
+        let exclusions_path = work.join("EXCLUDED-PARTITIONS.json");
+        let excluded: Vec<String> = if exclusions_path.exists() {
+            read_json(&exclusions_path)?
+        } else {
+            Vec::new()
+        };
+        result["excluded_partition_count"] = excluded.len().into();
+        result["excluded_partitions"] = serde_json::to_value(excluded).map_err(infrastructure)?;
         result["reused_partitions"] = reused.into();
         result["newly_completed_partitions"] = (completed - reused).into();
         atomic_json(&result_path, &result)?;
@@ -326,16 +367,21 @@ pub(super) fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
             if serde_json::to_vec(&sources).map_err(infrastructure)?.len() > 16 * MIB as usize {
                 return usage("database inventory exceeds 16 MiB; narrow the source/date scope");
             }
-            let discovered = discover(&source, database, sources, args.from.as_deref(), args.through.as_deref())?;
+            let mut discovered = discover(&source, database, sources, args.from.as_deref(), args.through.as_deref())?;
+            exclude_partitions(&mut discovered, &args.exclude_partition)?;
             let imported_at = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).map_err(infrastructure)?;
             let mut tables = Vec::new();
             for (table, days) in discovered {
                 let (overrides, native) = policy::load_table(args, &table)?;
                 tables.push(Inventory { identity: identity(common, args, &tuning, &table, &native, &overrides)?, imported_at: imported_at.clone(), days });
             }
-            DatabaseInventory { database: database.into(), imported_at, tables }
+            DatabaseInventory { database: database.into(), imported_at, tables, excluded_partitions: args.exclude_partition.clone() }
         };
         if inventory.database != database || inventory.tables.is_empty() || inventory.tables.len() > 256 { return abort("invalid database inventory"); }
+        atomic_json(&work.join("EXCLUDED-PARTITIONS.json"), &inventory.excluded_partitions)?;
+        for partition in &inventory.excluded_partitions {
+            eprintln!("Excluded by operator: {partition} (not counted as published)");
+        }
         let mut pipelines = Vec::new();
         let clean_store = if common.dry_run || args.verify || matches!(args.mode, crate::cli::Mode::Survey) { None } else {
             Some(store::S3Store::new(destination.bucket.clone(), args.destination_profile.as_deref(), 3600, common.retain_days, tuning.uploads).await?)

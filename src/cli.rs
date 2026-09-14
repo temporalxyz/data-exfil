@@ -418,6 +418,10 @@ pub struct ParquetArgs {
     /// Checks source identities and clean object metadata; does not re-audit their contents.
     #[arg(long, requires = "database", conflicts_with_all = ["verify", "dry_run", "resume"])]
     pub skip_published: bool,
+    /// Omit an exact database.table/YYYY-MM-DD partition; repeat for multiple exclusions.
+    /// Exclusions are recorded separately and never counted as published.
+    #[arg(long, requires = "database", conflicts_with_all = ["resume", "table"])]
+    pub exclude_partition: Vec<String>,
     /// Optional TOML field rules and limits; Parquet supplies schemas without DDL files.
     #[arg(long)]
     pub audit_policy: Option<PathBuf>,

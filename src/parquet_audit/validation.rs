@@ -798,28 +798,11 @@ impl Node {
                 || (self.approved_asset
                     && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                     && raw.as_ref() == b"ge87")
-                || (self.approved_mint_name
-                    && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-                    && matches!(
-                        raw.as_ref(),
-                        b"Halal Language Model"
-                            | b"Janction"
-                            | b"Patrick Star"
-                            | b"1 wish can change your life"
-                            | b"1 \xe7\xa1\xac\xe5\xb8\x81\xe2\x80\x8e can change your life"
-                    ))
                 || (self.approved_mint_symbol
                     && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                     && raw.as_ref() == b"CakeMas");
-            let approved_mint_name = self.approved_mint_name
-                && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-                && raw.as_ref() == b"Somethig's Gotta Change";
-            if approved_value || approved_mint_name {
-                let scan = if approved_mint_name {
-                    payloads::scan_reviewed_mint_name(&raw, limits)?
-                } else {
-                    payloads::scan_without_base64(&raw, limits)?
-                };
+            if approved_value {
+                let scan = payloads::scan_without_base64(&raw, limits)?;
                 if !scan.is_clean() {
                     emit(self.finding(
                         file,
@@ -836,13 +819,18 @@ impl Node {
                 file,
                 row,
                 self.pattern,
-                source_text && opaque_solana.is_none() && !approved_value && !approved_mint_name,
+                source_text
+                    && opaque_solana.is_none()
+                    && !approved_value
+                    && !self.approved_mint_name,
             )? {
                 emit(finding)?;
             }
             if let Some(iocs) = &self.iocs {
                 let matched = if let Some(decoded) = &opaque_solana {
                     iocs.is_match(&raw) || iocs.is_match(decoded.as_ref())
+                } else if self.approved_mint_name {
+                    iocs.is_match(&raw)
                 } else if source_text {
                     payloads::scan_with_iocs(&raw, limits, Some(iocs))?
                         .classes
@@ -959,6 +947,9 @@ pub struct FieldAudit {
     pub allows_empty_encoded_value: bool,
     #[serde(default)]
     pub approved_base64_exempt_values: Vec<String>,
+    /// Operator-approved display-name field: generic payload scanning is disabled.
+    #[serde(default)]
+    pub operator_approved_free_text: bool,
     #[serde(default)]
     pub approved_raw_sql_exempt_values: Vec<String>,
     pub enum_ids: Option<Vec<i16>>,
@@ -1057,28 +1048,19 @@ impl Contract {
                     pattern: scalar.pattern.clone(),
                     max_len: scalar.max_len,
                     opaque_binary: node.binary,
-                    approved_raw_sql_exempt_values: if node.approved_mint_name {
-                        vec!["Somethig's Gotta Change".into()]
-                    } else {
-                        Vec::new()
-                    },
+                    approved_raw_sql_exempt_values: Vec::new(),
                     approved_base64_exempt_values: if node.approved_label {
                         APPROVED_PROGRAM_LABELS.lines().map(str::to_owned).collect()
                     } else if node.approved_asset {
                         vec!["ge87".into()]
                     } else if node.approved_mint_name {
-                        vec![
-                            "Halal Language Model".into(),
-                            "Janction".into(),
-                            "Patrick Star".into(),
-                            "1 wish can change your life".into(),
-                            "1 硬币\u{200e} can change your life".into(),
-                        ]
+                        Vec::new()
                     } else if node.approved_mint_symbol {
                         vec!["CakeMas".into()]
                     } else {
                         Vec::new()
                     },
+                    operator_approved_free_text: node.approved_mint_name,
                     allows_empty_encoded_value: node.packed_binary.is_some()
                         || node.encoded.is_some_and(EncodedField::allows_empty),
                     recognizes_solana_encodings: node.recognize_solana

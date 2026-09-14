@@ -269,55 +269,17 @@ decoded binary is never executed. FIELD-AUDIT.json records
 `PackedTox(base64,35|70 bytes)` and the empty-value policy. Validation covers
 encoding and size, not the undocumented internal structure.
 
-## Reviewed mint name
+## Operator-approved mint names
 
-The operator approved the exact spelling `Somethig's Gotta Change` only in
-`analytics.mint_infos.name`. For that native string value, the raw SQL catalogue
-hit caused by its apostrophe is suppressed. All other raw catalogue classes,
-Unicode normalization and decoded-form checks (including base64), explicit
-incident indicators, native nullability, byte budgets, length limits and patterns
-remain active. The stored string is preserved exactly.
+By operator instruction, `analytics.mint_infos.name` is a free display-name
+field. Every valid source string is preserved and accepted; generic payload
+catalogue scanning, including raw, normalized, and decoded forms, is disabled
+for this exact table and column. Type/nullability, byte budgets, explicit
+patterns and length limits remain enforced. Explicit incident indicators still
+match the stored value directly. Other tables and columns retain their normal
+payload checks. FIELD-AUDIT.json records this with
+`operator_approved_free_text: true`.
 
-This does not allow apostrophes globally, approve corrected spellings, or exempt
-other tables/columns. FIELD-AUDIT.json records the exact value in
-`approved_raw_sql_exempt_values`; it is not a base64 exception. The shared
-default and TSV scanners retain their existing behavior.
-
-## Reviewed mint-name base64 exception
-
-The exact native string `Halal Language Model` is operator-approved only in
-`analytics.mint_infos.name`. It skips speculative base64 catalogue scanning,
-while retaining raw catalogue checks, Unicode/non-base64 decoding, native
-nullability, byte limits, patterns, and explicit incident indicators (including
-on decoded forms). The original string is preserved. Other names, columns,
-tables, or modified values retain their existing checks.
-
-FIELD-AUDIT.json records this value in `approved_base64_exempt_values`.
-The separate `Somethig's Gotta Change` exception still exempts only its raw
-SQL match; it does not inherit this base64 exception.
-
-The operator also approved the exact name `Janction` for the same
-`analytics.mint_infos.name` base64 exception. It is recorded alongside
-`Halal Language Model`. Scope, unchanged output, and all retained checks above
-apply equally; trailing whitespace or added text does not qualify.
-
-The exact value `1 wish can change your life` is also operator-approved for
-the same `analytics.mint_infos.name` base64-only exception. Its exact spelling
-is preserved and recorded in FIELD-AUDIT.json; all scope restrictions and
-retained checks above remain active.
-
-The operator also approved the exact Unicode name
-`1 硬币\u200e can change your life` (where `\u200e` denotes the actual
-U+200E left-to-right mark) for that same base64-only exception in
-`analytics.mint_infos.name`. The mark is preserved; removing it or replacing it
-does not qualify. Unicode/raw checks, field constraints and explicit incident
-indicators remain active, and the exact approved value is recorded in the report.
-
-The operator approved the exact `CakeMas` value only for
-`analytics.mint_infos.symbol`. It receives the same base64-only exception; its
-raw checks, constraints, and explicit incident indicators remain active. Names,
-other symbols, and modified values do not qualify.
-
-The operator also approved the exact `Patrick Star` value only for
-`analytics.mint_infos.name` under the base64-only exception. The value is
-preserved and all remaining field and incident checks still apply.
+The separate exact `CakeMas` base64 exception remains limited to
+`analytics.mint_infos.symbol`. It does not broaden symbol validation or affect
+any other table or column.

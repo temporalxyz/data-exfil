@@ -72,6 +72,7 @@ struct Node {
     approved_label: bool,
     approved_asset: bool,
     approved_mint_name: bool,
+    approved_mint_symbol: bool,
     packed_binary: Option<PackedBinary>,
 }
 
@@ -612,6 +613,7 @@ impl Node {
             approved_label: false,
             approved_asset: false,
             approved_mint_name: false,
+            approved_mint_symbol: false,
             packed_binary: None,
             binary: matches!(
                 dt,
@@ -804,7 +806,10 @@ impl Node {
                             | b"Janction"
                             | b"1 wish can change your life"
                             | b"1 \xe7\xa1\xac\xe5\xb8\x81\xe2\x80\x8e can change your life"
-                    ));
+                    ))
+                || (self.approved_mint_symbol
+                    && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                    && raw.as_ref() == b"CakeMas");
             let approved_mint_name = self.approved_mint_name
                 && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                 && raw.as_ref() == b"Somethig's Gotta Change";
@@ -990,6 +995,13 @@ impl Contract {
         }
 
         for node in &mut self.nodes {
+            node.approved_mint_symbol = table == "analytics.mint_infos"
+                && node.name == "symbol"
+                && matches!(node.ty, Ch::String)
+                && node.encoded.is_none()
+                && self.schema.field_with_name("symbol").is_ok_and(|field| {
+                    matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                });
             node.approved_mint_name = table == "analytics.mint_infos"
                 && node.name == "name"
                 && matches!(node.ty, Ch::String)
@@ -1060,6 +1072,8 @@ impl Contract {
                             "1 wish can change your life".into(),
                             "1 硬币\u{200e} can change your life".into(),
                         ]
+                    } else if node.approved_mint_symbol {
+                        vec!["CakeMas".into()]
                     } else {
                         Vec::new()
                     },

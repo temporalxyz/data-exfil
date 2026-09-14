@@ -312,3 +312,8 @@ U+200E left-to-right mark) for that same base64-only exception in
 `analytics.mint_infos.name`. The mark is preserved; removing it or replacing it
 does not qualify. Unicode/raw checks, field constraints and explicit incident
 indicators remain active, and the exact approved value is recorded in the report.
+
+The operator approved the exact `CakeMas` value only for
+`analytics.mint_infos.symbol`. It receives the same base64-only exception; its
+raw checks, constraints, and explicit incident indicators remain active. Names,
+other symbols, and modified values do not qualify.

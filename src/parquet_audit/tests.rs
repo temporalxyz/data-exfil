@@ -4192,3 +4192,65 @@ fn unicode_coin_mint_exception_preserves_mark_and_exact_scope() {
         assert!(file::check(&j).is_err(), "{rule}");
     }
 }
+
+#[test]
+fn cakemas_symbol_exception_is_exactly_scoped_and_keeps_constraints() {
+    for (table, column, value, passes) in [
+        ("analytics.mint_infos", "symbol", "CakeMas", true),
+        ("analytics.other", "symbol", "CakeMas", false),
+        ("other.mint_infos", "symbol", "CakeMas", false),
+        ("analytics.mint_infos", "name", "CakeMas", false),
+        ("analytics.mint_infos", "symbol", "CakeMas ", false),
+        (
+            "analytics.mint_infos",
+            "symbol",
+            "CakeMas; DROP TABLE x",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new(column, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![value]))],
+        );
+        let mut job = native_job(dir.path(), &b);
+        job.table = table.into();
+        let result = file::check(&job);
+        assert_eq!(result.is_ok(), passes, "{table}.{column}: {value}");
+        if let Ok(checked) = result {
+            assert_eq!(
+                checked.field_audits[0].approved_base64_exempt_values,
+                vec!["CakeMas"]
+            );
+        }
+    }
+    for rule in ["ioc", "pattern", "length"] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = batch(
+            vec![Field::new("symbol", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["CakeMas"]))],
+        );
+        let mut job = native_job(dir.path(), &b);
+        job.table = "analytics.mint_infos".into();
+        job.overrides.columns.insert(
+            "symbol".into(),
+            crate::models::ColumnOverride {
+                class: crate::models::FreedomClass::Closed,
+                pattern: (rule == "pattern").then(|| "^never$".into()),
+                max_len: (rule == "length").then_some(3),
+                enum_ids: None,
+                hex: false,
+                drop: false,
+                rotation_owner: None,
+            },
+        );
+        if rule == "ioc" {
+            job.native_policy
+                .as_mut()
+                .unwrap()
+                .iocs
+                .push("CakeMas".into());
+        }
+        assert!(file::check(&job).is_err(), "{rule}");
+    }
+}

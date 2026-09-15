@@ -4934,6 +4934,22 @@ fn a_target_is_refused_when_the_ddl_and_the_reference_object_disagree() {
         "{}",
         error.reason()
     );
+    // ...unless the operator names the removal, which must also cover the case where the range
+    // ends before the migration ran and the *newest* object still carries the column.
+    let mut dropping = overrides.clone();
+    dropping.columns.insert(
+        "legacy_fee".into(),
+        toml::from_str("class = \"closed\"\ndrop = true").unwrap(),
+    );
+    target::build(
+        &prod("CREATE TABLE db.events (`body` String) ENGINE = MergeTree ORDER BY tuple()"),
+        target::References {
+            newest: &wide,
+            oldest: &wide,
+        },
+        &dropping,
+    )
+    .unwrap();
 
     // A declared type the Parquet column cannot carry.
     let error = target::build(

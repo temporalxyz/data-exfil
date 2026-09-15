@@ -133,22 +133,16 @@ pub fn build(prod: &ProdSchema, refs: References<'_>, overrides: &Overrides) -> 
             declared_nullable || added_by_migration,
         ));
     }
-    for field in refs.newest.fields() {
-        if prod.ddl.column(field.name()).is_none() {
-            return abort(
-                "the newest object has a column the prod schema does not declare; add it or set \
-                 drop = true for it",
-            )
-            .map_err(|e: crate::abort::SalvageError| e.with("column", field.name()));
-        }
-    }
-    for field in refs.oldest.fields() {
+    // A column either object has and the DDL does not is a column a migration dropped. Named
+    // with `drop = true` it is excluded from every partition; unnamed, it would vanish from the
+    // output unannounced, and section 8.7 makes every removal explicit.
+    for field in refs.newest.fields().iter().chain(refs.oldest.fields()) {
         if prod.ddl.column(field.name()).is_none()
             && !overrides.columns.get(field.name()).is_some_and(|c| c.drop)
         {
             return abort(
-                "the oldest object has a column the prod schema no longer declares; a migration \
-                 dropped it, so set drop = true for it in --audit-policy",
+                "a reference object has a column the prod schema does not declare; if a migration \
+                 dropped it, set drop = true for it in --audit-policy",
             )
             .map_err(|e: crate::abort::SalvageError| e.with("column", field.name()));
         }

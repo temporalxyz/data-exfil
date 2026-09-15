@@ -571,6 +571,46 @@ fn native_type(field: &ArrowField, limits: &Limits, depth: u32) -> Result<Ch> {
     })
 }
 
+/// The single Arrow type a ClickHouse type can be, where there is only one.
+///
+/// Used for one case: a column the prod schema declares that **no** object in the range carries,
+/// because the migration adding it ran after the range ended. There is no file to take a type
+/// from, and the column can only be published as nulls -- but it still needs a type.
+///
+/// This is not a guess and not a default mapping. It answers only where `Node::build`'s matrix
+/// below accepts exactly one Arrow type for the declared ClickHouse type, and returns `None` for
+/// every type where it accepts more than one, so the caller refuses rather than picking. `String`
+/// is four Arrow types, `DateTime64` is a timezone this cannot know, `Decimal` is 128 or 256,
+/// `UUID`/`IPv4`/`IPv6`/`Enum`/`FixedString` are several each, containers carry writer-chosen
+/// child names, and the 128/256-bit integers have no Arrow type at all.
+/// `types_with_one_arrow_spelling_are_exactly_those_derived` holds this in step with the matrix.
+#[must_use]
+pub fn unambiguous_arrow_type(ty: &Ch) -> Option<DataType> {
+    let (ty, _) = inner(ty);
+    Some(match ty {
+        Ch::UInt(w) => match w.bits() {
+            8 => DataType::UInt8,
+            16 => DataType::UInt16,
+            32 => DataType::UInt32,
+            64 => DataType::UInt64,
+            // 128 and 256 have no Arrow integer type; the matrix accepts none.
+            _ => return None,
+        },
+        Ch::Int(w) => match w.bits() {
+            8 => DataType::Int8,
+            16 => DataType::Int16,
+            32 => DataType::Int32,
+            64 => DataType::Int64,
+            _ => return None,
+        },
+        Ch::Float(FloatWidth::F32) => DataType::Float32,
+        Ch::Float(FloatWidth::F64) => DataType::Float64,
+        Ch::Bool => DataType::Boolean,
+        Ch::Date | Ch::Date32 => DataType::Date32,
+        _ => return None,
+    })
+}
+
 /// The same ClickHouse/Arrow compatibility matrix the per-file audit applies, asked as a question.
 ///
 /// Exposed so a pinned target schema cannot be assembled out of pairs that the audit would then

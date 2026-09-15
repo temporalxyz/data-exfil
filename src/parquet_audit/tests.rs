@@ -4895,7 +4895,9 @@ fn a_target_is_refused_when_the_ddl_and_the_reference_object_disagree() {
     let reference = Schema::new(vec![Field::new("body", DataType::Utf8, false)]);
 
     // The DDL has run ahead of the data: there is no object to take an Arrow type from, and
-    // guessing one is exactly what this design refuses to do.
+    // `String` has four Parquet spellings, so guessing one is exactly what this refuses to do.
+    // (A column whose declared type has a single spelling is derived instead -- see
+    // `a_column_no_partition_carries_is_published_null_when_its_type_is_unambiguous`.)
     let error = target::build(
         &prod(
             "CREATE TABLE db.events (`body` String, `venue` Nullable(String)) \
@@ -4909,7 +4911,7 @@ fn a_target_is_refused_when_the_ddl_and_the_reference_object_disagree() {
     )
     .unwrap_err();
     assert!(
-        error.reason().contains("newest object does not have"),
+        error.reason().contains("more than one Parquet spelling"),
         "{}",
         error.reason()
     );
@@ -5409,4 +5411,152 @@ fn a_clickhouse_74988_footer_is_refused_by_name_and_read_only_when_accepted() {
     std::fs::write(&job.input, &other).unwrap();
     job.accept_ch74988 = true;
     assert!(file::check(&job).is_err());
+}
+
+#[test]
+fn types_with_one_arrow_spelling_are_exactly_those_derived() {
+    // `unambiguous_arrow_type` may answer for a ClickHouse type only where the audit's own
+    // matcher accepts exactly one Arrow type for it. Asserted against the matcher rather than
+    // against a list written by hand, so widening the matcher cannot silently turn a refusal
+    // into a guess.
+    use arrow_schema::TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
+    let candidates = vec![
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Boolean,
+        DataType::Date32,
+        DataType::Date64,
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::FixedSizeBinary(16),
+        DataType::FixedSizeBinary(32),
+        DataType::Decimal128(38, 18),
+        DataType::Decimal256(38, 18),
+        DataType::Timestamp(Second, None),
+        DataType::Timestamp(Millisecond, None),
+        DataType::Timestamp(Millisecond, Some("UTC".into())),
+        DataType::Timestamp(Microsecond, None),
+        DataType::Timestamp(Nanosecond, None),
+        DataType::Timestamp(Nanosecond, Some("UTC".into())),
+        DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+        DataType::List(Arc::new(Field::new("element", DataType::UInt8, true))),
+        DataType::Struct(vec![Field::new("a", DataType::UInt8, false)].into()),
+    ];
+    let limits = overrides().limits;
+    for declared in [
+        "UInt8",
+        "UInt16",
+        "UInt32",
+        "UInt64",
+        "UInt128",
+        "UInt256",
+        "Int8",
+        "Int16",
+        "Int32",
+        "Int64",
+        "Int128",
+        "Int256",
+        "Float32",
+        "Float64",
+        "Bool",
+        "Date",
+        "Date32",
+        "DateTime",
+        "DateTime64(3)",
+        "DateTime64(9)",
+        "String",
+        "FixedString(16)",
+        "UUID",
+        "IPv4",
+        "IPv6",
+        "Enum8('a' = 1)",
+        "Decimal(38, 18)",
+        "Decimal(10, 2)",
+        "Array(UInt8)",
+        "Map(String, UInt32)",
+        "Tuple(UInt8, String)",
+    ] {
+        let ty = crate::clickhouse::types::parse_type(declared).unwrap();
+        let accepted: Vec<_> = candidates
+            .iter()
+            .filter(|dt| validation::accepts(&ty, dt, &limits).is_ok())
+            .collect();
+        match validation::unambiguous_arrow_type(&ty) {
+            Some(derived) => {
+                assert_eq!(
+                    accepted.len(),
+                    1,
+                    "{declared} was derived as {derived:?} but the matcher accepts {accepted:?}"
+                );
+                assert_eq!(
+                    &derived, accepted[0],
+                    "{declared} derived the wrong spelling"
+                );
+            }
+            None => assert_ne!(
+                accepted.len(),
+                1,
+                "{declared} has exactly one spelling ({accepted:?}) and should be derived"
+            ),
+        }
+    }
+}
+
+#[test]
+fn a_column_no_partition_carries_is_published_null_when_its_type_is_unambiguous() {
+    // mds.l2: `depth UInt16` and `is_snapshot Bool` were added on 2026-09-08, after the last
+    // captured partition. No object has them, so there is no file to take a type from -- but
+    // UInt16 and Bool each have exactly one Parquet spelling, so nothing is guessed.
+    let both = Schema::new(vec![Field::new("body", DataType::Utf8, false)]);
+    let built = target::build(
+        &prod(
+            "CREATE TABLE mds.l2 (`body` String, `depth` UInt16, `is_snapshot` Bool) \
+             ENGINE = MergeTree ORDER BY tuple()",
+        ),
+        target::References {
+            newest: &both,
+            oldest: &both,
+        },
+        &overrides(),
+    )
+    .unwrap();
+    assert_eq!(built.field(1).data_type(), &DataType::UInt16);
+    assert_eq!(built.field(2).data_type(), &DataType::Boolean);
+    // NOT NULL in prod, but every partition lacks them, so they publish nullable and padded.
+    assert!(built.field(1).is_nullable() && built.field(2).is_nullable());
+
+    let dir = tempfile::tempdir().unwrap();
+    let checked = file::check(&target_job(dir.path(), &text_batch(&["hi"]), &built)).unwrap();
+    assert_eq!(
+        checked.padded_columns,
+        ["depth".to_owned(), "is_snapshot".to_owned()]
+    );
+
+    // A type with more than one spelling is still refused, and says what to do about it.
+    let error = target::build(
+        &prod(
+            "CREATE TABLE mds.l2 (`body` String, `venue` String) ENGINE = MergeTree ORDER BY tuple()",
+        ),
+        target::References {
+            newest: &both,
+            oldest: &both,
+        },
+        &overrides(),
+    )
+    .unwrap_err();
+    assert!(
+        error.reason().contains("more than one Parquet spelling"),
+        "{}",
+        error.reason()
+    );
 }

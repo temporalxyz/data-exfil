@@ -89,6 +89,14 @@ first file for that table. The oldest selected day's first file is read too, to 
 columns the range started without. Both downloads happen once per table per run. DDL and objects
 are cross-checked both ways before any is used, and the result is pinned in `TARGET-SCHEMA.json`.
 
+**A column no partition in the range carries at all** -- a migration that ran after the range
+ended, like `mds.l2`'s `depth`/`is_snapshot` -- has no object to take a type from. Its type is
+derived from the SQL only where the declared type has exactly one Parquet spelling: the integer
+widths through 64 bits, `Float32`/`Float64`, `Bool`, `Date`/`Date32`. For anything else --
+`String`, `DateTime64`, `Decimal`, `UUID`, `IPv4`/`IPv6`, `Enum`, `FixedString`, containers, the
+128/256-bit integers -- the run stops and names the column, rather than guessing. Extend the range
+to a partition that carries it, or `drop = true` it.
+
 **A column the oldest partition lacks is published `Nullable`, for every partition.** A migration
 adds `uid UInt64`; every partition before it has no `uid`, and the only honest value to write there
 is null -- not the server's implicit default, not the DDL's `DEFAULT` expression. So the published

@@ -104,33 +104,52 @@ pub fn build(prod: &ProdSchema, refs: References<'_>, overrides: &Overrides) -> 
     let mut fields = Vec::new();
     for column in columns {
         let name = column.name.as_str();
-        let field = refs.newest.field_with_name(name).map_err(|_| {
-            abort::<()>(
-                "prod schema declares a column the newest object does not have, so its Parquet \
-                 type is unknown; re-run once a partition carries it",
-            )
-            .unwrap_err()
-            .with("column", name)
-        })?;
-        // The newest object supplies the type; the DDL supplies whether it may be null. Checking
-        // the pair through the same matrix the per-file audit uses means a target can never be
-        // built that the audit would then refuse column by column.
-        validation_accepts(&column.ty, field, &overrides.limits, name)?;
         let declared_nullable = matches!(column.ty, Ch::Nullable(_));
-        // Caught here rather than left to the per-file projection, which would refuse the very
-        // object this target was derived from and report it as though the data were at fault.
-        if field.is_nullable() && !declared_nullable {
-            return abort(
-                "prod schema declares this column NOT NULL but the newest object writes it \
-                 nullable",
-            )
-            .map_err(|e: crate::abort::SalvageError| e.with("column", name));
-        }
-        let added_by_migration = refs.oldest.field_with_name(name).is_err();
+        // Prefer a real object's type, newest first; the newest is the shape the table has now.
+        let observed = refs
+            .newest
+            .field_with_name(name)
+            .or_else(|_| refs.oldest.field_with_name(name))
+            .ok();
+        let arrow_type = match observed {
+            Some(field) => {
+                // Checking the pair through the same matrix the per-file audit uses means a
+                // target can never be built that the audit would then refuse column by column.
+                validation_accepts(&column.ty, field, &overrides.limits, name)?;
+                // Caught here rather than left to the per-file projection, which would refuse the
+                // very object this target was derived from and report it as though the data were
+                // at fault.
+                if field.is_nullable() && !declared_nullable {
+                    return abort(
+                        "prod schema declares this column NOT NULL but a reference object writes \
+                         it nullable",
+                    )
+                    .map_err(|e: crate::abort::SalvageError| e.with("column", name));
+                }
+                super::validation::clean_field_type(field)
+            }
+            // No object in the range carries it: the migration that added it ran after the range
+            // ended. It can only be published as nulls, but it still needs a type, and one is
+            // taken only where the declared type has exactly one Arrow spelling.
+            None => super::validation::unambiguous_arrow_type(&column.ty).ok_or_else(|| {
+                abort::<()>(
+                    "no object in this range carries this column and its declared type has more \
+                     than one Parquet spelling, so its type cannot be known; extend the range to \
+                     a partition that carries it, or set drop = true for it in --audit-policy",
+                )
+                .unwrap_err()
+                .with("column", name)
+                .with("declared", &column.declared_type)
+            })?,
+        };
+        // Nullable if either reference lacks it: whichever partitions lack it are padded, and a
+        // NOT NULL column cannot hold a pad. Columns every reference carries keep the DDL's word.
+        let padded_somewhere = refs.oldest.field_with_name(name).is_err()
+            || refs.newest.field_with_name(name).is_err();
         fields.push(ArrowField::new(
             name,
-            super::validation::clean_field_type(field),
-            declared_nullable || added_by_migration,
+            arrow_type,
+            declared_nullable || padded_somewhere,
         ));
     }
     // A column either object has and the DDL does not is a column a migration dropped. Named

@@ -48,6 +48,7 @@ fn job(dir: &Path, definition: &str, batch: &RecordBatch) -> file::Job {
     file::Job {
         table: String::new(),
         target_schema: None,
+        accept_ch74988: false,
         input,
         work: dir.into(),
         ddl: format!("CREATE TABLE db.events ({definition}) ENGINE = MergeTree ORDER BY tuple()"),
@@ -5032,7 +5033,12 @@ fn a_reference_object_supplies_the_arrow_types_the_sql_cannot() {
 
     let dir = tempfile::tempdir().unwrap();
     let schema = runtime()
-        .block_on(target::reference_schema(raw.as_ref(), &source, dir.path()))
+        .block_on(target::reference_schema(
+            raw.as_ref(),
+            &source,
+            dir.path(),
+            false,
+        ))
         .unwrap();
     // The scratch copy is reclaimed; nothing downstream reads it.
     assert!(!dir.path().join("REFERENCE.parquet").exists());
@@ -5232,4 +5238,159 @@ SETTINGS index_granularity = 8192
             .len(),
         7
     );
+}
+
+/// Forge the footer ClickHouse wrote before PR 75029: every `Timestamp(NANOS)` column also
+/// carries converted type `UTF8`. Built by decoding the real footer, editing that one field and
+/// re-encoding it, so everything else about the file is exactly what arrow wrote.
+fn with_clickhouse_74988_footer(parquet: &[u8]) -> Vec<u8> {
+    use parquet::thrift::{TCompactOutputProtocol, TSerializable};
+    let trailer = &parquet[parquet.len() - 8..];
+    let footer_len = u32::from_le_bytes(trailer[..4].try_into().unwrap()) as usize;
+    let footer_start = parquet.len() - 8 - footer_len;
+    let mut protocol = thrift::protocol::TCompactInputProtocol::new(std::io::Cursor::new(
+        &parquet[footer_start..footer_start + footer_len],
+    ));
+    let mut metadata = parquet::format::FileMetaData::read_from_in_protocol(&mut protocol).unwrap();
+    let mut touched = 0;
+    for element in &mut metadata.schema {
+        if matches!(
+            &element.logical_type,
+            Some(parquet::format::LogicalType::TIMESTAMP(t))
+                if matches!(t.unit, parquet::format::TimeUnit::NANOS(_))
+        ) {
+            element.converted_type = Some(parquet::format::ConvertedType::UTF8);
+            touched += 1;
+        }
+    }
+    assert!(
+        touched > 0,
+        "the fixture needs a nanosecond timestamp column"
+    );
+    let mut encoded = Vec::new();
+    {
+        let mut out = TCompactOutputProtocol::new(&mut encoded);
+        metadata.write_to_out_protocol(&mut out).unwrap();
+    }
+    let mut forged = parquet[..footer_start].to_vec();
+    forged.extend_from_slice(&encoded);
+    forged.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    forged.extend_from_slice(b"PAR1");
+    forged
+}
+
+#[test]
+fn a_clickhouse_74988_footer_is_refused_by_name_and_read_only_when_accepted() {
+    let original = batch(
+        vec![
+            Field::new(
+                "detect_time",
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("body", DataType::Utf8, false),
+        ],
+        vec![
+            Arc::new(
+                TimestampNanosecondArray::from(vec![1_700_000_000_000_000_001i64])
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(vec!["hello"])),
+        ],
+    );
+    let forged = with_clickhouse_74988_footer(&parquet_bytes(&original));
+    // The forgery reproduces the real failure: parquet's own reader refuses the schema.
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("forged.parquet"), &forged).unwrap();
+    assert!(
+        ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(fixture.path().join("forged.parquet")).unwrap()
+        )
+        .is_err(),
+        "fixture must be unreadable to stock parquet-rs"
+    );
+
+    let write = |dir: &Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("raw.parquet"), &forged).unwrap();
+        let mut j = native_job(dir, &original);
+        std::fs::write(dir.join("raw.parquet"), &forged).unwrap();
+        j.input = dir.join("raw.parquet");
+        j
+    };
+
+    // Without the flag: refused, and the message says which flag and why.
+    let dir = tempfile::tempdir().unwrap();
+    let error = file::check(&write(dir.path())).unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+    assert!(error.reason().contains("74988"), "{}", error.reason());
+
+    // With it: read, values intact, the correction recorded against the column.
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = write(dir.path());
+    job.accept_ch74988 = true;
+    let checked = file::check(&job).unwrap();
+    assert_eq!(checked.rows, 1);
+    assert_eq!(checked.footer_corrections, ["detect_time".to_owned()]);
+    let out = ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+    )
+    .unwrap()
+    .build()
+    .unwrap()
+    .next()
+    .unwrap()
+    .unwrap();
+    let ts = out
+        .column_by_name("detect_time")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(ts.value(0), 1_700_000_000_000_000_001i64);
+
+    // A footer wrong in any *other* way is still refused even with the flag: here the same
+    // contradiction on a millisecond column, which the ClickHouse bug never produced.
+    let millis = batch(
+        vec![Field::new(
+            "exchange_time",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            false,
+        )],
+        vec![Arc::new(TimestampMillisecondArray::from(vec![
+            1_700_000_000_000i64,
+        ]))],
+    );
+    let bytes = parquet_bytes(&millis);
+    let trailer_len =
+        u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap()) as usize;
+    let start = bytes.len() - 8 - trailer_len;
+    let mut protocol = thrift::protocol::TCompactInputProtocol::new(std::io::Cursor::new(
+        &bytes[start..start + trailer_len],
+    ));
+    let mut md =
+        <parquet::format::FileMetaData as parquet::thrift::TSerializable>::read_from_in_protocol(
+            &mut protocol,
+        )
+        .unwrap();
+    for e in &mut md.schema {
+        if e.logical_type.is_some() {
+            e.converted_type = Some(parquet::format::ConvertedType::UTF8);
+        }
+    }
+    let mut enc = Vec::new();
+    {
+        let mut out = parquet::thrift::TCompactOutputProtocol::new(&mut enc);
+        parquet::thrift::TSerializable::write_to_out_protocol(&md, &mut out).unwrap();
+    }
+    let mut other = bytes[..start].to_vec();
+    other.extend_from_slice(&enc);
+    other.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+    other.extend_from_slice(b"PAR1");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut job = native_job(dir.path(), &millis);
+    std::fs::write(&job.input, &other).unwrap();
+    job.accept_ch74988 = true;
+    assert!(file::check(&job).is_err());
 }

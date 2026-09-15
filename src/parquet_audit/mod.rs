@@ -1,6 +1,7 @@
 //! One table, independent day transactions, globally bounded download/check/upload pools.
 mod database;
 pub mod file;
+pub mod footer;
 pub mod policy;
 pub mod profile;
 mod published;
@@ -273,6 +274,10 @@ pub struct Manifest {
     /// them. A null here is not a null that was in the source.
     #[serde(default)]
     pub padded_columns: Vec<String>,
+    /// Columns whose footer converted type was cleared under `--accept-clickhouse-74988`. The
+    /// values were read exactly as written; only the contradictory legacy annotation was dropped.
+    #[serde(default)]
+    pub footer_corrections: Vec<String>,
     pub audit_limits: crate::limits::Limits,
     pub independent_revalidation: bool,
     pub field_audits: Vec<validation::FieldAudit>,
@@ -394,6 +399,8 @@ pub struct Pipeline {
     /// Pinned target schema for this table. Set when `--prod-schema-dir` supplied one; the output
     /// then follows it and migrated-in columns are padded with nulls.
     pub target_schema: Option<arrow_schema::Schema>,
+    /// Read footers carrying ClickHouse issue 74988 with that one field corrected. See `footer`.
+    pub accept_ch74988: bool,
     schema_lock: std::sync::Mutex<()>,
     published_store: Option<Arc<dyn published::PublishedStore>>,
     stop: Arc<stop::Stop>,
@@ -444,6 +451,7 @@ impl Pipeline {
             ddl,
             native_policy: None,
             target_schema: None,
+            accept_ch74988: false,
             schema_lock: std::sync::Mutex::new(()),
             published_store: None,
             overrides,
@@ -779,6 +787,7 @@ impl Pipeline {
                                 ddl: self.ddl.clone(),
                                 native_policy: self.native_policy.clone(),
                                 target_schema: self.target_schema.clone(),
+                                accept_ch74988: self.accept_ch74988,
                                 stop_path: self
                                     .native_policy
                                     .as_ref()
@@ -1058,6 +1067,7 @@ impl Pipeline {
             // Taken from the same file as `field_audits` and `schema`, which the per-day source
             // schema check above proves speaks for every file in the partition.
             padded_columns: checked.values().next().unwrap().padded_columns.clone(),
+            footer_corrections: checked.values().next().unwrap().footer_corrections.clone(),
             // A distinct value, not a flag: it makes a manifest written under projection
             // unreusable by a run without it, and the reverse, rather than leaving the two kinds
             // of partition to be told apart by a field that defaults to empty.
@@ -1426,10 +1436,20 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
                         .iter()
                         .find_map(|day| day.sources.first())
                         .ok_or_else(missing)?;
-                    let newest_schema =
-                        target::reference_schema(raw.as_ref(), newest, &work).await?;
-                    let oldest_schema =
-                        target::reference_schema(raw.as_ref(), oldest, &work).await?;
+                    let newest_schema = target::reference_schema(
+                        raw.as_ref(),
+                        newest,
+                        &work,
+                        args.accept_clickhouse_74988,
+                    )
+                    .await?;
+                    let oldest_schema = target::reference_schema(
+                        raw.as_ref(),
+                        oldest,
+                        &work,
+                        args.accept_clickhouse_74988,
+                    )
+                    .await?;
                     let built = target::build(
                         prod,
                         target::References {
@@ -1459,6 +1479,7 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
         );
         pipeline.native_policy = Some(native_policy);
         pipeline.target_schema = target_schema;
+        pipeline.accept_ch74988 = args.accept_clickhouse_74988;
         pipeline.run(&inventory.days).await
     })
 }

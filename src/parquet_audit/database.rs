@@ -161,6 +161,7 @@ async fn pin_target(
     work: &Path,
     raw: &dyn Store,
     overrides: &Overrides,
+    accept_ch74988: bool,
 ) -> Result<arrow_schema::Schema> {
     let path = work.join("TARGET-SCHEMA.json");
     // The pinned copy is authoritative on resume. Re-deriving it would re-download a reference
@@ -185,8 +186,8 @@ async fn pin_target(
         .ok_or_else(|| {
             abort::<()>("table has no source objects to read a schema from").unwrap_err()
         })?;
-    let newest_schema = target::reference_schema(raw, newest, work).await?;
-    let oldest_schema = target::reference_schema(raw, oldest, work).await?;
+    let newest_schema = target::reference_schema(raw, newest, work, accept_ch74988).await?;
+    let oldest_schema = target::reference_schema(raw, oldest, work, accept_ch74988).await?;
     let built = target::build(
         prod,
         target::References {
@@ -442,12 +443,13 @@ pub(super) fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
             // Resolve the target before any partition starts: it decides the published shape, so
             // deriving it later would make the output depend on which day happened to run first.
             let target_schema = match &prod {
-                Some(prod) => Some(pin_target(prod, table, &table_work, raw.as_ref(), &overrides).await?),
+                Some(prod) => Some(pin_target(prod, table, &table_work, raw.as_ref(), &overrides, args.accept_clickhouse_74988).await?),
                 None => None,
             };
             let mut pipeline = Pipeline::new(table.identity.clone(), table_work, destination.clone(), String::new(), overrides, tuning.clone(), inventory.imported_at.clone(), args.resume, raw, clean, Arc::new(ProcessWorker));
             pipeline.native_policy = Some(native);
             pipeline.target_schema = target_schema;
+            pipeline.accept_ch74988 = args.accept_clickhouse_74988;
             if args.skip_published {
                 pipeline.published_store = clean_store.as_ref().map(|s| Arc::new(s.with_timeout(pipeline.overrides.limits.wall_clock_secs)) as Arc<dyn published::PublishedStore>);
             }

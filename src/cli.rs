@@ -439,6 +439,16 @@ pub struct ParquetArgs {
     /// reused under it.
     #[arg(long, conflicts_with = "skip_published")]
     pub prod_schema_dir: Option<PathBuf>,
+    /// Read footers written by ClickHouse before the fix for issue 74988.
+    ///
+    /// Those files annotate every `DateTime64(9)` column with logical type `Timestamp(NANOS)`
+    /// **and** legacy converted type `UTF8`, which contradict each other, and the Parquet reader
+    /// refuses the whole file. With this flag a column matching exactly that signature has its
+    /// converted type cleared -- what the fixed writer emits -- before the schema is built. No
+    /// value is touched and a footer wrong in any other way is still refused. Corrected columns
+    /// are listed in each manifest's `footer_corrections`.
+    #[arg(long)]
+    pub accept_clickhouse_74988: bool,
     #[command(flatten)]
     pub batch: BatchArg,
     /// Root before YYYY/MM/DD/table/ or table/YYYY/MM/DD/. Must be s3://bucket/prefix.

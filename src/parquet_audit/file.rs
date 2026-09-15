@@ -10,7 +10,6 @@ use std::sync::{
 use std::time::Instant;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
@@ -35,6 +34,9 @@ pub struct Job {
     /// and columns this file predates are written as nulls. See `validation::build_native_with_target`.
     #[serde(default)]
     pub target_schema: Option<arrow_schema::Schema>,
+    /// See `footer`: correct the one named ClickHouse footer defect instead of refusing the file.
+    #[serde(default)]
+    pub accept_ch74988: bool,
     #[serde(default)]
     pub stop_path: Option<PathBuf>,
     pub overrides: Overrides,
@@ -75,6 +77,9 @@ pub struct Checked {
     /// Output columns this file had no values for; written as nulls to match the pinned target.
     #[serde(default)]
     pub padded_columns: Vec<String>,
+    /// Columns whose contradictory legacy converted type was cleared before reading.
+    #[serde(default)]
+    pub footer_corrections: Vec<String>,
     pub outputs: Vec<Output>,
     pub findings: u64,
     pub findings_by_reason: BTreeMap<String, u64>,
@@ -171,11 +176,15 @@ pub fn check(job: &Job) -> Result<Checked> {
         return abort("invalid Parquet magic");
     }
     let input_sha256 = hash_file(&job.input)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+    // `footer_len` was bounded above; the footer starts that many bytes before the trailer.
+    let (builder, footer_corrections) = super::footer::open(
         input,
-        ArrowReaderOptions::new().with_skip_arrow_metadata(true),
-    )
-    .map_err(finding_error)?;
+        &super::footer::Footer {
+            start: size - 8 - footer_len,
+            len: footer_len,
+        },
+        job.accept_ch74988,
+    )?;
     let metadata = builder.metadata();
     let expected_rows =
         u64::try_from(metadata.file_metadata().num_rows()).map_err(finding_error)?;
@@ -488,6 +497,7 @@ pub fn check(job: &Job) -> Result<Checked> {
     let checked = Checked {
         input_schema: validation::clean_schema(&input_schema),
         padded_columns: contract.padded_columns(),
+        footer_corrections,
         field_audits: contract.field_audits(),
         finding_rows_by_column,
         input_sha256,

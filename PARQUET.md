@@ -124,6 +124,23 @@ source schemas observed are recorded in `SOURCE-SCHEMAS.json` rather than used a
 schema of every table, including ones that never migrated, so partitions committed by an earlier
 run are not reusable under it.
 
+## Source files written by ClickHouse before 25.4 (issue 74988)
+
+ClickHouse before the fix in [PR 75029](https://github.com/ClickHouse/ClickHouse/pull/75029)
+annotated every `DateTime64(9)` column in Parquet with logical type `Timestamp(NANOS)` **and**
+legacy converted type `UTF8` ([issue 74988](https://github.com/ClickHouse/ClickHouse/issues/74988)).
+The two contradict each other -- no converted type exists for nanosecond timestamps -- and the
+Parquet reader refuses to build the schema, so the file cannot be read at all, let alone audited.
+Every `mds` object carries this: `nic_time`, `deser_time`, `detect_time`.
+
+`--accept-clickhouse-74988` does what the fixed writer would have done: for a column matching
+**exactly** that signature, the converted type is cleared before the schema is built. Nothing else
+in the footer and no value in the file is touched; a footer wrong in any other way is still
+refused; each partition's `MANIFEST.json` lists the corrected columns under `footer_corrections`.
+Without the flag such a file is refused with a message naming the issue and the flag. It is a flag
+rather than a default for the same reason `--prod-schema-dir` is: the run's shell history has to
+show that the source needed help to be read.
+
 ## Single table
 
 Inputs live under `s3://RAW/PREFIX/YYYY/MM/DD/table/*.parquet`. The terminal directory is the

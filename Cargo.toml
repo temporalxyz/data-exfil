@@ -34,6 +34,9 @@ arrow-array           = { version = "56.2", features = ["chrono-tz"] }
 arrow-cast            = "56.2"
 arrow-schema          = { version = "56.2", features = ["serde"] }
 parquet               = { version = "56.2", default-features = false, features = ["arrow", "snap", "flate2-zlib-rs", "lz4", "zstd"] }
+# Only to decode a footer that parquet's own reader refuses (ClickHouse #74988); same version and
+# feature set parquet itself uses, so nothing new is compiled in.
+thrift                = { version = "0.17", default-features = false }
 aws-config            = "1"
 aws-sdk-s3            = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "default-https-client"] }
 tokio                 = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util", "time", "process"] }

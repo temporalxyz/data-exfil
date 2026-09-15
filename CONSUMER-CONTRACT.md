@@ -73,6 +73,9 @@ by that migration is written as **all nulls** in the partitions that predate it.
 - Nothing validated those nulls, because there was no value to validate. Every other column went
   through the full audit as usual.
 - Partitions from a projected run carry `schema_source: "parquet+target"` rather than `"parquet"`.
+- `footer_corrections` lists columns whose source footer carried ClickHouse issue 74988 (a
+  contradictory legacy converted type on a nanosecond timestamp) and was read with that one
+  annotation cleared. The values are exactly the source's; only the footer was wrong.
 
 ## 4. Provenance columns are not optional
 

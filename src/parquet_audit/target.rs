@@ -179,7 +179,9 @@ pub async fn reference_schema(
     store: &dyn super::Store,
     source: &super::Source,
     work: &Path,
+    accept_ch74988: bool,
 ) -> Result<Schema> {
+    use std::io::{Read, Seek, SeekFrom};
     tracing::info!(
         key = source.key,
         bytes = source.size,
@@ -189,22 +191,38 @@ pub async fn reference_schema(
     let path = work.join("REFERENCE.parquet");
     let downloaded = store.download(source, &path).await;
     let schema = downloaded.and_then(|_| {
-        let file = std::fs::File::open(&path).map_err(infrastructure)?;
         // Named, keyed and sized: the operator has to be able to tell a half-written object
         // in today's partition from a corrupt one without re-downloading it by hand.
-        let builder =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new_with_options(
-                file,
-                parquet::arrow::arrow_reader::ArrowReaderOptions::new()
-                    .with_skip_arrow_metadata(true),
-            )
-            .map_err(|e| {
-                abort::<()>("reference object is not readable Parquet")
-                    .unwrap_err()
-                    .with("key", &source.key)
-                    .with("bytes", source.size)
-                    .with("error", e)
-            })?;
+        let context =
+            |e: crate::abort::SalvageError| e.with("key", &source.key).with("bytes", source.size);
+        let mut file = std::fs::File::open(&path).map_err(infrastructure)?;
+        let size = file.metadata().map_err(infrastructure)?.len();
+        if size < 12 {
+            return Err(context(
+                abort::<()>("reference object is too short to be Parquet").unwrap_err(),
+            ));
+        }
+        file.seek(SeekFrom::End(-8)).map_err(infrastructure)?;
+        let mut trailer = [0u8; 8];
+        file.read_exact(&mut trailer).map_err(infrastructure)?;
+        let footer_len = u64::from(u32::from_le_bytes([
+            trailer[0], trailer[1], trailer[2], trailer[3],
+        ]));
+        if &trailer[4..] != b"PAR1" || footer_len > size - 12 || footer_len > 8 * super::MIB {
+            return Err(context(
+                abort::<()>("reference object has an invalid or oversized Parquet footer")
+                    .unwrap_err(),
+            ));
+        }
+        let (builder, _corrections) = super::footer::open(
+            file,
+            &super::footer::Footer {
+                start: size - 8 - footer_len,
+                len: footer_len,
+            },
+            accept_ch74988,
+        )
+        .map_err(context)?;
         Ok(super::validation::clean_schema(builder.schema()))
     });
     // Reclaim the scratch whether or not the read worked; nothing downstream reads this copy.

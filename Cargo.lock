@@ -2596,6 +2596,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "thrift",
  "time",
  "tokio",
  "toml",

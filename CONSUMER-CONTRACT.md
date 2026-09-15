@@ -57,6 +57,23 @@ thing that failed.
   during import, double-counts, and propagates unreviewed data.
 - The generated `quarantine.sql` in the batch is the DDL we tested against. Use it.
 
+## 3a. Padded columns, when a table was migrated
+
+If a batch was produced with `--prod-schema-dir`, every partition of a table shares one schema even
+where the source did not, because the table was altered partway through the range. A column added
+by that migration is written as **all nulls** in the partitions that predate it.
+
+- `MANIFEST.json` lists them per partition in `padded_columns`, and `FIELD-AUDIT.json` marks them
+  `padded: true`. `target_schema_sha256` identifies the schema the partition was published against.
+- **A null in a padded column is not a null that was in the source.** It means the column did not
+  exist yet. Do not read it as an observed absence, aggregate over it, or treat it as a default.
+- A column added by a migration is published `Nullable` even where production declares it
+  `NOT NULL`, so that the old and new partitions share one type. Production's nullability holds
+  for every column the range always had.
+- Nothing validated those nulls, because there was no value to validate. Every other column went
+  through the full audit as usual.
+- Partitions from a projected run carry `schema_source: "parquet+target"` rather than `"parquet"`.
+
 ## 4. Provenance columns are not optional
 
 Every row carries `_source_object`, `_batch` and `_imported_at`, supplied as literals. **Keep them

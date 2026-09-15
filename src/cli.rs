@@ -425,6 +425,20 @@ pub struct ParquetArgs {
     /// Optional TOML field rules and limits; Parquet supplies schemas without DDL files.
     #[arg(long)]
     pub audit_policy: Option<PathBuf>,
+    /// Directory of prod `CREATE TABLE` files, `<db>.<table>.sql` or `create_<table>.sql`, one
+    /// per table, as `SHOW CREATE TABLE` writes them.
+    ///
+    /// Publishes every partition against the schema the table has *now*, so a table migrated
+    /// mid-range stops being schema drift. Columns a partition predates are written as nulls,
+    /// published `Nullable` for the whole table, and listed in its manifest's `padded_columns`. This is the only place this tool writes a value
+    /// it did not read, which is why it is a flag and not a fallback: it must be visible in the
+    /// shell history, and a consumer must be able to tell a padded null from a source null.
+    ///
+    /// Conflicts with `--skip-published`: projection changes the output schema of every table,
+    /// including ones that never migrated, so partitions committed by an earlier run cannot be
+    /// reused under it.
+    #[arg(long, conflicts_with = "skip_published")]
+    pub prod_schema_dir: Option<PathBuf>,
     #[command(flatten)]
     pub batch: BatchArg,
     /// Root before YYYY/MM/DD/table/ or table/YYYY/MM/DD/. Must be s3://bucket/prefix.

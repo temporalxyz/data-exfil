@@ -40,7 +40,10 @@ pub fn default_limits() -> Limits {
     }
 }
 
-pub fn load_table(args: &ParquetArgs, table: &str) -> Result<(Overrides, TablePolicy)> {
+pub fn load_table(
+    args: &ParquetArgs,
+    table: &str,
+) -> Result<(Overrides, TablePolicy, Option<super::target::ProdSchema>)> {
     let policy = if let Some(path) = &args.audit_policy {
         if std::fs::metadata(path).map_err(infrastructure)?.len() > 4 * MIB {
             return usage("audit policy exceeds 4 MiB");
@@ -81,5 +84,10 @@ pub fn load_table(args: &ParquetArgs, table: &str) -> Result<(Overrides, TablePo
         columns: native.columns.clone(),
     };
     overrides.validate()?;
-    Ok((overrides, native))
+    let prod = args
+        .prod_schema_dir
+        .as_deref()
+        .map(|dir| super::target::load(dir, table))
+        .transpose()?;
+    Ok((overrides, native, prod))
 }

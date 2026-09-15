@@ -31,6 +31,10 @@ pub struct Job {
     pub ddl: String,
     #[serde(default)]
     pub native_policy: Option<super::policy::TablePolicy>,
+    /// Pinned target schema. When set, the output follows it rather than this file's own schema,
+    /// and columns this file predates are written as nulls. See `validation::build_native_with_target`.
+    #[serde(default)]
+    pub target_schema: Option<arrow_schema::Schema>,
     #[serde(default)]
     pub stop_path: Option<PathBuf>,
     pub overrides: Overrides,
@@ -68,6 +72,9 @@ pub struct Checked {
     pub rows: u64,
     pub schema: arrow_schema::Schema,
     pub input_schema: arrow_schema::Schema,
+    /// Output columns this file had no values for; written as nulls to match the pinned target.
+    #[serde(default)]
+    pub padded_columns: Vec<String>,
     pub outputs: Vec<Output>,
     pub findings: u64,
     pub findings_by_reason: BTreeMap<String, u64>,
@@ -216,7 +223,15 @@ pub fn check(job: &Job) -> Result<Checked> {
     )?;
     let contract = if let Some(native) = &job.native_policy {
         {
-            let mut contract = validation::build_native(native, &job.overrides, builder.schema())?;
+            let mut contract = match &job.target_schema {
+                Some(target) => validation::build_native_with_target(
+                    native,
+                    &job.overrides,
+                    builder.schema(),
+                    target,
+                )?,
+                None => validation::build_native(native, &job.overrides, builder.schema())?,
+            };
             contract.apply_label_exception(&job.table)?;
             contract
         }
@@ -273,6 +288,16 @@ pub fn check(job: &Job) -> Result<Checked> {
             .collect::<Vec<_>>(),
     ));
     let mut provenance: Vec<ArrayRef> = Vec::new();
+    // Only a pinned target ever pads, so a run without one allocates nothing here at all.
+    let padded_slots: Vec<usize> = contract
+        .output_slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.is_none())
+        .map(|(at, _)| at)
+        .collect();
+    let mut padding: BTreeMap<usize, ArrayRef> = BTreeMap::new();
+    let mut padding_rows = 0usize;
     loop {
         let decode_started = Instant::now();
         let Some(next) = reader.next() else {
@@ -369,11 +394,39 @@ pub fn check(job: &Job) -> Result<Checked> {
                     used.clone(),
                 )?);
             }
+            // Built once and sliced, like the provenance literals below: allocating per batch
+            // would also inflate get_array_memory_size, which decides when a chunk rotates.
+            if padding_rows < full.num_rows() {
+                padding = padded_slots
+                    .iter()
+                    .map(|at| {
+                        (
+                            *at,
+                            arrow_array::new_null_array(
+                                contract.schema.field(*at).data_type(),
+                                full.num_rows(),
+                            ),
+                        )
+                    })
+                    .collect();
+                padding_rows = full.num_rows();
+            }
+            // `full` is always full source width -- either the batch itself, when nothing is
+            // dropped, or rebuilt in source order above -- so a slot indexes it directly.
             let mut arrays: Vec<ArrayRef> = contract
-                .kept
+                .output_slots
                 .iter()
-                .map(|index| full.column(*index).clone())
-                .collect();
+                .enumerate()
+                .map(|(at, slot)| match slot {
+                    Some(index) => Ok(full.column(*index).clone()),
+                    None => padding
+                        .get(&at)
+                        .map(|array| array.slice(0, full.num_rows()))
+                        .ok_or_else(|| {
+                            super::infra::<()>("padded column lost its null array").unwrap_err()
+                        }),
+                })
+                .collect::<Result<_>>()?;
             if provenance
                 .first()
                 .is_none_or(|array| array.len() < full.num_rows())
@@ -434,6 +487,7 @@ pub fn check(job: &Job) -> Result<Checked> {
     findings_file.sync_all().map_err(infrastructure)?;
     let checked = Checked {
         input_schema: validation::clean_schema(&input_schema),
+        padded_columns: contract.padded_columns(),
         field_audits: contract.field_audits(),
         finding_rows_by_column,
         input_sha256,

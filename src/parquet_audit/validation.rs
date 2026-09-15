@@ -19,6 +19,28 @@ pub struct Contract {
     pub kept: Vec<usize>,
     nodes: Vec<Node>,
     pub schema: Arc<Schema>,
+    /// One entry per output column (before provenance): the source-schema index it reads, or
+    /// `None` for a pinned target column the source file does not have, which is written as nulls.
+    /// Without a pinned target every slot is `Some`, so the writer walks one shape either way.
+    pub output_slots: Vec<Option<usize>>,
+    /// The source file's own schema. `schema` may be the pinned target, so anything reasoning
+    /// about what this file actually contained must read this and never `schema`.
+    source: Arc<Schema>,
+}
+
+impl Contract {
+    /// Target columns written entirely as nulls because this source file predates the migration
+    /// that added them. Recorded in the manifest: a consumer cannot otherwise tell these from a
+    /// null that was really in the source.
+    #[must_use]
+    pub fn padded_columns(&self) -> Vec<String> {
+        self.output_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(at, _)| self.schema.field(at).name().clone())
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -136,10 +158,13 @@ pub fn build(ddl: &PinnedDdl, overrides: &Overrides, schema: &Schema) -> Result<
     for (name, _) in crate::clickhouse::quarantine::PROVENANCE_COLUMNS {
         fields.push(ArrowField::new(*name, DataType::Utf8, false));
     }
+    let output_slots = kept.iter().copied().map(Some).collect();
     Ok(Contract {
         kept,
         nodes,
         schema: Arc::new(Schema::new(fields)),
+        output_slots,
+        source: Arc::new(schema.clone()),
     })
 }
 
@@ -148,6 +173,30 @@ pub fn build_native(
     policy: &super::policy::TablePolicy,
     overrides: &Overrides,
     schema: &Schema,
+) -> Result<Contract> {
+    build_native_inner(policy, overrides, schema, None)
+}
+
+/// As [`build_native`], but the output follows a pinned target schema rather than this file's.
+///
+/// A table migrated in production leaves older partitions a column short. The target says which
+/// columns the published data has, in what order and with what nullability; this file supplies
+/// values for the ones it has, and the rest are written as nulls. Validation still covers exactly
+/// the columns that carry real values -- padding is not audited, because there is nothing to audit.
+pub fn build_native_with_target(
+    policy: &super::policy::TablePolicy,
+    overrides: &Overrides,
+    schema: &Schema,
+    target: &Schema,
+) -> Result<Contract> {
+    build_native_inner(policy, overrides, schema, Some(target))
+}
+
+fn build_native_inner(
+    policy: &super::policy::TablePolicy,
+    overrides: &Overrides,
+    schema: &Schema,
+    target: Option<&Schema>,
 ) -> Result<Contract> {
     if schema.fields().is_empty()
         || schema.fields().len() > overrides.limits.max_fields_per_row as usize
@@ -263,9 +312,14 @@ pub fn build_native(
         nodes.push(node);
         fields.push(clean_field(field));
     }
+    // A `drop = true` entry names a column a migration removed, so with a pinned target it is
+    // absent from precisely the partitions written after that migration and its absence is the
+    // expected state, not a typo. Every other policy entry still has to name a column this file has.
     if policy
         .columns
-        .keys()
+        .iter()
+        .filter(|(_, column)| !(target.is_some() && column.drop))
+        .map(|(name, _)| name)
         .chain(policy.types.keys())
         .any(|name| !names.contains(name))
     {
@@ -274,6 +328,13 @@ pub fn build_native(
     if kept.is_empty() {
         return usage("every native column is dropped");
     }
+    let (mut fields, output_slots) = match target {
+        None => {
+            let slots = kept.iter().copied().map(Some).collect();
+            (fields, slots)
+        }
+        Some(target) => project_onto_target(policy, overrides, schema, target, &kept)?,
+    };
     for (name, _) in crate::clickhouse::quarantine::PROVENANCE_COLUMNS {
         fields.push(ArrowField::new(*name, DataType::Utf8, false));
     }
@@ -281,7 +342,115 @@ pub fn build_native(
         kept,
         nodes,
         schema: Arc::new(Schema::new(fields)),
+        output_slots,
+        source: Arc::new(schema.clone()),
     })
+}
+
+/// Lay this file's columns out against a pinned target schema.
+///
+/// The target is the authority for which columns exist, their order and their nullability. Its
+/// Arrow types come from a real post-migration object rather than from translated SQL, so the
+/// comparison below is exact equality and never a guess about how a `String` was spelled.
+fn project_onto_target(
+    policy: &super::policy::TablePolicy,
+    overrides: &Overrides,
+    schema: &Schema,
+    target: &Schema,
+    kept: &[usize],
+) -> Result<(Vec<ArrowField>, Vec<Option<usize>>)> {
+    if target.fields().is_empty()
+        || target.fields().len() > overrides.limits.max_fields_per_row as usize
+    {
+        return abort("pinned target schema has no fields or exceeds the field cap");
+    }
+    let mut fields = Vec::new();
+    let mut slots = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for field in target.fields() {
+        let name = field.name();
+        if !seen.insert(name.clone())
+            || crate::clickhouse::quarantine::PROVENANCE_COLUMNS
+                .iter()
+                .any(|(n, _)| n == name)
+        {
+            return abort("duplicate target column or target/audit provenance collision")
+                .map_err(|e: SalvageError| e.with("column", name));
+        }
+        crate::clickhouse::types::Ident::new(name)?;
+        match schema.fields().iter().position(|f| f.name() == name) {
+            Some(index) if kept.contains(&index) => {
+                let source = clean_field(&schema.fields()[index]);
+                if source.data_type() != field.data_type() {
+                    return abort("source column type differs from the pinned target schema")
+                        .map_err(|e: SalvageError| {
+                            e.with("column", name)
+                                .with("target", format!("{:?}", field.data_type()))
+                                .with("source", format!("{:?}", source.data_type()))
+                        });
+                }
+                // The reverse is fine: a column the source never nulls widens into a nullable
+                // target. This direction cannot, and arrow would only notice on a batch that
+                // happened to carry a null, which is far too late to call it a schema error.
+                if source.is_nullable() && !field.is_nullable() {
+                    return abort("source column is nullable but the pinned target column is not")
+                        .map_err(|e: SalvageError| e.with("column", name));
+                }
+                slots.push(Some(index));
+            }
+            Some(_) => {
+                return abort(
+                    "column is dropped by policy but declared by the pinned target schema",
+                )
+                .map_err(|e: SalvageError| e.with("column", name));
+            }
+            None => {
+                if !field.is_nullable() {
+                    return abort(
+                        "pinned target column is absent from this file and is not Nullable; there                          is no truthful value to write",
+                    )
+                    .map_err(|e: SalvageError| e.with("column", name));
+                }
+                // Padding writes a column nothing validates. That is only honest where the
+                // contract is the default one; where a person pinned a semantic type or a field
+                // rule, an unchecked all-null column would quietly retire their review.
+                if policy.types.contains_key(name)
+                    || policy.columns.get(name).is_some_and(|c| !c.drop)
+                    || matches!(
+                        name.as_str(),
+                        "signature"
+                            | "address"
+                            | "token_a"
+                            | "token_b"
+                            | "fee_payer"
+                            | "mid_a_to_b_num"
+                            | "mid_a_to_b_denom"
+                            | "mid_b_to_a_num"
+                            | "mid_b_to_a_denom"
+                    )
+                {
+                    return abort(
+                        "pinned target column carries a field contract and cannot be padded",
+                    )
+                    .map_err(|e: SalvageError| e.with("column", name));
+                }
+                slots.push(None);
+            }
+        }
+        fields.push(field.as_ref().clone());
+    }
+    // A column the target does not declare would otherwise vanish from the output unannounced.
+    // Section 8.7 makes every removal explicit, so the operator has to name this one too.
+    for index in kept {
+        let name = schema.fields()[*index].name();
+        if !seen.contains(name) {
+            return abort(
+                "source column is absent from the pinned target schema; set drop = true to exclude it",
+            )
+            .map_err(|e: SalvageError| e.with("column", name));
+        }
+    }
+    Ok((fields, slots))
 }
 
 fn configure_native(
@@ -400,6 +569,20 @@ fn native_type(field: &ArrowField, limits: &Limits, depth: u32) -> Result<Ch> {
     } else {
         ty
     })
+}
+
+/// The same ClickHouse/Arrow compatibility matrix the per-file audit applies, asked as a question.
+///
+/// Exposed so a pinned target schema cannot be assembled out of pairs that the audit would then
+/// refuse column by column, which would turn a configuration mistake into a mid-run stop.
+pub fn accepts(ty: &Ch, dt: &DataType, limits: &Limits) -> Result<()> {
+    Node::build("target".to_owned(), ty, dt, None, limits).map(|_| ())
+}
+
+/// The type a field takes in regenerated output, with source metadata stripped at every level.
+#[must_use]
+pub fn clean_field_type(field: &ArrowField) -> DataType {
+    clean_field(field).data_type().clone()
 }
 
 pub fn clean_schema(schema: &Schema) -> Schema {
@@ -954,10 +1137,34 @@ pub struct FieldAudit {
     #[serde(default)]
     pub approved_raw_sql_exempt_values: Vec<String>,
     pub enum_ids: Option<Vec<i16>>,
+    /// Written entirely as nulls to match a pinned target schema; no value was read or checked,
+    /// because this file predates the migration that added the column.
+    #[serde(default)]
+    pub padded: bool,
 }
 
 impl Contract {
     pub fn apply_label_exception(&mut self, table: &str) -> Result<()> {
+        // A padded column carries no node, so every loop below skips it and the reviewed
+        // allowlist would silently stop applying. Refuse rather than publish it unchecked.
+        for name in self.padded_columns() {
+            let reviewed = matches!(
+                (table, name.as_str()),
+                ("analytics.solana_program_labels", "label")
+                    | ("analytics.mint_infos", "name" | "symbol")
+                    | ("analytics.memefi_fv", "asset")
+                    | (
+                        "analytics.memefi_oracle_updates",
+                        "curve_packed" | "tox_data"
+                    )
+            );
+            if reviewed {
+                return abort(
+                    "this column is covered by a reviewed per-table exception and cannot be padded",
+                )
+                .map_err(|e: SalvageError| e.with("table", table).with("column", name));
+            }
+        }
         if table == "analytics.memefi_oracle_updates" {
             for node in &mut self.nodes {
                 let packed = match node.name.as_str() {
@@ -966,7 +1173,7 @@ impl Contract {
                     _ => continue,
                 };
                 let field = self
-                    .schema
+                    .source
                     .field_with_name(&node.name)
                     .map_err(|_| usage::<()>("missing packed binary schema").unwrap_err())?;
                 let scalar = node.scalar.as_mut().ok_or_else(|| {
@@ -992,7 +1199,7 @@ impl Contract {
                 && node.name == "symbol"
                 && matches!(node.ty, Ch::String)
                 && node.encoded.is_none()
-                && self.schema.field_with_name("symbol").is_ok_and(|field| {
+                && self.source.field_with_name("symbol").is_ok_and(|field| {
                     matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                 });
             // This is an operator-approved free display-name field.  Its native
@@ -1004,7 +1211,7 @@ impl Contract {
                 && node.name == "asset"
                 && matches!(node.ty, Ch::String)
                 && node.encoded.is_none()
-                && self.schema.field_with_name("asset").is_ok_and(|field| {
+                && self.source.field_with_name("asset").is_ok_and(|field| {
                     matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                 });
         }
@@ -1013,7 +1220,7 @@ impl Contract {
                 node.approved_label = node.name == "label";
                 if node.approved_label {
                     if !matches!(
-                        self.schema
+                        self.source
                             .field_with_name("label")
                             .map_err(|_| usage::<()>("missing program label schema").unwrap_err())?
                             .data_type(),
@@ -1066,6 +1273,7 @@ impl Contract {
                         Validator::EnumId { ids } => Some(ids.clone()),
                         _ => None,
                     },
+                    padded: false,
                 });
             }
             for child in &node.children {
@@ -1075,6 +1283,26 @@ impl Contract {
         let mut result = Vec::new();
         for node in &self.nodes {
             visit(node, &mut result);
+        }
+        // Listed explicitly: a report that simply omitted these would read as though the output
+        // had fewer columns than it has.
+        for column in self.padded_columns() {
+            result.push(FieldAudit {
+                column,
+                validated_type: "Padded(null)".into(),
+                class: FreedomClass::Closed,
+                pattern: None,
+                max_len: None,
+                opaque_binary: false,
+                approved_raw_sql_exempt_values: Vec::new(),
+                approved_base64_exempt_values: Vec::new(),
+                operator_approved_free_text: false,
+                allows_nul: false,
+                allows_empty_encoded_value: false,
+                recognizes_solana_encodings: false,
+                enum_ids: None,
+                padded: true,
+            });
         }
         result
     }

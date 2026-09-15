@@ -150,6 +150,34 @@ fn bad(reason: impl Into<String>) -> SalvageError {
 
 /// Parse a pinned `CREATE TABLE` statement.
 pub fn parse_create_table(sql: &str) -> Result<PinnedDdl> {
+    parse_with(sql, Dialect::Pinned)
+}
+
+/// Parse a production `SHOW CREATE TABLE` for its column set, order and nullability only.
+///
+/// Production DDL carries `ON CLUSTER`, per-column `CODEC`, `COMMENT`, `DEFAULT` and `TTL`,
+/// none of which say anything about a column's shape. This accepts and discards them. It still
+/// refuses `ALIAS`, `MATERIALIZED` and `EPHEMERAL`: those are not stored columns and would never
+/// appear in an export, so a schema that names one is not describing the data on disk. Engine and
+/// `ORDER BY` are parsed as usual so the same checks apply; callers of this variant do not use
+/// them.
+pub fn parse_prod_create_table(sql: &str) -> Result<PinnedDdl> {
+    parse_with(sql, Dialect::Production)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    /// Our pinned DDL: nothing after a type, nothing between the name and the column list.
+    Pinned,
+    /// A `SHOW CREATE TABLE` as production writes it.
+    Production,
+}
+
+/// Column modifiers a production DDL may carry that say nothing about the column's shape.
+/// `DEFAULT` and `TTL` take an expression; `CODEC` a parenthesised list; `COMMENT` a string.
+const SKIPPED_PROD_MODIFIERS: &[&str] = &["DEFAULT", "CODEC", "COMMENT", "TTL"];
+
+fn parse_with(sql: &str, dialect: Dialect) -> Result<PinnedDdl> {
     let stripped = strip_comments(sql)?;
     let text = stripped.trim();
 
@@ -166,7 +194,7 @@ pub fn parse_create_table(sql: &str) -> Result<PinnedDdl> {
         .find('(')
         .ok_or_else(|| bad("pinned DDL has no column list"))?;
     let (name_part, from_paren) = rest.split_at(open);
-    let (database, table) = parse_qualified_name(name_part.trim())?;
+    let (database, table) = parse_qualified_name(name_part.trim(), dialect)?;
 
     let close = matching_paren(from_paren)?;
     let body = from_paren
@@ -183,7 +211,7 @@ pub fn parse_create_table(sql: &str) -> Result<PinnedDdl> {
         if entry.is_empty() {
             return Err(bad("empty column definition (a trailing comma?)"));
         }
-        columns.push(parse_column(entry)?);
+        columns.push(parse_column(entry, dialect)?);
     }
     if columns.is_empty() {
         return Err(bad("pinned DDL declares no columns"));
@@ -212,7 +240,7 @@ pub fn parse_create_table(sql: &str) -> Result<PinnedDdl> {
 }
 
 /// Split `db.table`, accepting backticks on either part.
-fn parse_qualified_name(s: &str) -> Result<(Ident, Ident)> {
+fn parse_qualified_name(s: &str, dialect: Dialect) -> Result<(Ident, Ident)> {
     let (db_raw, rest) = read_identifier(s).ok_or_else(|| bad("expected a database name"))?;
     let rest = rest.trim_start();
     let rest = rest
@@ -220,6 +248,14 @@ fn parse_qualified_name(s: &str) -> Result<(Ident, Ident)> {
         .ok_or_else(|| bad("expected `db.table`; the database qualifier is not optional"))?;
     let (tbl_raw, rest) = read_identifier(rest.trim_start())
         .ok_or_else(|| bad("expected a table name after the dot"))?;
+    // `ON CLUSTER name` routes the statement; it says nothing about the table.
+    let rest = match dialect {
+        Dialect::Production => expect_keyword(rest, "ON")
+            .and_then(|r| expect_keyword(r, "CLUSTER"))
+            .and_then(|r| read_identifier(r).map(|(_, after)| after))
+            .unwrap_or(rest),
+        Dialect::Pinned => rest,
+    };
     if !rest.trim().is_empty() {
         return Err(
             bad("unexpected text between the table name and the column list")
@@ -229,8 +265,8 @@ fn parse_qualified_name(s: &str) -> Result<(Ident, Ident)> {
     Ok((Ident::new(&db_raw)?, Ident::new(&tbl_raw)?))
 }
 
-/// One `` `name` Type `` entry, with nothing permitted after the type.
-fn parse_column(entry: &str) -> Result<PinnedColumn> {
+/// One `` `name` Type `` entry, with nothing permitted after the type in the pinned dialect.
+fn parse_column(entry: &str, dialect: Dialect) -> Result<PinnedColumn> {
     let (name_raw, rest) = read_identifier(entry).ok_or_else(|| {
         bad("column definition does not begin with a name").with("entry", entry.escape_debug())
     })?;
@@ -241,6 +277,10 @@ fn parse_column(entry: &str) -> Result<PinnedColumn> {
     }
 
     let (declared_type, trailing) = split_type(rest)?;
+    let trailing = match dialect {
+        Dialect::Production => skip_prod_modifiers(trailing, name.as_str())?,
+        Dialect::Pinned => trailing,
+    };
     let trailing = trailing.trim();
     if !trailing.is_empty() {
         // Name the modifier if we recognise it, because the *reason* is the useful part -- an
@@ -265,6 +305,74 @@ fn parse_column(entry: &str) -> Result<PinnedColumn> {
         declared_type,
         ty,
     })
+}
+
+/// Consume the shape-irrelevant modifiers a production column may carry, in any order.
+///
+/// Stops at the first thing it does not recognise and hands it back, so the caller's forbidden-
+/// modifier check still names `ALIAS`/`MATERIALIZED`/`EPHEMERAL` with their reasons rather than
+/// this function swallowing them. An expression after `DEFAULT` or `TTL` runs to the next
+/// recognised modifier keyword at the top level, outside strings and parentheses.
+fn skip_prod_modifiers<'a>(mut s: &'a str, column: &str) -> Result<&'a str> {
+    loop {
+        let trimmed = s.trim_start();
+        let Some(kw) = SKIPPED_PROD_MODIFIERS
+            .iter()
+            .find(|kw| expect_keyword(trimmed, kw).is_some())
+        else {
+            return Ok(trimmed);
+        };
+        let after = expect_keyword(trimmed, kw).unwrap_or("").trim_start();
+        s = match *kw {
+            "CODEC" => {
+                let close = matching_paren(after).map_err(|e| e.with("column", column))?;
+                after
+                    .get(close.checked_add(1).ok_or_else(|| bad("overflow"))?..)
+                    .unwrap_or("")
+            }
+            "COMMENT" => {
+                if !after.starts_with('\'') {
+                    return Err(bad("COMMENT must be followed by a string").with("column", column));
+                }
+                after.get(skip_string(after, 0)..).unwrap_or("")
+            }
+            // DEFAULT / TTL: an expression, ended by the next modifier keyword or the entry's end.
+            _ => skip_expression(after),
+        };
+    }
+}
+
+/// Everything up to the next top-level modifier keyword, respecting strings and parentheses.
+fn skip_expression(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rest = s.get(i..).unwrap_or("");
+        if depth == 0
+            && i > 0
+            && bytes
+                .get(i.saturating_sub(1))
+                .is_some_and(|b| b.is_ascii_whitespace())
+            && SKIPPED_PROD_MODIFIERS
+                .iter()
+                .chain(FORBIDDEN_COLUMN_MODIFIERS.iter().map(|(kw, _)| kw))
+                .any(|kw| expect_keyword(rest, kw).is_some())
+        {
+            return rest;
+        }
+        match bytes.get(i) {
+            Some(b'(') => depth = depth.saturating_add(1),
+            Some(b')') => depth = depth.saturating_sub(1),
+            Some(b'\'') => {
+                i = skip_string(s, i);
+                continue;
+            }
+            _ => {}
+        }
+        i = i.saturating_add(1);
+    }
+    ""
 }
 
 /// Read a type: an identifier optionally followed by one balanced parenthesised argument list.

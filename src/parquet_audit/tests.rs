@@ -47,6 +47,7 @@ fn job(dir: &Path, definition: &str, batch: &RecordBatch) -> file::Job {
     std::fs::write(&input, parquet_bytes(batch)).unwrap();
     file::Job {
         table: String::new(),
+        target_schema: None,
         input,
         work: dir.into(),
         ddl: format!("CREATE TABLE db.events ({definition}) ENGINE = MergeTree ORDER BY tuple()"),
@@ -1486,7 +1487,7 @@ fn native_policy_defaults_need_no_ddl_and_typos_fail_closed() {
     let crate::cli::Command::AuditParquet(mut args) = cli.command else {
         unreachable!()
     };
-    let (overrides, policy) = policy::load_table(&args, "analytics.anytable").unwrap();
+    let (overrides, policy, _) = policy::load_table(&args, "analytics.anytable").unwrap();
     assert!(policy.columns.is_empty());
     assert!(overrides.limits.max_compressed_bytes > 19 * 1024 * MIB);
     let dir = tempfile::tempdir().unwrap();
@@ -1501,7 +1502,7 @@ fn native_policy_defaults_need_no_ddl_and_typos_fail_closed() {
         assert!(policy::load_table(&args, "analytics.anytable").is_err());
     }
     std::fs::write(&path, "iocs = [\"incidentCanary\"]\n[limits]\nmax_field_bytes = 4096\n[tables.\"analytics.anytable\".types]\nid = \"UUID\"").unwrap();
-    let (overrides, policy) = policy::load_table(&args, "analytics.anytable").unwrap();
+    let (overrides, policy, _) = policy::load_table(&args, "analytics.anytable").unwrap();
     assert_eq!(overrides.limits.max_field_bytes, 4096);
     assert_eq!(policy.types["id"], "UUID");
     assert_eq!(policy.iocs, vec!["incidentCanary"]);
@@ -4410,4 +4411,825 @@ fn cakemas_symbol_exception_is_exactly_scoped_and_keeps_constraints() {
         }
         assert!(file::check(&job).is_err(), "{rule}");
     }
+}
+
+// -- pinned target schemas: publishing a migrated table as one shape -----------------------------
+
+/// The shape `text_batch` writes, plus a column a later migration added.
+fn migrated_target() -> Schema {
+    Schema::new(vec![
+        Field::new("body", DataType::Utf8, false),
+        Field::new("venue", DataType::Utf8, true),
+    ])
+}
+
+fn target_job(dir: &Path, batch: &RecordBatch, target: &Schema) -> file::Job {
+    let mut j = native_job(dir, batch);
+    j.target_schema = Some(target.clone());
+    j
+}
+
+#[test]
+fn a_pre_migration_file_is_padded_onto_the_target_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let checked = file::check(&target_job(
+        dir.path(),
+        &text_batch(&["hello"]),
+        &migrated_target(),
+    ))
+    .unwrap();
+    // Output follows the target, not the file, and carries the provenance columns after it.
+    let names: Vec<_> = checked
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(names[..2], ["body".to_owned(), "venue".to_owned()]);
+    assert_eq!(checked.padded_columns, ["venue".to_owned()]);
+    assert_eq!(checked.rows, 1);
+
+    // The padded column really is null in the regenerated file, and nullable as the target said.
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(dir.path().join(&checked.outputs[0].name)).unwrap(),
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let out = reader.next().unwrap().unwrap();
+    let venue = out.column_by_name("venue").unwrap();
+    assert_eq!(venue.len(), 1);
+    assert_eq!(venue.null_count(), 1);
+    assert!(out.schema().field_with_name("venue").unwrap().is_nullable());
+    assert_eq!(
+        out.column_by_name("body")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "hello"
+    );
+
+    // FIELD-AUDIT.json accounts for every output column rather than omitting the padded one.
+    let padded = checked
+        .field_audits
+        .iter()
+        .find(|a| a.column == "venue")
+        .expect("padded column is reported");
+    assert!(padded.padded);
+    assert!(
+        !checked
+            .field_audits
+            .iter()
+            .any(|a| a.column == "body" && a.padded)
+    );
+}
+
+#[test]
+fn a_post_migration_file_projects_onto_the_same_shape_with_nothing_padded() {
+    let dir = tempfile::tempdir().unwrap();
+    let full = batch(
+        vec![
+            Field::new("body", DataType::Utf8, false),
+            Field::new("venue", DataType::Utf8, true),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec!["hello"])),
+            Arc::new(StringArray::from(vec![Some("binance")])),
+        ],
+    );
+    let after = file::check(&target_job(dir.path(), &full, &migrated_target())).unwrap();
+    assert!(after.padded_columns.is_empty());
+
+    let before_dir = tempfile::tempdir().unwrap();
+    let before = file::check(&target_job(
+        before_dir.path(),
+        &text_batch(&["hello"]),
+        &migrated_target(),
+    ))
+    .unwrap();
+    // The whole point: both sides of the migration publish one schema.
+    assert_eq!(before.schema, after.schema);
+}
+
+#[test]
+fn a_target_column_that_is_not_nullable_cannot_be_padded_even_with_no_rows() {
+    // Zero rows on purpose: arrow only rejects a null in a non-nullable field when a batch
+    // actually carries one, so an empty file would slip past a write-time check entirely.
+    let empty = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+        "body",
+        DataType::Utf8,
+        false,
+    )])));
+    let target = Schema::new(vec![
+        Field::new("body", DataType::Utf8, false),
+        Field::new("venue", DataType::Utf8, false),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let error = file::check(&target_job(dir.path(), &empty, &target)).unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+    assert!(
+        error.reason().contains("not Nullable"),
+        "{}",
+        error.reason()
+    );
+}
+
+#[test]
+fn a_source_column_the_target_omits_must_be_dropped_explicitly() {
+    let extra = batch(
+        vec![
+            Field::new("body", DataType::Utf8, false),
+            Field::new("legacy_fee", DataType::Utf8, true),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec!["hello"])),
+            Arc::new(StringArray::from(vec![Some("7")])),
+        ],
+    );
+    let target = Schema::new(vec![Field::new("body", DataType::Utf8, false)]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let error = file::check(&target_job(dir.path(), &extra, &target)).unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+    assert!(error.reason().contains("drop = true"), "{}", error.reason());
+
+    // Naming it is enough, and the same policy must keep working against the post-migration
+    // files that no longer carry the column at all -- otherwise the escape hatch is unusable.
+    let mut policy = policy::TablePolicy::default();
+    policy.columns.insert(
+        "legacy_fee".into(),
+        toml::from_str(
+            r#"class = "closed"
+drop = true"#,
+        )
+        .unwrap(),
+    );
+    for input in [&extra, &text_batch(&["hello"])] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut job = target_job(dir.path(), input, &target);
+        job.native_policy = Some(policy.clone());
+        job.overrides.columns = policy.columns.clone();
+        let checked = file::check(&job).unwrap();
+        assert!(checked.padded_columns.is_empty());
+        assert!(
+            !checked
+                .schema
+                .fields()
+                .iter()
+                .any(|f| f.name() == "legacy_fee")
+        );
+    }
+}
+
+#[test]
+fn a_retyped_column_is_a_schema_refusal_and_not_a_data_finding() {
+    let retyped = batch(
+        vec![Field::new("body", DataType::UInt64, false)],
+        vec![Arc::new(UInt64Array::from(vec![1]))],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let error = file::check(&target_job(dir.path(), &retyped, &migrated_target())).unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+    assert!(
+        error
+            .reason()
+            .contains("differs from the pinned target schema"),
+        "{}",
+        error.reason()
+    );
+    // Not routed through finding_error, which discards the diagnostic and would make a
+    // configuration mistake indistinguishable from a bad value.
+    assert!(!error.reason().contains("invalid native Parquet structure"));
+}
+
+#[test]
+fn a_target_may_not_shadow_a_provenance_column_or_tighten_nullability() {
+    let dir = tempfile::tempdir().unwrap();
+    let shadow = Schema::new(vec![
+        Field::new("body", DataType::Utf8, false),
+        Field::new("_batch", DataType::Utf8, true),
+    ]);
+    let error = file::check(&target_job(dir.path(), &text_batch(&["hi"]), &shadow)).unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+    assert!(error.reason().contains("provenance"), "{}", error.reason());
+
+    // A nullable source cannot be published into a non-nullable target column.
+    let nullable = batch(
+        vec![Field::new("body", DataType::Utf8, true)],
+        vec![Arc::new(StringArray::from(vec![Some("hi")]))],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let strict = Schema::new(vec![Field::new("body", DataType::Utf8, false)]);
+    let error = file::check(&target_job(dir.path(), &nullable, &strict)).unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+    assert!(
+        error.reason().contains("nullable but the pinned target"),
+        "{}",
+        error.reason()
+    );
+}
+
+#[test]
+fn a_column_with_a_reviewed_or_pinned_contract_is_never_padded() {
+    // A reviewed per-table exception: padding would retire an allowlist a person signed off on.
+    let dir = tempfile::tempdir().unwrap();
+    let target = Schema::new(vec![
+        Field::new("body", DataType::Utf8, false),
+        Field::new("label", DataType::Utf8, true),
+    ]);
+    let mut job = target_job(dir.path(), &text_batch(&["hi"]), &target);
+    job.table = "analytics.solana_program_labels".into();
+    let error = file::check(&job).unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+    assert!(error.reason().contains("reviewed"), "{}", error.reason());
+
+    // A built-in field contract, on any table.
+    let dir = tempfile::tempdir().unwrap();
+    let target = Schema::new(vec![
+        Field::new("body", DataType::Utf8, false),
+        Field::new("signature", DataType::Utf8, true),
+    ]);
+    let error = file::check(&target_job(dir.path(), &text_batch(&["hi"]), &target)).unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+    assert!(
+        error.reason().contains("field contract"),
+        "{}",
+        error.reason()
+    );
+}
+
+#[test]
+fn the_pinned_contract_hash_is_unchanged_for_every_run_without_a_prod_schema() {
+    // Adding the target to the hashed tuple must not disturb runs that do not use one, or every
+    // in-flight --resume would abort against its own inventory. Asserted against the exact tuple
+    // this crate hashed before targets existed, rather than against a frozen hex string that
+    // would also move whenever GIT_COMMIT does.
+    let native = policy::TablePolicy::default();
+    let overrides = overrides();
+    let before = crate::export::diff::sha256_hex(
+        &serde_json::to_vec(&(
+            FORMAT,
+            crate::export::plan::GIT_COMMIT,
+            "parquet-schema",
+            &native,
+            &overrides,
+        ))
+        .unwrap(),
+    );
+    assert_eq!(contract_hash(&native, &overrides, None).unwrap(), before);
+
+    // And a prod schema does change it, so editing the SQL mid-run is caught like any other
+    // change to a pinned contract.
+    let prod = target::ProdSchema {
+        sql: "CREATE TABLE db.events (body String) ENGINE = MergeTree ORDER BY tuple()".into(),
+        ddl: crate::clickhouse::ddl::parse_create_table(
+            "CREATE TABLE db.events (body String) ENGINE = MergeTree ORDER BY tuple()",
+        )
+        .unwrap(),
+    };
+    assert_ne!(
+        contract_hash(&native, &overrides, Some(&prod)).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn files_within_one_day_must_still_agree_about_what_they_hold() {
+    // With a target every file projects onto the same output schema, so the output comparison
+    // cannot see this. The partition's field audits are taken from one file and published as
+    // though they described all of them, so disagreement has to fail on its own terms.
+    let dir = tempfile::tempdir().unwrap();
+    let track = Arc::new(Tracker::default());
+    let raw = Arc::new(FakeStore::new(track.clone()));
+    let clean = Arc::new(FakeStore::new(track.clone()));
+    let mut day = add_day(&raw, 1, &["hello", "placeholder"]);
+    let widened = batch(
+        vec![
+            Field::new("body", DataType::Utf8, false),
+            Field::new("venue", DataType::Utf8, true),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec!["hello"])),
+            Arc::new(StringArray::from(vec![Some("binance")])),
+        ],
+    );
+    let bytes = parquet_bytes(&widened);
+    day.sources[1].size = bytes.len() as u64;
+    day.sources[1].etag = crate::export::diff::sha256_hex(&bytes);
+    raw.data
+        .lock()
+        .unwrap()
+        .insert(day.sources[1].key.clone(), bytes);
+
+    let mut p = pipeline(dir.path(), track, raw, clean.clone());
+    p.native_policy = Some(Default::default());
+    p.target_schema = Some(migrated_target());
+    p.ddl.clear();
+    let error = runtime().block_on(p.run(&[day])).unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+    let report: BTreeMap<String, Status> = read_json(&dir.path().join("report.json")).unwrap();
+    assert!(
+        report["2026-09-01"]
+            .reason
+            .contains("source schema differs between files"),
+        "{:?}",
+        report
+    );
+    assert!(clean.data.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_migrated_table_publishes_both_sides_as_one_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let track = Arc::new(Tracker::default());
+    let raw = Arc::new(FakeStore::new(track.clone()));
+    let clean = Arc::new(FakeStore::new(track.clone()));
+    // Day 1 predates the migration; day 2 carries the added column.
+    let before = add_day(&raw, 1, &["hello"]);
+    let mut after = add_day(&raw, 2, &["placeholder"]);
+    let widened = batch(
+        vec![
+            Field::new("body", DataType::Utf8, false),
+            Field::new("venue", DataType::Utf8, true),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec!["world"])),
+            Arc::new(StringArray::from(vec![Some("binance")])),
+        ],
+    );
+    let bytes = parquet_bytes(&widened);
+    after.sources[0].size = bytes.len() as u64;
+    after.sources[0].etag = crate::export::diff::sha256_hex(&bytes);
+    raw.data
+        .lock()
+        .unwrap()
+        .insert(after.sources[0].key.clone(), bytes);
+
+    let mut p = pipeline(dir.path(), track, raw, clean.clone());
+    p.native_policy = Some(Default::default());
+    p.target_schema = Some(migrated_target());
+    p.ddl.clear();
+    // Without a target this is the run that stops with "native source schema drift"; it now
+    // publishes both days.
+    runtime().block_on(p.run(&[before, after])).unwrap();
+
+    let stored = clean.data.lock().unwrap();
+    let manifests: Vec<_> = stored
+        .iter()
+        .filter(|(key, _)| key.ends_with("MANIFEST.json"))
+        .map(|(key, bytes)| {
+            (
+                key.clone(),
+                serde_json::from_slice::<Manifest>(bytes).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(manifests.len(), 2);
+    for (key, manifest) in &manifests {
+        assert_eq!(manifest.schema_source, "parquet+target");
+        assert_eq!(manifest.schema, manifests[0].1.schema, "one shape: {key}");
+        assert!(!manifest.target_schema_sha256.is_empty());
+        let expected: &[&str] = if manifest.date == "2026-09-01" {
+            &["venue"]
+        } else {
+            &[]
+        };
+        assert_eq!(manifest.padded_columns, expected, "{key}");
+    }
+    // The distinct source schemas are recorded rather than used as a gate.
+    let observed: Vec<arrow_schema::Schema> =
+        read_json(&dir.path().join("SOURCE-SCHEMAS.json")).unwrap();
+    assert_eq!(observed.len(), 2);
+    assert!(!dir.path().join("SOURCE-SCHEMA.json").exists());
+}
+
+#[test]
+fn projection_and_published_reuse_cannot_be_combined() {
+    use clap::Parser;
+    let base = [
+        "salvage",
+        "audit-parquet",
+        "--database",
+        "mds",
+        "--source",
+        "s3://raw/mds",
+        "--destination",
+        "s3://clean",
+        "--batch",
+        "b1",
+        "--memory-bytes",
+        "1024",
+        "--scratch-bytes",
+        "1024",
+        "--max-day-scratch-bytes",
+        "1024",
+    ];
+    // Each is fine on its own.
+    for flag in [
+        vec!["--skip-published"],
+        vec!["--prod-schema-dir", "./prod-schemas"],
+    ] {
+        assert!(
+            crate::cli::Cli::try_parse_from(base.iter().copied().chain(flag.iter().copied()))
+                .is_ok()
+        );
+    }
+    // Together they would republish partitions committed under a different output schema.
+    assert!(
+        crate::cli::Cli::try_parse_from(
+            base.iter().copied().chain(
+                ["--skip-published", "--prod-schema-dir", "./prod-schemas"]
+                    .iter()
+                    .copied()
+            )
+        )
+        .is_err()
+    );
+}
+
+fn prod(sql: &str) -> target::ProdSchema {
+    target::ProdSchema {
+        sql: sql.into(),
+        ddl: crate::clickhouse::ddl::parse_create_table(sql).unwrap(),
+    }
+}
+
+#[test]
+fn a_target_takes_its_columns_from_the_ddl_and_its_types_from_a_real_object() {
+    // The reference writes `venue` as Utf8; the DDL says it may be null. Neither artifact can
+    // answer both questions on its own, which is the whole reason there are two of them.
+    let reference = Schema::new(vec![
+        Field::new("venue", DataType::Utf8, true),
+        Field::new("body", DataType::Utf8, false),
+    ]);
+    let built = target::build(
+        &prod(
+            "CREATE TABLE db.events (`body` String, `venue` Nullable(String)) \
+             ENGINE = MergeTree ORDER BY tuple()",
+        ),
+        target::References {
+            newest: &reference,
+            oldest: &reference,
+        },
+        &overrides(),
+    )
+    .unwrap();
+    // DDL order wins, so the published column order is reviewable in source control.
+    assert_eq!(
+        built
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.is_nullable()))
+            .collect::<Vec<_>>(),
+        vec![("body".to_owned(), false), ("venue".to_owned(), true)]
+    );
+    assert_eq!(built.field(1).data_type(), &DataType::Utf8);
+}
+
+#[test]
+fn a_target_is_refused_when_the_ddl_and_the_reference_object_disagree() {
+    let overrides = overrides();
+    let reference = Schema::new(vec![Field::new("body", DataType::Utf8, false)]);
+
+    // The DDL has run ahead of the data: there is no object to take an Arrow type from, and
+    // guessing one is exactly what this design refuses to do.
+    let error = target::build(
+        &prod(
+            "CREATE TABLE db.events (`body` String, `venue` Nullable(String)) \
+             ENGINE = MergeTree ORDER BY tuple()",
+        ),
+        target::References {
+            newest: &reference,
+            oldest: &reference,
+        },
+        &overrides,
+    )
+    .unwrap_err();
+    assert!(
+        error.reason().contains("newest object does not have"),
+        "{}",
+        error.reason()
+    );
+
+    // The reference has a column the operator never declared; silently discarding it would be a
+    // removal nobody recorded.
+    let wide = Schema::new(vec![
+        Field::new("body", DataType::Utf8, false),
+        Field::new("legacy_fee", DataType::Utf8, true),
+    ]);
+    let error = target::build(
+        &prod("CREATE TABLE db.events (`body` String) ENGINE = MergeTree ORDER BY tuple()"),
+        target::References {
+            newest: &wide,
+            oldest: &wide,
+        },
+        &overrides,
+    )
+    .unwrap_err();
+    assert!(
+        error.reason().contains("does not declare"),
+        "{}",
+        error.reason()
+    );
+
+    // A declared type the Parquet column cannot carry.
+    let error = target::build(
+        &prod("CREATE TABLE db.events (`body` UInt64) ENGINE = MergeTree ORDER BY tuple()"),
+        target::References {
+            newest: &reference,
+            oldest: &reference,
+        },
+        &overrides,
+    )
+    .unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Abort);
+
+    // NOT NULL in prod, nullable on disk.
+    let nullable_on_disk = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
+    let error = target::build(
+        &prod("CREATE TABLE db.events (`body` String) ENGINE = MergeTree ORDER BY tuple()"),
+        target::References {
+            newest: &nullable_on_disk,
+            oldest: &nullable_on_disk,
+        },
+        &overrides,
+    )
+    .unwrap_err();
+    assert!(error.reason().contains("NOT NULL"), "{}", error.reason());
+}
+
+#[test]
+fn a_prod_schema_file_must_declare_the_table_it_is_named_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = "CREATE TABLE db.other (`body` String) ENGINE = MergeTree ORDER BY tuple()";
+    std::fs::write(dir.path().join("db.events.sql"), sql).unwrap();
+    let error = target::load(dir.path(), "db.events").unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Usage);
+    assert!(
+        error.reason().contains("different table"),
+        "{}",
+        error.reason()
+    );
+
+    // And an absent file is an error, never a quiet fall back to the un-projected behaviour.
+    let error = target::load(dir.path(), "db.missing").unwrap_err();
+    assert_eq!(error.exit_code(), ExitCode::Usage);
+
+    std::fs::write(
+        dir.path().join("db.events.sql"),
+        sql.replace("db.other", "db.events"),
+    )
+    .unwrap();
+    assert_eq!(
+        target::load(dir.path(), "db.events")
+            .unwrap()
+            .ddl
+            .columns
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_reference_object_supplies_the_arrow_types_the_sql_cannot() {
+    // The shape these tables really have: a nanosecond timestamp, a float, and the column a
+    // migration added. `DateTime64(9)` alone does not say whether the Parquet column carries a
+    // timezone, which is why the reference object is read at all.
+    let track = Arc::new(Tracker::default());
+    let raw = Arc::new(FakeStore::new(track));
+    let reference = batch(
+        vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("price", DataType::Float64, false),
+            Field::new("venue", DataType::Utf8, true),
+        ],
+        vec![
+            Arc::new(
+                TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000i64])
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(Float64Array::from(vec![1.5])),
+            Arc::new(StringArray::from(vec![Some("binance")])),
+        ],
+    );
+    let bytes = parquet_bytes(&reference);
+    let source = Source {
+        key: "mds/trade/2026/09/13/part-0.parquet".into(),
+        size: bytes.len() as u64,
+        version: Some("1".into()),
+        etag: crate::export::diff::sha256_hex(&bytes),
+    };
+    raw.data
+        .lock()
+        .unwrap()
+        .insert(source.key.clone(), bytes.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema = runtime()
+        .block_on(target::reference_schema(raw.as_ref(), &source, dir.path()))
+        .unwrap();
+    // The scratch copy is reclaimed; nothing downstream reads it.
+    assert!(!dir.path().join("REFERENCE.parquet").exists());
+
+    let built = target::build(
+        &prod(
+            "CREATE TABLE mds.trade (`ts` DateTime64(9), `price` Float64, \
+             `venue` Nullable(String)) ENGINE = MergeTree ORDER BY (`ts`)",
+        ),
+        target::References {
+            newest: &schema,
+            oldest: &schema,
+        },
+        &overrides(),
+    )
+    .unwrap();
+    // The timezone came from the file; the SQL could not have supplied it.
+    assert_eq!(
+        built.field(0).data_type(),
+        &DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()))
+    );
+    assert!(!built.field(0).is_nullable());
+    assert!(built.field(2).is_nullable());
+
+    // A file written before the migration projects onto it, padding the added column.
+    let older = batch(
+        vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("price", DataType::Float64, false),
+        ],
+        vec![
+            Arc::new(
+                TimestampNanosecondArray::from(vec![1_600_000_000_000_000_000i64])
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(Float64Array::from(vec![2.5])),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let checked = file::check(&target_job(dir.path(), &older, &built)).unwrap();
+    assert_eq!(checked.padded_columns, ["venue".to_owned()]);
+    assert_eq!(checked.rows, 1);
+}
+
+#[test]
+fn a_column_a_migration_added_is_published_nullable_for_the_whole_table() {
+    // `uid UInt64` is NOT NULL in prod and absent from every partition before 2026-08-18. The
+    // only honest value for those partitions is null, so the published type widens for every
+    // partition -- the newer ones too, or the table would not have one shape.
+    let newest = Schema::new(vec![
+        Field::new("body", DataType::Utf8, false),
+        Field::new("uid", DataType::UInt64, false),
+    ]);
+    let oldest = Schema::new(vec![Field::new("body", DataType::Utf8, false)]);
+    let built = target::build(
+        &prod("CREATE TABLE db.events (`body` String, `uid` UInt64) ENGINE = MergeTree ORDER BY tuple()"),
+        target::References {
+            newest: &newest,
+            oldest: &oldest,
+        },
+        &overrides(),
+    )
+    .unwrap();
+    assert!(
+        !built.field(0).is_nullable(),
+        "a column the range always had keeps NOT NULL"
+    );
+    assert!(
+        built.field(1).is_nullable(),
+        "a column the range started without widens"
+    );
+    assert_eq!(built.field(1).data_type(), &DataType::UInt64);
+
+    // And both sides of the migration project onto it: the old file padded, the new one not.
+    let dir = tempfile::tempdir().unwrap();
+    let old = file::check(&target_job(dir.path(), &text_batch(&["hi"]), &built)).unwrap();
+    assert_eq!(old.padded_columns, ["uid".to_owned()]);
+    let dir = tempfile::tempdir().unwrap();
+    let new = file::check(&target_job(
+        dir.path(),
+        &batch(
+            vec![
+                Field::new("body", DataType::Utf8, false),
+                Field::new("uid", DataType::UInt64, false),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["hi"])),
+                Arc::new(UInt64Array::from(vec![7])),
+            ],
+        ),
+        &built,
+    ))
+    .unwrap();
+    assert!(new.padded_columns.is_empty());
+    assert_eq!(old.schema, new.schema);
+
+    // A column the oldest partition has and prod dropped must be named, not lost.
+    let with_dropped = Schema::new(vec![
+        Field::new("body", DataType::Utf8, false),
+        Field::new("settle_price_estimate", DataType::Utf8, true),
+    ]);
+    let error = target::build(
+        &prod("CREATE TABLE db.events (`body` String) ENGINE = MergeTree ORDER BY tuple()"),
+        target::References {
+            newest: &oldest,
+            oldest: &with_dropped,
+        },
+        &overrides(),
+    )
+    .unwrap_err();
+    assert!(error.reason().contains("dropped it"), "{}", error.reason());
+    let mut dropping = overrides();
+    dropping.columns.insert(
+        "settle_price_estimate".into(),
+        toml::from_str("class = \"closed\"\ndrop = true").unwrap(),
+    );
+    target::build(
+        &prod("CREATE TABLE db.events (`body` String) ENGINE = MergeTree ORDER BY tuple()"),
+        target::References {
+            newest: &oldest,
+            oldest: &with_dropped,
+        },
+        &dropping,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_production_show_create_table_loads_as_written() {
+    // As the schema repository writes it: routing, codecs, comments with quotes and parens, a
+    // DEFAULT expression, and the table clauses the pinned parser already skips. The pinned
+    // dialect must go on refusing every one of these; only the prod loader accepts them.
+    let sql = r#"
+-- header comment
+CREATE TABLE mds.l2 ON CLUSTER temporal
+(
+    `host_location` LowCardinality(String) COMMENT 'Capture site, e.g. "tokyo-1".',
+    `depth` UInt16 DEFAULT 0 COMMENT 'Which chain: 0 is the venue book (see mds.snapshot).' CODEC(ZSTD(1)),
+    `is_snapshot` Bool DEFAULT false CODEC(ZSTD(1)),
+    `trade_id` UInt64 COMMENT 'The venue''s own trade id ("t").' CODEC(Delta, ZSTD(1)),
+    `nic_time` Nullable(DateTime64(9)) CODEC(Delta, ZSTD(1)),
+    `price` Decimal(38, 18) CODEC(ZSTD(3)),
+    `uid` UInt64 CODEC(Delta, ZSTD(1))
+)
+ENGINE = ReplicatedMergeTree
+PARTITION BY toYYYYMMDD(exchange_time)
+ORDER BY (host_location, depth)
+SETTINGS index_granularity = 8192
+"#;
+    assert!(crate::clickhouse::ddl::parse_create_table(sql).is_err());
+    let ddl = crate::clickhouse::ddl::parse_prod_create_table(sql).unwrap();
+    assert_eq!(ddl.qualified(), "mds.l2");
+    assert_eq!(
+        ddl.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "host_location",
+            "depth",
+            "is_snapshot",
+            "trade_id",
+            "nic_time",
+            "price",
+            "uid"
+        ]
+    );
+    assert_eq!(ddl.columns[1].declared_type, "UInt16");
+    assert_eq!(ddl.columns[4].declared_type, "Nullable(DateTime64(9))");
+
+    // Stored-ness is still required: these are not columns an export can carry.
+    for modifier in ["ALIAS body", "MATERIALIZED body", "EPHEMERAL"] {
+        let sql = format!(
+            "CREATE TABLE mds.t (`body` String, `x` String {modifier} CODEC(ZSTD(1))) \
+             ENGINE = MergeTree ORDER BY tuple()"
+        );
+        let error = crate::clickhouse::ddl::parse_prod_create_table(&sql).unwrap_err();
+        assert!(
+            error.reason().contains("not permitted"),
+            "{modifier}: {}",
+            error.reason()
+        );
+    }
+
+    // The repository's own file naming works without renaming anything.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("create_l2.sql"), sql).unwrap();
+    assert_eq!(
+        target::load(dir.path(), "mds.l2")
+            .unwrap()
+            .ddl
+            .columns
+            .len(),
+        7
+    );
 }

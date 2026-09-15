@@ -6,6 +6,7 @@ pub mod profile;
 mod published;
 mod stop;
 pub mod store;
+pub mod target;
 pub mod validation;
 
 #[cfg(test)]
@@ -265,6 +266,13 @@ pub struct Manifest {
     pub dropped_columns: Vec<String>,
     pub schema_source: String,
     pub source_schema_sha256: String,
+    /// Hash of the pinned target schema this partition was projected onto, empty when none was.
+    #[serde(default)]
+    pub target_schema_sha256: String,
+    /// Columns written entirely as nulls because this partition predates the migration that added
+    /// them. A null here is not a null that was in the source.
+    #[serde(default)]
+    pub padded_columns: Vec<String>,
     pub audit_limits: crate::limits::Limits,
     pub independent_revalidation: bool,
     pub field_audits: Vec<validation::FieldAudit>,
@@ -373,12 +381,19 @@ pub fn worker_command(path: &Path) -> Result<()> {
     }
 }
 
+/// Distinct source schemas one table may present across a run before it stops looking like a
+/// migration. Also keeps SOURCE-SCHEMAS.json well inside `read_json`'s size ceiling.
+const MAX_OBSERVED_SOURCE_SCHEMAS: usize = 16;
+
 pub struct Pipeline {
     pub identity: Identity,
     pub work: PathBuf,
     pub destination: Location,
     pub ddl: String,
     pub native_policy: Option<policy::TablePolicy>,
+    /// Pinned target schema for this table. Set when `--prod-schema-dir` supplied one; the output
+    /// then follows it and migrated-in columns are padded with nulls.
+    pub target_schema: Option<arrow_schema::Schema>,
     schema_lock: std::sync::Mutex<()>,
     published_store: Option<Arc<dyn published::PublishedStore>>,
     stop: Arc<stop::Stop>,
@@ -428,6 +443,7 @@ impl Pipeline {
             destination,
             ddl,
             native_policy: None,
+            target_schema: None,
             schema_lock: std::sync::Mutex::new(()),
             published_store: None,
             overrides,
@@ -762,6 +778,7 @@ impl Pipeline {
                                 work: file_work.clone(),
                                 ddl: self.ddl.clone(),
                                 native_policy: self.native_policy.clone(),
+                                target_schema: self.target_schema.clone(),
                                 stop_path: self
                                     .native_policy
                                     .as_ref()
@@ -849,39 +866,72 @@ impl Pipeline {
         if let Some(error) = first_error {
             return Err(error);
         }
-        let first_schema = &checked
+        let first = checked
             .values()
             .next()
-            .ok_or_else(|| abort::<()>("day has no checked files").unwrap_err())?
-            .schema;
+            .ok_or_else(|| abort::<()>("day has no checked files").unwrap_err())?;
+        let first_schema = &first.schema;
         if checked.values().any(|c| &c.schema != first_schema) {
             return abort("native Parquet schema differs between files in a day");
+        }
+        // Checked as its own question rather than left to the output comparison above: with a
+        // pinned target every file in the day projects onto the same output schema by
+        // construction, so that check would pass while the files disagreed about what they hold.
+        // FIELD-AUDIT.json and the manifest's field audits are taken from one file and speak for
+        // the whole partition, which is only true if the files agree.
+        let first_input_schema = &first.input_schema;
+        if checked
+            .values()
+            .any(|c| &c.input_schema != first_input_schema)
+        {
+            return abort("native Parquet source schema differs between files in a day");
         }
         // Pin the complete source schema, including dropped columns, across this table's days.
         // Publication is per partition; a later drift rejects that partition, never mutates the baseline.
         if self.native_policy.is_some() {
             let _lock = self.schema_lock.lock().map_err(infrastructure)?;
-            let reused_schema = self.work.join("REUSED-SOURCE-SCHEMA.json");
-            if reused_schema.exists() {
-                let expected: String = read_json(&reused_schema)?;
-                let actual = crate::export::diff::sha256_hex(
-                    &serde_json::to_vec(&checked.values().next().unwrap().input_schema)
-                        .map_err(infrastructure)?,
-                );
-                if actual != expected {
-                    return abort("source schema differs from reused published partitions");
+            if self.target_schema.is_some() {
+                // The pinned target, not the first file observed, is what every day must agree
+                // with -- that agreement was already enforced per file while building the
+                // contract. Source schemas may now legitimately differ across the migration, so
+                // they are recorded for the audit trail instead of gating.
+                let path = self.work.join("SOURCE-SCHEMAS.json");
+                let mut observed: Vec<arrow_schema::Schema> = if path.exists() {
+                    read_json(&path)?
+                } else {
+                    Vec::new()
+                };
+                if !observed.iter().any(|s| s == first_input_schema) {
+                    if observed.len() >= MAX_OBSERVED_SOURCE_SCHEMAS {
+                        return abort(
+                            "table presents more distinct source schemas than a migration explains",
+                        );
+                    }
+                    observed.push(first_input_schema.clone());
+                    atomic_json(&path, &observed)?;
                 }
-            }
-            let path = self.work.join("SOURCE-SCHEMA.json");
-            let baseline = if path.exists() {
-                read_json::<arrow_schema::Schema>(&path)?
             } else {
-                let baseline = checked.values().next().unwrap().input_schema.clone();
-                atomic_json(&path, &baseline)?;
-                baseline
-            };
-            if checked.values().any(|c| c.input_schema != baseline) {
-                return abort("native source schema drift across files/days of the table");
+                let reused_schema = self.work.join("REUSED-SOURCE-SCHEMA.json");
+                if reused_schema.exists() {
+                    let expected: String = read_json(&reused_schema)?;
+                    let actual = crate::export::diff::sha256_hex(
+                        &serde_json::to_vec(&first.input_schema).map_err(infrastructure)?,
+                    );
+                    if actual != expected {
+                        return abort("source schema differs from reused published partitions");
+                    }
+                }
+                let path = self.work.join("SOURCE-SCHEMA.json");
+                let baseline = if path.exists() {
+                    read_json::<arrow_schema::Schema>(&path)?
+                } else {
+                    let baseline = first.input_schema.clone();
+                    atomic_json(&path, &baseline)?;
+                    baseline
+                };
+                if checked.values().any(|c| c.input_schema != baseline) {
+                    return abort("native source schema drift across files/days of the table");
+                }
             }
         }
         atomic_json(
@@ -999,10 +1049,22 @@ impl Pipeline {
                     .map_err(infrastructure)?,
             ),
             audit_limits: self.overrides.limits.clone(),
-            schema_source: if self.native_policy.is_some() {
-                "parquet"
-            } else {
-                "pinned-ddl"
+            target_schema_sha256: match &self.target_schema {
+                Some(target) => crate::export::diff::sha256_hex(
+                    &serde_json::to_vec(target).map_err(infrastructure)?,
+                ),
+                None => String::new(),
+            },
+            // Taken from the same file as `field_audits` and `schema`, which the per-day source
+            // schema check above proves speaks for every file in the partition.
+            padded_columns: checked.values().next().unwrap().padded_columns.clone(),
+            // A distinct value, not a flag: it makes a manifest written under projection
+            // unreusable by a run without it, and the reverse, rather than leaving the two kinds
+            // of partition to be told apart by a field that defaults to empty.
+            schema_source: match (self.native_policy.is_some(), self.target_schema.is_some()) {
+                (true, true) => "parquet+target",
+                (true, false) => "parquet",
+                (false, _) => "pinned-ddl",
             }
             .into(),
             independent_revalidation: false,
@@ -1069,6 +1131,28 @@ impl Pipeline {
         );
         Ok(rows)
     }
+}
+
+/// Hash the pinned contract a resume must match.
+///
+/// With no prod schema the tuple is left exactly as it was, five elements and no placeholder, so
+/// adding this feature does not change a single existing table's hash and every in-flight resume
+/// keeps working. A prod schema appends its SQL, so editing that file after a run starts is
+/// caught the same way an edited override is.
+fn contract_hash(
+    native: &policy::TablePolicy,
+    overrides: &Overrides,
+    prod: Option<&target::ProdSchema>,
+) -> Result<String> {
+    const HEAD: (&str, &str, &str) = (FORMAT, crate::export::plan::GIT_COMMIT, "parquet-schema");
+    let contract = match prod {
+        None => serde_json::to_vec(&(HEAD.0, HEAD.1, HEAD.2, native, overrides)),
+        Some(prod) => {
+            serde_json::to_vec(&(HEAD.0, HEAD.1, HEAD.2, native, overrides, prod.sql.as_str()))
+        }
+    }
+    .map_err(infrastructure)?;
+    Ok(crate::export::diff::sha256_hex(&contract))
 }
 
 fn source_day_prefix(
@@ -1186,16 +1270,9 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
         );
     }
     let table = table_ref.qualified();
-    let (overrides, native_policy) = policy::load_table(args, &table)?;
+    let (overrides, native_policy, prod) = policy::load_table(args, &table)?;
     let ddl = String::new();
-    let contract = serde_json::to_vec(&(
-        FORMAT,
-        crate::export::plan::GIT_COMMIT,
-        "parquet-schema",
-        &native_policy,
-        &overrides,
-    ))
-    .map_err(infrastructure)?;
+    let contract_sha256 = contract_hash(&native_policy, &overrides, prod.as_ref())?;
     let identity = Identity {
         format: FORMAT.into(),
         table: table.clone(),
@@ -1207,7 +1284,7 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
         destination: destination_uri(args).trim_end_matches('/').into(),
         from: from.into(),
         through: through.into(),
-        contract_sha256: crate::export::diff::sha256_hex(&contract),
+        contract_sha256,
         survey,
         dry_run: common.dry_run || args.verify,
         retain_days: common.retain_days,
@@ -1325,6 +1402,48 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
             atomic_json(&inventory_path, &inventory)?;
             inventory
         };
+        // Resolved before any partition starts: the target decides the published shape, so
+        // deriving it later would make the output depend on which day happened to run first.
+        let target_schema = match &prod {
+            Some(prod) => {
+                // The pinned copy is authoritative on resume; see `database::pin_target`.
+                let path = work.join("TARGET-SCHEMA.json");
+                if path.exists() {
+                    Some(read_json::<arrow_schema::Schema>(&path)?)
+                } else {
+                    let missing = || {
+                        abort::<()>("table has no source objects to read a schema from")
+                            .unwrap_err()
+                    };
+                    let newest = inventory
+                        .days
+                        .iter()
+                        .rev()
+                        .find_map(|day| day.sources.first())
+                        .ok_or_else(missing)?;
+                    let oldest = inventory
+                        .days
+                        .iter()
+                        .find_map(|day| day.sources.first())
+                        .ok_or_else(missing)?;
+                    let newest_schema =
+                        target::reference_schema(raw.as_ref(), newest, &work).await?;
+                    let oldest_schema =
+                        target::reference_schema(raw.as_ref(), oldest, &work).await?;
+                    let built = target::build(
+                        prod,
+                        target::References {
+                            newest: &newest_schema,
+                            oldest: &oldest_schema,
+                        },
+                        &overrides,
+                    )?;
+                    atomic_json(&path, &built)?;
+                    Some(built)
+                }
+            }
+            None => None,
+        };
         let mut pipeline = Pipeline::new(
             identity,
             work.clone(),
@@ -1339,6 +1458,7 @@ pub fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
             Arc::new(ProcessWorker),
         );
         pipeline.native_policy = Some(native_policy);
+        pipeline.target_schema = target_schema;
         pipeline.run(&inventory.days).await
     })
 }

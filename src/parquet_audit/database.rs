@@ -125,15 +125,9 @@ fn identity(
     table: &str,
     native: &policy::TablePolicy,
     overrides: &Overrides,
+    prod: Option<&target::ProdSchema>,
 ) -> Result<Identity> {
-    let contract = serde_json::to_vec(&(
-        FORMAT,
-        crate::export::plan::GIT_COMMIT,
-        "parquet-schema",
-        native,
-        overrides,
-    ))
-    .map_err(infrastructure)?;
+    let contract_sha256 = contract_hash(native, overrides, prod)?;
     Ok(Identity {
         format: FORMAT.into(),
         table: table.into(),
@@ -145,7 +139,7 @@ fn identity(
         destination: destination_uri(args).trim_end_matches('/').into(),
         from: args.from.clone().unwrap_or_default(),
         through: args.through.clone().unwrap_or_default(),
-        contract_sha256: crate::export::diff::sha256_hex(&contract),
+        contract_sha256,
         survey: matches!(args.mode, crate::cli::Mode::Survey) && !args.verify,
         dry_run: common.dry_run || args.verify,
         retain_days: common.retain_days,
@@ -153,6 +147,56 @@ fn identity(
         row_group_bytes: tuning.row_group_bytes,
         chunk_bytes: tuning.chunk_bytes,
     })
+}
+
+/// Resolve and pin this table's target schema, reusing the pinned one on resume.
+///
+/// The reference object is the newest selected day's first file: the shape the table has now is
+/// the shape the whole table is published as. On resume the pinned copy is authoritative and is
+/// re-derived only to check it has not moved, so a second run cannot quietly republish a
+/// different shape into the same destination.
+async fn pin_target(
+    prod: &target::ProdSchema,
+    table: &Inventory,
+    work: &Path,
+    raw: &dyn Store,
+    overrides: &Overrides,
+) -> Result<arrow_schema::Schema> {
+    let path = work.join("TARGET-SCHEMA.json");
+    // The pinned copy is authoritative on resume. Re-deriving it would re-download a reference
+    // object per table to reach the same answer: the SQL is already in `contract_sha256`, which a
+    // resume checks, and the reference object is pinned by INVENTORY.json's key and ETag.
+    if path.exists() {
+        return read_json(&path);
+    }
+    let newest = table
+        .days
+        .iter()
+        .max_by(|a, b| a.date.cmp(&b.date))
+        .and_then(|day| day.sources.first())
+        .ok_or_else(|| {
+            abort::<()>("table has no source objects to read a schema from").unwrap_err()
+        })?;
+    let oldest = table
+        .days
+        .iter()
+        .min_by(|a, b| a.date.cmp(&b.date))
+        .and_then(|day| day.sources.first())
+        .ok_or_else(|| {
+            abort::<()>("table has no source objects to read a schema from").unwrap_err()
+        })?;
+    let newest_schema = target::reference_schema(raw, newest, work).await?;
+    let oldest_schema = target::reference_schema(raw, oldest, work).await?;
+    let built = target::build(
+        prod,
+        target::References {
+            newest: &newest_schema,
+            oldest: &oldest_schema,
+        },
+        overrides,
+    )?;
+    atomic_json(&path, &built)?;
+    Ok(built)
 }
 
 /// Share transfer/check permits; the one outer scheduler admits only `days` total days.
@@ -372,8 +416,8 @@ pub(super) fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
             let imported_at = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).map_err(infrastructure)?;
             let mut tables = Vec::new();
             for (table, days) in discovered {
-                let (overrides, native) = policy::load_table(args, &table)?;
-                tables.push(Inventory { identity: identity(common, args, &tuning, &table, &native, &overrides)?, imported_at: imported_at.clone(), days });
+                let (overrides, native, prod) = policy::load_table(args, &table)?;
+                tables.push(Inventory { identity: identity(common, args, &tuning, &table, &native, &overrides, prod.as_ref())?, imported_at: imported_at.clone(), days });
             }
             DatabaseInventory { database: database.into(), imported_at, tables, excluded_partitions: args.exclude_partition.clone() }
         };
@@ -390,12 +434,20 @@ pub(super) fn command(common: &Common, args: &ParquetArgs) -> Result<()> {
         for table in &inventory.tables {
             let table_ref: TableRef = table.identity.table.parse().map_err(|e: String| usage::<()>(e).unwrap_err())?;
             if table_ref.database() != database { return abort("inventory table belongs to another database"); }
-            let (overrides, native) = policy::load_table(args, &table.identity.table)?;
-            if table.identity != identity(common, args, &tuning, &table.identity.table, &native, &overrides)? { return abort("resume configuration/contract differs from pinned database inventory"); }
+            let (overrides, native, prod) = policy::load_table(args, &table.identity.table)?;
+            if table.identity != identity(common, args, &tuning, &table.identity.table, &native, &overrides, prod.as_ref())? { return abort("resume configuration/contract differs from pinned database inventory"); }
             let raw = Arc::new(listing.with_timeout(overrides.limits.wall_clock_secs));
             let clean: Arc<dyn Store> = match &clean_store { Some(s) => Arc::new(s.with_timeout(overrides.limits.wall_clock_secs)), None => Arc::new(store::NoUploadStore) };
-            let mut pipeline = Pipeline::new(table.identity.clone(), work.join(&table.identity.table), destination.clone(), String::new(), overrides, tuning.clone(), inventory.imported_at.clone(), args.resume, raw, clean, Arc::new(ProcessWorker));
+            let table_work = work.join(&table.identity.table);
+            // Resolve the target before any partition starts: it decides the published shape, so
+            // deriving it later would make the output depend on which day happened to run first.
+            let target_schema = match &prod {
+                Some(prod) => Some(pin_target(prod, table, &table_work, raw.as_ref(), &overrides).await?),
+                None => None,
+            };
+            let mut pipeline = Pipeline::new(table.identity.clone(), table_work, destination.clone(), String::new(), overrides, tuning.clone(), inventory.imported_at.clone(), args.resume, raw, clean, Arc::new(ProcessWorker));
             pipeline.native_policy = Some(native);
+            pipeline.target_schema = target_schema;
             if args.skip_published {
                 pipeline.published_store = clean_store.as_ref().map(|s| Arc::new(s.with_timeout(pipeline.overrides.limits.wall_clock_secs)) as Arc<dyn published::PublishedStore>);
             }

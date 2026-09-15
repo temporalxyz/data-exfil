@@ -55,6 +55,75 @@ version, choose a new destination root. Resume an interrupted run with the ident
 and `--resume`; discovery stays pinned and newly arrived source files require a new batch.
 Database reports and inventory live in `WORK/parquet-database/DATABASE/BATCH/`.
 
+## Migrated tables
+
+A table altered partway through the range has one schema in its older partitions and another in
+its newer ones, and the per-table schema pin rejects that as drift. `--prod-schema-dir DIR` says
+what the table is *now*, so the whole range publishes as that one shape:
+
+```sh
+./target/release/salvage audit-parquet \
+  --database mds --verify \
+  --source s3://br-ch-exfil/mds/ --source-profile source \
+  --prod-schema-dir ./prod-schemas \
+  --batch mds-migrate-verify-001 \
+  --memory-bytes 137438953472 --scratch-bytes 1099511627776 \
+  --max-day-scratch-bytes 68719476736 --work ./work -vv
+```
+
+`DIR` holds one file per selected table, named `db.table.sql` or `create_table.sql`, holding the
+current `SHOW CREATE TABLE` as production writes it: `ON CLUSTER`, per-column `CODEC`, `COMMENT`,
+`DEFAULT` and `TTL`, `PARTITION BY` and `SETTINGS` are all accepted and discarded, since none of
+them describes a column's shape. `ALIAS`, `MATERIALIZED` and `EPHEMERAL` columns are still refused:
+they are not stored, so an export never carries them. Every selected table needs a file; a
+missing one is an error, not a fall back to the un-projected behavior.
+
+**The SQL does not supply Parquet types, and cannot.** `String` is any of Utf8, LargeUtf8, Binary
+or LargeBinary; `DateTime64(3)` and `DateTime64(3, 'UTC')` are one ClickHouse type but two
+different Arrow types; `UUID`, `IPv4`/`IPv6`, `Enum8`/`Enum16` and `Decimal128`/`Decimal256` are
+ambiguous the same way, and `UInt128`/`Int128`/`UInt256`/`Int256` have no Arrow type at all.
+Choosing a representative would mean guessing, and a wrong guess rejects exactly the old partitions
+this exists to rescue. So the DDL is the authority for **which columns exist, in what order, and
+which are nullable**, and the Arrow types are read from a real object: the newest selected day's
+first file for that table. The oldest selected day's first file is read too, to learn which
+columns the range started without. Both downloads happen once per table per run. DDL and objects
+are cross-checked both ways before any is used, and the result is pinned in `TARGET-SCHEMA.json`.
+
+**A column the oldest partition lacks is published `Nullable`, for every partition.** A migration
+adds `uid UInt64`; every partition before it has no `uid`, and the only honest value to write there
+is null -- not the server's implicit default, not the DDL's `DEFAULT` expression. So the published
+type widens to `Nullable(UInt64)` across the table, which is what keeps it one shape. Columns the
+range always had keep the DDL's nullability exactly.
+
+Per column, against that target:
+
+| Source file | Result |
+| --- | --- |
+| has it, same Arrow type | audited and forwarded as usual |
+| has it, different Arrow type | stops -- a retype is not a migration this can absorb |
+| has it nullable, target `NOT NULL` | stops |
+| has it `NOT NULL`, target `Nullable` | fine |
+| lacks it | **written as all nulls** (the column is `Nullable` in the target, see above) |
+| has a column the target does not declare | stops unless `drop = true` in `--audit-policy` |
+
+A `drop = true` entry keeps working against the newer partitions that no longer carry the column
+at all, which is what makes it usable for a column a migration removed. `audit-policy.mds.toml` in
+this repository is the one the `mds` database needs.
+
+Padding is the **only** place this tool writes a value it did not read, so it is visible rather
+than silent: `MANIFEST.json` names the columns in `padded_columns` and records
+`target_schema_sha256`, `FIELD-AUDIT.json` marks them `padded`, and `schema_source` becomes
+`parquet+target`. A padded null is not a source null, and `CONSUMER-CONTRACT.md` says so to the
+consumer. Padding is refused for any column carrying a semantic type, a field rule or a reviewed
+per-table exception, because a padded column is not validated and publishing one would quietly
+retire that review.
+
+Files within a single day must still agree with each other; only days may differ. The distinct
+source schemas observed are recorded in `SOURCE-SCHEMAS.json` rather than used as a gate.
+`--prod-schema-dir` cannot be combined with `--skip-published`: projection changes the output
+schema of every table, including ones that never migrated, so partitions committed by an earlier
+run are not reusable under it.
+
 ## Single table
 
 Inputs live under `s3://RAW/PREFIX/YYYY/MM/DD/table/*.parquet`. The terminal directory is the

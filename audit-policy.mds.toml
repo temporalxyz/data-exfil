@@ -1,0 +1,16 @@
+# Audit policy for `salvage audit-parquet --database mds --prod-schema-dir ../cextrader/tables/mds`.
+#
+# One entry, for one migration: `tables/mds/migrations/2026-08-28_drop_funding_settle_price_estimate.sql`
+# removed `settle_price_estimate` from `mds.funding`. Partitions written before that day still
+# carry the column and the prod schema no longer declares it, so the audit refuses to publish
+# them until the removal is named here (section 8.7: the only permitted removal is by column,
+# decided before the run, and recorded). Every partition of `mds.funding` is published without it;
+# each manifest lists it under `dropped_columns`.
+#
+# The other two migrations (`2026-08-18_add_uid`, `2026-09-08_add_l2_depth`) ADD columns and
+# need nothing here: partitions that predate them are padded with nulls and the added columns
+# are published `Nullable`. See PARQUET.md ("Migrated tables").
+
+[tables."mds.funding".columns.settle_price_estimate]
+class = "closed"
+drop = true

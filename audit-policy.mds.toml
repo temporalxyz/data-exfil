@@ -14,3 +14,11 @@
 [tables."mds.funding".columns.settle_price_estimate]
 class = "closed"
 drop = true
+
+# The default per-file budget is one hour, which these files outgrow: mds.l2 partitions run 4-12 GB
+# and one was still auditing at 3049s when the run stopped. A partition that trips this budget
+# latches STOP for the whole invocation, so the bound has to be generous rather than tight -- it
+# exists to stop a pathological input running forever, not to pace normal work. This is also the
+# per-operation S3 timeout, which the 12 GB downloads are nowhere near.
+[limits]
+wall_clock_secs = 43200

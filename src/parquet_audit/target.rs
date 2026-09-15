@@ -180,18 +180,31 @@ pub async fn reference_schema(
     source: &super::Source,
     work: &Path,
 ) -> Result<Schema> {
+    tracing::info!(
+        key = source.key,
+        bytes = source.size,
+        "reading reference object schema"
+    );
     std::fs::create_dir_all(work).map_err(infrastructure)?;
     let path = work.join("REFERENCE.parquet");
     let downloaded = store.download(source, &path).await;
     let schema = downloaded.and_then(|_| {
         let file = std::fs::File::open(&path).map_err(infrastructure)?;
+        // Named, keyed and sized: the operator has to be able to tell a half-written object
+        // in today's partition from a corrupt one without re-downloading it by hand.
         let builder =
             parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new_with_options(
                 file,
                 parquet::arrow::arrow_reader::ArrowReaderOptions::new()
                     .with_skip_arrow_metadata(true),
             )
-            .map_err(|_| abort::<()>("reference object is not readable Parquet").unwrap_err())?;
+            .map_err(|e| {
+                abort::<()>("reference object is not readable Parquet")
+                    .unwrap_err()
+                    .with("key", &source.key)
+                    .with("bytes", source.size)
+                    .with("error", e)
+            })?;
         Ok(super::validation::clean_schema(builder.schema()))
     });
     // Reclaim the scratch whether or not the read worked; nothing downstream reads this copy.
